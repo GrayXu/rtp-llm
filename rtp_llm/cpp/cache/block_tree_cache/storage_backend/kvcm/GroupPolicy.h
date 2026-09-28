@@ -27,6 +27,8 @@ using LocationsView = std::vector<LocationView>;
 
 class GroupPolicy {
 public:
+    using SourceResolver = std::function<std::vector<BlockInfo>(int, const std::string&, int, Tier)>;
+
     struct Group {
         Group() = default;
         Group(bool        is_full,
@@ -57,7 +59,7 @@ public:
     using LocationSpecGroups = std::map<std::string, std::vector<std::string>>;
 
     GroupPolicy(const CacheTopology&                    topology,
-                StorageBackend::BufferResolver          buffer_resolver,
+                SourceResolver                          buffer_resolver,
                 const std::vector<std::string>&         full_group_tags,
                 const std::vector<std::string>&         other_group_tags,
                 std::unordered_map<std::string, size_t> group_block_size_bytes = {}):
@@ -80,7 +82,8 @@ public:
 
     virtual bool genBlockBuffers(const std::vector<std::string>& group_tags,
                                  const std::vector<int32_t>&     block_ids,
-                                 kv_cache_manager::BlockBuffers& block_buffers) const = 0;
+                                 kv_cache_manager::BlockBuffers& block_buffers,
+                                 Tier                            source_tier = Tier::DEVICE) const = 0;
 
     const GroupIdMap& groups() const {
         return groups_;
@@ -113,7 +116,7 @@ protected:
                                  LocationView&                     location_view) const;
 
     const CacheTopology&                    topology_;
-    StorageBackend::BufferResolver          buffer_resolver_;
+    SourceResolver                          buffer_resolver_;
     std::set<std::string>                   full_group_tags_;
     std::set<std::string>                   other_group_tags_;
     std::unordered_map<std::string, size_t> group_block_size_bytes_;
@@ -133,7 +136,7 @@ protected:
 class DefaultLayerGroupPolicy: public GroupPolicy {
 public:
     DefaultLayerGroupPolicy(const CacheTopology&                    topology,
-                            StorageBackend::BufferResolver          buffer_resolver,
+                            SourceResolver                          buffer_resolver,
                             const std::vector<std::string>&         full_group_tags,
                             const std::vector<std::string>&         other_group_tags,
                             std::unordered_map<std::string, size_t> group_block_size_bytes = {}):
@@ -155,7 +158,8 @@ public:
 
     bool genBlockBuffers(const std::vector<std::string>& group_tags,
                          const std::vector<int32_t>&     block_ids,
-                         kv_cache_manager::BlockBuffers& block_buffers) const override;
+                         kv_cache_manager::BlockBuffers& block_buffers,
+                         Tier                            source_tier = Tier::DEVICE) const override;
 
     std::string debugString() const override;
 
@@ -170,7 +174,7 @@ protected:
 class FullLayerGroupPolicy: public DefaultLayerGroupPolicy {
 public:
     FullLayerGroupPolicy(const CacheTopology&                    topology,
-                         StorageBackend::BufferResolver          buffer_resolver,
+                         SourceResolver                          buffer_resolver,
                          const std::vector<std::string>&         full_group_tags,
                          const std::vector<std::string>&         other_group_tags,
                          std::unordered_map<std::string, size_t> group_block_size_bytes = {}):
@@ -204,7 +208,7 @@ protected:
     void rebuildDerivedSpecInfo() override;
 
     FullOtherGroupPolicy(const CacheTopology&                    topology,
-                         StorageBackend::BufferResolver          buffer_resolver,
+                         SourceResolver                          buffer_resolver,
                          const std::vector<std::string>&         full_group_tags,
                          const std::vector<std::string>&         other_group_tags,
                          uint32_t                                write_interval,
@@ -226,7 +230,7 @@ protected:
 class FullLinearLayerGroupPolicy: public FullOtherGroupPolicy {
 public:
     FullLinearLayerGroupPolicy(const CacheTopology&                    topology,
-                               StorageBackend::BufferResolver          buffer_resolver,
+                               SourceResolver                          buffer_resolver,
                                const std::vector<std::string>&         full_group_tags,
                                const std::vector<std::string>&         other_group_tags,
                                uint32_t                                linear_attention_write_interval,

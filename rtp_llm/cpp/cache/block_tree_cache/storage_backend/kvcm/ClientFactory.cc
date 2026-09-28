@@ -2,6 +2,7 @@
 
 #include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/DirectSubscriber.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/VIPServerSubscriber.h"
+#include <mutex>
 
 namespace rtp_llm {
 namespace kvcm {
@@ -13,6 +14,9 @@ ClientFactory::createMetaClient(const std::string& config, const kv_cache_manage
 
 std::unique_ptr<kv_cache_manager::TransferClient>
 ClientFactory::createTransferClient(const std::string& config, const kv_cache_manager::InitParams& init_params) const {
+    // PACE SDK initializers use process-wide state and an unguarded random generator.
+    static std::mutex           init_mutex;
+    std::lock_guard<std::mutex> lock(init_mutex);
     return kv_cache_manager::TransferClient::Create(config, init_params);
 }
 

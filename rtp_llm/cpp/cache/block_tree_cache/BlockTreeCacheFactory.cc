@@ -642,6 +642,18 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
     auto         task_pool           = std::make_unique<BlockTreeTaskPool>(
         static_cast<size_t>(config.task_pool_size), business_queue_size, "BlockTreeCacheTaskPool");
 
+    StorageBackend::HostPoolsByTag               storage_host_pools;
+    std::unordered_map<std::string, GroupSetPtr> storage_host_groups;
+    if (storage_backend) {
+        for (const auto& group_set : group_sets) {
+            if (group_set->hostPool()) {
+                for (const auto& tag : group_set->groupTags()) {
+                    storage_host_pools.emplace(tag, group_set->hostPool());
+                    storage_host_groups.emplace(tag, group_set);
+                }
+            }
+        }
+    }
     auto tree = std::make_unique<BlockTree>(std::move(group_sets));
 
     auto result = std::make_shared<BlockTreeCache>(std::move(tree),
@@ -667,6 +679,10 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
                 resolver_pools,
                 [storage_config, resolver_pools](int layer_id, const std::string& tag, int block_id) {
                     return resolveStorageBuffers(storage_config, resolver_pools, layer_id, tag, block_id);
+                },
+                std::move(storage_host_pools),
+                [host_groups = std::move(storage_host_groups)](int layer_id, const std::string& tag, int block_id) {
+                    return host_groups.at(tag)->convertHostIndexToBuffer(layer_id, tag, block_id);
                 }),
             "StorageBackend init failed");
     }

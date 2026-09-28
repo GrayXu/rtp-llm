@@ -115,6 +115,8 @@ private:
     bool                                          waitForRetry(int sleep_time_ms);
 
     kv_cache_manager::InitParams init_params_;
+    // Immutable SDK config snapshot, separate from mutable metadata endpoints.
+    std::string transfer_config_json_;
     // InitParams carries a pointer, so retain the descriptor for every later
     // meta-client re-registration performed by this wrapper.
     std::vector<PoolRegistration>           pool_registrations_;

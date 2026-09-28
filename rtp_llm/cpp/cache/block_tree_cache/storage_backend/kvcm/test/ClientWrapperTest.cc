@@ -213,6 +213,148 @@ TEST(ClientWrapperTest, TagRoutingUsesRegistrationOrderAndFailedInitPublishesNoR
     }
 }
 
+TEST(ClientWrapperTest, HostTimeoutDrainsWriteScopedClientAndPreservesTagAndCpuTrace) {
+    class DrainingHostClient final: public kv_cache_manager::TransferClient {
+    public:
+        DrainingHostClient(std::shared_ptr<std::promise<void>> entered,
+                           std::shared_future<void>            released,
+                           std::shared_ptr<std::atomic<int>>   observed):
+            entered_(std::move(entered)), released_(std::move(released)), observed_(std::move(observed)) {}
+        ~DrainingHostClient() override {
+            if (worker_.joinable()) {
+                worker_.join();
+            }
+        }
+        kv_cache_manager::ClientErrorCode LoadKvCaches(const kv_cache_manager::UriStrVec&,
+                                                       const kv_cache_manager::BlockBuffers&,
+                                                       std::shared_ptr<kv_cache_manager::TransferTraceInfo>) override {
+            return kv_cache_manager::ER_INVALID_PARAMS;
+        }
+        std::pair<kv_cache_manager::ClientErrorCode, kv_cache_manager::UriStrVec>
+        SaveKvCaches(const kv_cache_manager::UriStrVec&                   uris,
+                     const kv_cache_manager::BlockBuffers&                buffers,
+                     std::shared_ptr<kv_cache_manager::TransferTraceInfo> trace) override {
+            EXPECT_EQ(uris, (kv_cache_manager::UriStrVec{"alpha_uri"}));
+            EXPECT_NE(trace, nullptr);
+            if (trace) {
+                EXPECT_FALSE(trace->need_print);
+            }
+            worker_ = std::thread([this, buffers] {
+                entered_->set_value();
+                released_.wait();
+                observed_->store(*static_cast<uint8_t*>(buffers[0].iovs[0].base));
+            });
+            return {kv_cache_manager::ER_SDK_TIMEOUT, {}};
+        }
+
+    private:
+        kv_cache_manager::ClientErrorCode Init(const std::string&, const kv_cache_manager::InitParams&) override {
+            return kv_cache_manager::ER_OK;
+        }
+        std::shared_ptr<std::promise<void>> entered_;
+        std::shared_future<void>            released_;
+        std::shared_ptr<std::atomic<int>>   observed_;
+        std::thread                         worker_;
+    };
+
+    auto                     factory        = std::make_unique<MockClientFactory>();
+    auto                     subscriber     = std::make_unique<MockSubscriber>();
+    auto                     meta           = std::make_unique<kv_cache_manager::MockMetaClient>();
+    static const std::string storage_config = "{}";
+    EXPECT_CALL(*meta, GetStorageConfig()).WillOnce(ReturnRef(storage_config));
+    EXPECT_CALL(*subscriber, init(std::vector<std::string>{"direct"})).WillOnce(Return(true));
+    EXPECT_CALL(*factory, createSubscriber(false)).WillOnce(Invoke([&](bool) { return std::move(subscriber); }));
+    EXPECT_CALL(*factory, createMetaClient(_, _)).WillOnce(Invoke([&](const auto&, const auto&) {
+        return std::move(meta);
+    }));
+    auto               destroyed = std::make_shared<int>(0);
+    auto               entered   = std::make_shared<std::promise<void>>();
+    auto               started   = entered->get_future();
+    std::promise<void> release;
+    auto               released     = release.get_future().share();
+    auto               observed     = std::make_shared<std::atomic<int>>(0);
+    size_t             client_count = 0;
+    EXPECT_CALL(*factory, createTransferClient(_, _))
+        .Times(3)
+        .WillRepeatedly(Invoke([&](const std::string&, const kv_cache_manager::InitParams& params)
+                                   -> std::unique_ptr<kv_cache_manager::TransferClient> {
+            if (++client_count <= 2) {
+                return std::make_unique<kv_cache_manager::MockTransferClient>(destroyed);
+            }
+            EXPECT_EQ(params.self_location_spec_name, "tp0_Falpha");
+            EXPECT_EQ(params.role_type, kv_cache_manager::RoleType::WORKER);
+            EXPECT_EQ(params.regist_span, nullptr);
+            EXPECT_EQ(params.storage_configs, storage_config);
+            return std::make_unique<DrainingHostClient>(entered, released, observed);
+        }));
+    ClientWrapper           wrapper(std::move(factory));
+    std::array<uint8_t, 32> registration{};
+    ASSERT_TRUE(
+        wrapper.initForPools({{"", makeConfig(false, "direct")}},
+                             kv_cache_manager::RoleType::HYBRID,
+                             {{{registration.data(), 16}, "tp0_Fzeta"}, {{registration.data() + 16, 16}, "tp0_Falpha"}},
+                             {"zeta", "alpha"}));
+    uint8_t                        payload = 87;
+    kv_cache_manager::BlockBuffers buffers(1);
+    buffers[0].iovs.push_back({kv_cache_manager::MemoryType::CPU, &payload, 1, false});
+    auto trace        = std::make_shared<kv_cache_manager::TransferTraceInfo>();
+    trace->need_print = true;
+    BoundedThread<bool> write([&] { return wrapper.saveKvCachesForTag("alpha", {"alpha_uri"}, buffers, trace).first; });
+    const auto          started_status = started.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(started_status, std::future_status::ready);
+    EXPECT_EQ(write.waitFor(std::chrono::milliseconds(50)), std::future_status::timeout);
+    release.set_value();
+    ASSERT_EQ(write.waitFor(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_FALSE(write.get());
+    EXPECT_EQ(observed->load(), 87);
+    EXPECT_TRUE(trace->need_print);
+    EXPECT_EQ(*destroyed, 0);
+    wrapper.shutdown();
+    EXPECT_EQ(*destroyed, 2);
+}
+
+TEST(ClientWrapperTest, HostClientCreationFailureKeepsGpuClient) {
+    auto                     factory        = std::make_unique<MockClientFactory>();
+    auto                     subscriber     = std::make_unique<MockSubscriber>();
+    auto                     meta           = std::make_unique<kv_cache_manager::MockMetaClient>();
+    static const std::string storage_config = R"([{"type":"mooncake"}])";
+    auto                     destroyed      = std::make_shared<int>(0);
+    auto                     gpu_client     = std::make_unique<kv_cache_manager::MockTransferClient>(destroyed);
+    EXPECT_CALL(*gpu_client, SaveKvCaches(kv_cache_manager::UriStrVec{"gpu_uri"}, _, _))
+        .WillOnce(Return(std::make_pair(kv_cache_manager::ER_OK, kv_cache_manager::UriStrVec{})));
+    EXPECT_CALL(*meta, GetStorageConfig()).WillOnce(ReturnRef(storage_config));
+    EXPECT_CALL(*subscriber, init(std::vector<std::string>{"direct"})).WillOnce(Return(true));
+    EXPECT_CALL(*factory, createSubscriber(false)).WillOnce(Invoke([&](bool) { return std::move(subscriber); }));
+    EXPECT_CALL(*factory, createMetaClient(_, _)).WillOnce(Invoke([&](const auto&, const auto&) {
+        return std::move(meta);
+    }));
+    EXPECT_CALL(*factory, createTransferClient(_, _))
+        .WillOnce(Invoke([&](const auto&, const auto&) -> std::unique_ptr<kv_cache_manager::TransferClient> {
+            return std::move(gpu_client);
+        }))
+        .WillOnce(
+            Invoke([](const auto&,
+                      const kv_cache_manager::InitParams& params) -> std::unique_ptr<kv_cache_manager::TransferClient> {
+                EXPECT_EQ(params.regist_span, nullptr);
+                return nullptr;
+            }));
+    ClientWrapper           wrapper(std::move(factory));
+    std::array<uint8_t, 16> registration{};
+    ASSERT_TRUE(wrapper.initForPools({{"", makeConfig(false, "direct")}},
+                                     kv_cache_manager::RoleType::HYBRID,
+                                     {{{registration.data(), registration.size()}, "tp0_Fdefault"}},
+                                     {"default"}));
+    uint8_t                        payload = 1;
+    kv_cache_manager::BlockBuffers buffers(1);
+    buffers[0].iovs.push_back({kv_cache_manager::MemoryType::CPU, &payload, 1, false});
+    EXPECT_FALSE(wrapper.saveKvCachesForTag("default", {"host_uri"}, buffers).first);
+    EXPECT_EQ(*destroyed, 0);
+    buffers[0].iovs[0].type = kv_cache_manager::MemoryType::GPU;
+    EXPECT_TRUE(wrapper.saveKvCachesForTag("default", {"gpu_uri"}, buffers).first);
+    wrapper.shutdown();
+    EXPECT_EQ(*destroyed, 1);
+}
+
 TEST(ClientWrapperTest, RejectsInvalidConfigBeforeCreatingSubscriberOrClients) {
     auto                         valid      = makeConfig(false, "endpoint");
     auto                         serialized = autil::legacy::ToJsonString(valid);

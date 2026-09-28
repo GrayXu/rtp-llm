@@ -35,9 +35,14 @@ struct StorageTaskState {
         DeviceBlockPoolPtr pool;
         BlockIdxType       block;
     };
+    struct HostPin {
+        std::shared_ptr<HostBlockPool> pool;
+        BlockIdxType                   block;
+    };
 
     StorageRequest   request;
     std::vector<Pin> pins;
+    std::vector<HostPin> host_pins;
     std::once_flag   finish_once;
     void             finish() {
         std::call_once(finish_once, [this] {
@@ -45,6 +50,10 @@ struct StorageTaskState {
                 pin.pool->decRef(pin.block);
             }
             pins.clear();
+            for (const HostPin& pin : host_pins) {
+                pin.pool->decTreeRef(pin.block, BlockTreeRefType::STORE);
+            }
+            host_pins.clear();
         });
     }
 
@@ -59,7 +68,7 @@ namespace rtp_llm {
 namespace {
 
 struct BlockKey {
-    DeviceBlockPool* pool;
+    IBlockPool*      pool;
     BlockIdxType     block;
     bool             operator==(const BlockKey& other) const {
         return pool == other.pool && block == other.block;
@@ -68,7 +77,7 @@ struct BlockKey {
 
 struct BlockKeyHash {
     size_t operator()(const BlockKey& key) const {
-        return std::hash<DeviceBlockPool*>{}(key.pool) ^ (std::hash<BlockIdxType>{}(key.block) << 1U);
+        return std::hash<IBlockPool*>{}(key.pool) ^ (std::hash<BlockIdxType>{}(key.block) << 1U);
     }
 };
 
@@ -87,7 +96,9 @@ StorageBackend::~StorageBackend() {
 
 bool StorageBackend::init(std::shared_ptr<const CacheTopology> topology,
                           PoolsByTag                           pools_by_tag,
-                          BufferResolver                       buffer_resolver) {
+                          BufferResolver                       buffer_resolver,
+                          HostPoolsByTag                       host_pools_by_tag,
+                          BufferResolver                       host_buffer_resolver) {
     if (init_attempted_) {
         RTP_LLM_LOG_ERROR("StorageBackend initialization has already been attempted");
         return false;
@@ -101,6 +112,12 @@ bool StorageBackend::init(std::shared_ptr<const CacheTopology> topology,
         RTP_LLM_CHECK_WITH_INFO(
             seen_pools.emplace(pool.get()).second, "storage tags must own distinct pools: tag=%s", tag.c_str());
     }
+    RTP_LLM_CHECK_WITH_INFO(host_pools_by_tag.empty() || host_buffer_resolver,
+                            "host storage pools require a buffer resolver");
+    for (const auto& [tag, pool] : host_pools_by_tag) {
+        (void)topology->group(tag);
+        RTP_LLM_CHECK_WITH_INFO(pool != nullptr, "null host storage pool for tag=%s", tag.c_str());
+    }
     init_attempted_ = true;
     if (executor_ == nullptr) {
         executor_ = makeDefaultStorageBackendExecutor();
@@ -112,10 +129,14 @@ bool StorageBackend::init(std::shared_ptr<const CacheTopology> topology,
     topology_            = std::move(topology);
     pools_by_tag_        = std::move(pools_by_tag);
     buffer_resolver_     = std::move(buffer_resolver);
+    host_pools_by_tag_    = std::move(host_pools_by_tag);
+    host_buffer_resolver_ = std::move(host_buffer_resolver);
     const auto fail_init = [this] {
         shutdownImpl();
         buffer_resolver_ = {};
         pools_by_tag_.clear();
+        host_buffer_resolver_ = {};
+        host_pools_by_tag_.clear();
         topology_.reset();
         return false;
     };
@@ -223,8 +244,9 @@ void StorageBackend::shutdown() {
     lifecycle_cv_.notify_all();
 }
 
-std::shared_ptr<storage_backend_detail::StorageTaskState> StorageBackend::prepare(StorageRequest request) {
-    validateRequest(request, /*allow_null_blocks=*/false);
+std::shared_ptr<storage_backend_detail::StorageTaskState> StorageBackend::prepare(StorageRequest request,
+                                                                                  bool           allow_host) {
+    validateRequest(request, /*allow_null_blocks=*/false, allow_host);
     auto state     = std::make_shared<storage_backend_detail::StorageTaskState>();
     state->request = std::move(request);
     RTP_LLM_CHECK(initialized_);
@@ -232,6 +254,20 @@ std::shared_ptr<storage_backend_detail::StorageTaskState> StorageBackend::prepar
     std::unordered_set<BlockKey, BlockKeyHash> pinned;
     for (const auto& key_handles : state->request.handles) {
         for (const StorageBlockHandle& handle : key_handles) {
+            if (state->request.source_tier == Tier::HOST) {
+                const auto& pool = host_pools_by_tag_.at(handle.tag);
+                if (pinned.insert({pool.get(), handle.block}).second) {
+                    // Several tags can share one packed HOST block.
+                    state->host_pins.push_back({pool, handle.block});
+                    try {
+                        pool->incTreeRef(handle.block, BlockTreeRefType::STORE);
+                    } catch (...) {
+                        state->host_pins.pop_back();
+                        throw;
+                    }
+                }
+                continue;
+            }
             const auto&    pool = devicePool(handle.tag);
             const BlockKey key{pool.get(), handle.block};
             if (pinned.insert(key).second) {
@@ -243,7 +279,10 @@ std::shared_ptr<storage_backend_detail::StorageTaskState> StorageBackend::prepar
     return state;
 }
 
-void StorageBackend::validateRequest(const StorageRequest& request, bool allow_null_blocks) const {
+void StorageBackend::validateRequest(const StorageRequest& request, bool allow_null_blocks, bool allow_host) const {
+    RTP_LLM_CHECK_WITH_INFO(request.source_tier == Tier::DEVICE || (allow_host && request.source_tier == Tier::HOST),
+                            "unsupported storage source tier: %s",
+                            tierName(request.source_tier));
     RTP_LLM_CHECK_WITH_INFO(request.keys != nullptr, "storage request requires cache keys");
     RTP_LLM_CHECK_WITH_INFO(request.handles.size() == request.keys->size(),
                             "storage request key/handle count mismatch: keys=%zu handles=%zu",
@@ -254,6 +293,11 @@ void StorageBackend::validateRequest(const StorageRequest& request, bool allow_n
         for (const auto& handle : request.handles[key_index]) {
             RTP_LLM_CHECK_WITH_INFO(!handle.tag.empty(), "storage handle has empty tag at key=%zu", key_index);
             (void)topology().group(handle.tag);
+            if (request.source_tier == Tier::HOST) {
+                RTP_LLM_CHECK_WITH_INFO(host_pools_by_tag_.count(handle.tag) != 0 && host_buffer_resolver_,
+                                        "storage has no HOST source for tag=%s",
+                                        handle.tag.c_str());
+            }
             RTP_LLM_CHECK_WITH_INFO(seen_tags.emplace(handle.tag).second,
                                     "storage request has duplicate tag=%s at key=%zu",
                                     handle.tag.c_str(),
@@ -275,9 +319,18 @@ const DeviceBlockPoolPtr& StorageBackend::devicePool(const std::string& tag) con
     return pools_by_tag_.at(tag);
 }
 
-std::vector<BlockInfo> StorageBackend::convertIndexToBuffer(int layer_id, const std::string& tag, int block_id) const {
-    RTP_LLM_CHECK(static_cast<bool>(buffer_resolver_));
+const std::shared_ptr<HostBlockPool>& StorageBackend::hostPool(const std::string& tag) const {
+    return host_pools_by_tag_.at(tag);
+}
+
+std::vector<BlockInfo>
+StorageBackend::convertIndexToBuffer(int layer_id, const std::string& tag, int block_id, Tier source_tier) const {
     (void)topology().group(tag);
+    if (source_tier == Tier::HOST) {
+        RTP_LLM_CHECK(host_pools_by_tag_.count(tag) != 0 && host_buffer_resolver_);
+        return host_buffer_resolver_(layer_id, tag, block_id);
+    }
+    RTP_LLM_CHECK(source_tier == Tier::DEVICE && buffer_resolver_);
     return buffer_resolver_(layer_id, tag, block_id);
 }
 
@@ -326,7 +379,7 @@ StorageWriteTask StorageBackend::prepareWrite(StorageRequest request) {
     if (request.empty()) {
         return {};
     }
-    return StorageWriteTask(prepare(std::move(request)));
+    return StorageWriteTask(prepare(std::move(request), /*allow_host=*/true));
 }
 
 bool StorageBackend::write(StorageWriteTask task) {

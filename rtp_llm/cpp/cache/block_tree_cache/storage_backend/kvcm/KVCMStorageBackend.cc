@@ -279,7 +279,7 @@ public:
     bool failed() const { return failed_.load(); }
 
     bool init(const CacheTopology&                                                topology,
-              StorageBackend::BufferResolver                                      buffer_resolver,
+              kvcm::GroupPolicy::SourceResolver                                   buffer_resolver,
               const std::function<const DeviceBlockPoolPtr&(const std::string&)>& pool_resolver) {
         RTP_LLM_LOG_INFO("start init BlockTree KVCM storage backend");
         if (parallelism_config_.tp_rank == 0 && parallelism_config_.tp_size > 1 && !broadcast_manager_) {
@@ -517,6 +517,9 @@ public:
             std::vector<FunctionRequestPB> requests(static_cast<size_t>(parallelism_config_.tp_size));
             ActualUriGather                actual_uri_gather(requests.size());
             initializeRequests(requests, REMOTE_OPERATION_WRITE, trace_id);
+            for (auto& remote_request : requests) {
+                remote_request.mutable_remote_request()->set_host_source(request.source_tier == Tier::HOST);
+            }
             const auto key_indices = unmaskedKeyIndices(write_location.block_mask, valid_keys_size);
             RTP_LLM_CHECK_WITH_INFO(key_indices.size() == write_location.locations.size(),
                                     "KVCM write mask/location mismatch: keys=%zu locations=%zu",
@@ -627,10 +630,27 @@ public:
             RTP_LLM_LOG_WARNING("KVCM transfer tag/block/URI count mismatch");
             return false;
         }
+        if (request.host_source() && request.op() != REMOTE_OPERATION_WRITE) {
+            RTP_LLM_LOG_WARNING("HOST buffers are only supported for remote writes");
+            return false;
+        }
         setCudaDevice();
         kv_cache_manager::BlockBuffers buffers;
-        if (!group_policy_->genBlockBuffers(tags, blocks, buffers)) {
+        if (!group_policy_->genBlockBuffers(tags, blocks, buffers, request.host_source() ? Tier::HOST : Tier::DEVICE)) {
             return false;
+        }
+        // Each rank owns its transfer snapshot even if the metadata RPC times out.
+        // Keep every IOV separate and preserve its original byte order.
+        std::vector<std::vector<uint8_t>> host_payloads;
+        if (request.host_source()) {
+            for (auto& buffer : buffers) {
+                for (auto& iov : buffer.iovs) {
+                    host_payloads.emplace_back(iov.size);
+                    auto& payload = host_payloads.back();
+                    std::memcpy(payload.data(), iov.base, iov.size);
+                    iov.base = payload.data();
+                }
+            }
         }
         return executeTagTransfers(request.op(), tags, blocks, uris, buffers, response);
     }
@@ -1184,8 +1204,16 @@ KVCMStorageBackend::KVCMStorageBackend(const CacheConfig&                   cach
 KVCMStorageBackend::~KVCMStorageBackend() = default;
 
 bool KVCMStorageBackend::initImpl() {
-    return impl_->init(topology(), bufferResolver(),
-                       [this](const std::string& tag) -> const DeviceBlockPoolPtr& { return devicePool(tag); });
+    return impl_->init(
+        topology(),
+        [device = bufferResolver(), host = bufferResolver(Tier::HOST)](
+            int layer_id, const std::string& tag, int block_id, Tier source) {
+            RTP_LLM_CHECK(source == Tier::DEVICE || source == Tier::HOST);
+            const auto& resolver = source == Tier::HOST ? host : device;
+            RTP_LLM_CHECK(resolver);
+            return resolver(layer_id, tag, block_id);
+        },
+        [this](const std::string& tag) -> const DeviceBlockPoolPtr& { return devicePool(tag); });
 }
 
 StorageMatchResult KVCMStorageBackend::matchImpl(const StorageRequest& request) {
@@ -1223,17 +1251,20 @@ void KVCMStorageBackend::shutdownImpl() noexcept {
 bool KVCMStorageBackend::execute(const RemoteOperationRequestPB& request, RemoteOperationResponsePB& response) {
     try {
         StorageWriteTask pins;
-        std::vector<DeviceBlockPoolPtr> follower_pools;
+        std::vector<std::shared_ptr<IBlockPool>> follower_pools;
         if ((request.op() == REMOTE_OPERATION_READ || request.op() == REMOTE_OPERATION_WRITE)
             && request.group_tags_size() == request.block_ids_size()
             && request.block_ids_size() == request.uris_size()) {
             StorageRequest transfer;
+            transfer.source_tier = request.host_source() ? Tier::HOST : Tier::DEVICE;
             transfer.keys = std::make_shared<CacheKeysType>(request.block_ids_size(), 0);
             transfer.handles.resize(request.block_ids_size());
             for (int i = 0; i < request.block_ids_size(); ++i) {
                 transfer.handles[i].push_back({request.group_tags(i), request.block_ids(i)});
                 if (!impl_->ownsAllocator()) {
-                    const auto& pool = devicePool(request.group_tags(i));
+                    std::shared_ptr<IBlockPool> pool = request.host_source() ?
+                        std::static_pointer_cast<IBlockPool>(hostPool(request.group_tags(i))) :
+                        std::static_pointer_cast<IBlockPool>(devicePool(request.group_tags(i)));
                     RTP_LLM_CHECK_WITH_INFO(!isNullBlockIdx(request.block_ids(i))
                                                && pool->validBlock(request.block_ids(i)),
                                             "KVCM follower received an invalid physical block [%d]", request.block_ids(i));

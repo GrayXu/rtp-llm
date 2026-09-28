@@ -810,6 +810,9 @@ message RemoteOperationRequestPB {
     repeated string group_tags = 6;
     // Metadata operations are served by TP rank 0 for this backend's instance.
     RemoteMetadataRequestPB metadata = 7;
+    // Write-only: block_ids address each rank's packed HOST pools.
+    // Omission preserves the existing DEVICE-buffer protocol.
+    bool host_source = 8;
 }
 
 message RemoteMetadataRequestPB {

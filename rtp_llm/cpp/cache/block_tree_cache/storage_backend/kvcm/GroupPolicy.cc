@@ -336,10 +336,17 @@ bool DefaultLayerGroupPolicy::getNeedWriteGroups(const StorageRequest&     reque
 
 bool DefaultLayerGroupPolicy::genBlockBuffers(const std::vector<std::string>& group_tags,
                                               const std::vector<int32_t>&     block_ids,
-                                              kv_cache_manager::BlockBuffers& block_buffers) const {
+                                              kv_cache_manager::BlockBuffers& block_buffers,
+                                              Tier                            source_tier) const {
     static auto push_iov = [](std::vector<kv_cache_manager::Iov>& iovs, const BlockInfo& block_info) {
-        iovs.push_back({kv_cache_manager::MemoryType::GPU, block_info.addr, block_info.size_bytes, false});
+        const auto type = block_info.is_cuda ? kv_cache_manager::MemoryType::GPU : kv_cache_manager::MemoryType::CPU;
+        iovs.push_back({type, block_info.addr, block_info.size_bytes, false});
     };
+    RTP_LLM_CHECK(source_tier == Tier::DEVICE || source_tier == Tier::HOST);
+    if (!buffer_resolver_) {
+        RTP_LLM_LOG_WARNING("remote cache has no %s buffer resolver", tierName(source_tier));
+        return false;
+    }
     RTP_LLM_CHECK_WITH_INFO(group_tags.size() == block_ids.size(),
                             "remote cache group/block count mismatch: groups=%zu blocks=%zu",
                             group_tags.size(),
@@ -365,7 +372,7 @@ bool DefaultLayerGroupPolicy::genBlockBuffers(const std::vector<std::string>& gr
         iovs.reserve(layer_ids.size() * 2);
         for (size_t j = 0; j < layer_ids.size(); ++j) {
             // if support scale, block_infos: {kv_info, scale_info}
-            const auto block_infos = buffer_resolver_(layer_ids[j], tag, block_ids[i]);
+            const auto block_infos = buffer_resolver_(layer_ids[j], tag, block_ids[i], source_tier);
             if (block_infos.empty()) {
                 RTP_LLM_LOG_WARNING("convertIndexToBuffer returned empty for layer_id [%d] group_id [%d] block_id[%d]",
                                     layer_ids[j],
@@ -373,6 +380,12 @@ bool DefaultLayerGroupPolicy::genBlockBuffers(const std::vector<std::string>& gr
                                     block_ids[i]);
             }
             for (size_t idx = 0; idx < block_infos.size(); ++idx) {
+                if (block_infos[idx].is_cuda != (source_tier == Tier::DEVICE)) {
+                    RTP_LLM_LOG_WARNING("remote cache buffer device does not match %s source for tag=%s",
+                                        tierName(source_tier),
+                                        tag.c_str());
+                    return false;
+                }
                 CHECK_BLOCK_INFO_VALID(
                     block_infos[idx],
                     "convertIndexToBuffer failed layer_id [%d] group_id [%d] block_id[%d], block_info.addr or block_info.size_bytes is invalid",

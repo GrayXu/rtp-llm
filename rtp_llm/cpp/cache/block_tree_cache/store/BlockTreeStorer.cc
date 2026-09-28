@@ -1,6 +1,7 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/store/BlockTreeStorer.h"
 
 #include <chrono>
+#include <algorithm>
 #include <cassert>
 #include <exception>
 #include <utility>
@@ -52,6 +53,33 @@ StorageWriteTask BlockTreeStorer::storeLocked(const CacheKeysType&              
     if (target_tier == Tier::DEVICE) {
         publishDeviceLocked(cache_keys, resources, is_resident, resident_prefix_length);
     } else {
+        const bool host_source =
+            target_tier == Tier::HOST && std::any_of(resources.begin(), resources.end(), [](const auto& key_resources) {
+                return std::any_of(key_resources.begin(), key_resources.end(), [](const auto& resource) {
+                    return resource.hasTier(Tier::HOST);
+                });
+            });
+        if (host_source) {
+            if (stopping_.load()) {
+                return {};
+            }
+            for (const auto& key_resources : resources) {
+                for (const auto& resource : key_resources) {
+                    RTP_LLM_CHECK_WITH_INFO(!resource.hasTier(Tier::DEVICE) && !resource.hasTier(Tier::DISK),
+                                            "ready HOST store requires HOST-only source resources");
+                }
+            }
+            auto storage_write =
+                storage_backend_ ?
+                    storage_backend_->prepareWrite(makeStorageRequest(cache_keys, resources, Tier::HOST)) :
+                    StorageWriteTask{};
+            const auto insert_result = tree_->insertNode(cache_keys, resources, true, false);
+            if (insert_result.accepted_resource_count > 0) {
+                evictor_.onInserted(insert_result);
+                settled_(true, true);
+            }
+            return storage_write;
+        }
         submitLowerTierLocked(cache_keys, resources, target_tier);
         return {};
     }
@@ -75,19 +103,27 @@ void BlockTreeStorer::publishDeviceLocked(const CacheKeysType&                  
 }
 
 StorageRequest BlockTreeStorer::makeStorageRequest(const CacheKeysType&                              cache_keys,
-                                                   const std::vector<std::vector<GroupSetResource>>& resources) const {
+                                                   const std::vector<std::vector<GroupSetResource>>& resources,
+                                                   Tier source_tier) const {
+    RTP_LLM_CHECK_WITH_INFO(resources.size() == cache_keys.size(), "storage source key/resource count mismatch");
+    for (const auto& key_resources : resources) {
+        RTP_LLM_CHECK_WITH_INFO(key_resources.size() == tree_->groupSets().size(),
+                                "storage source GroupSetResource count mismatch");
+    }
     StorageRequest request{std::make_shared<CacheKeysType>(cache_keys),
                            std::vector<std::vector<StorageBlockHandle>>(cache_keys.size())};
+    request.source_tier = source_tier;
     for (size_t key_index = 0; key_index < resources.size(); ++key_index) {
         auto& key_handles = request.handles[key_index];
         for (size_t group_set = 0; group_set < tree_->groupSets().size(); ++group_set) {
             const auto& resource = resources[key_index][group_set];
-            if (!resource.hasCompleteDeviceValue()) {
+            if (source_tier == Tier::HOST ? !resource.hasTier(Tier::HOST) : !resource.hasCompleteDeviceValue()) {
                 continue;
             }
             const auto& group = *tree_->groupSets()[group_set];
             for (size_t member = 0; member < group.groupTags().size(); ++member) {
-                key_handles.push_back({group.groupTags()[member], resource.device_blocks[member]});
+                const auto block = source_tier == Tier::HOST ? resource.host_block : resource.device_blocks[member];
+                key_handles.push_back({group.groupTags()[member], block});
             }
         }
     }
@@ -183,12 +219,18 @@ void BlockTreeStorer::scheduleStoreSettlement(const StoreTaskPtr& task, ErrorInf
 }
 
 void BlockTreeStorer::settleTask(const StoreTask& task, bool copy_success) {
+    // StoreTaskRunner success includes the dispatcher's all-rank transfer barrier.
     bool   stopping = false;
     size_t accepted = 0;
+    StorageWriteTask storage_write;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         stopping = stopping_.load();
-        accepted = settleLocked(task, copy_success && !stopping);
+        accepted = settleLocked(task, copy_success && !stopping, &storage_write);
+    }
+
+    if (storage_write) {
+        storage_backend_->write(std::move(storage_write));
     }
 
     if (stopping) {
@@ -208,7 +250,7 @@ void BlockTreeStorer::settleTask(const StoreTask& task, bool copy_success) {
     }
 }
 
-size_t BlockTreeStorer::settleLocked(const StoreTask& task, bool publish) {
+size_t BlockTreeStorer::settleLocked(const StoreTask& task, bool publish, StorageWriteTask* storage_write) {
     BlockTreeInsertResult insert_result;
     if (publish) {
         std::vector<std::vector<GroupSetResource>> resources(task.cache_keys.size(),
@@ -216,6 +258,17 @@ size_t BlockTreeStorer::settleLocked(const StoreTask& task, bool publish) {
         for (const TransferDescriptor& descriptor : task.descriptors()) {
             resources[descriptor.path_index][descriptor.group_set_id].setBlocks(
                 task.target_tier, {descriptor.singleBlockAt(task.target_tier)});
+        }
+        if (task.target_tier == Tier::HOST && storage_backend_ && storage_write) {
+            // Pin completed HOST payload before publication, duplicate cleanup or watermark eviction.
+            try {
+                *storage_write =
+                    storage_backend_->prepareWrite(makeStorageRequest(task.cache_keys, resources, Tier::HOST));
+            } catch (const std::exception& error) {
+                RTP_LLM_LOG_WARNING("prepare HOST remote write failed: %s", error.what());
+            } catch (...) {
+                RTP_LLM_LOG_WARNING("prepare HOST remote write failed with an unknown exception");
+            }
         }
         insert_result = tree_->insertNode(task.cache_keys, resources, true, false);
     }

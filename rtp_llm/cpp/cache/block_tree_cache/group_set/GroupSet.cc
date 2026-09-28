@@ -88,6 +88,8 @@ void GroupSet::initialize(size_t                               group_set_id,
     topology_      = std::move(topology);
     group_tags_    = std::move(group_tags);
     payload_bytes_ = physical_payload_bytes;
+    std::lock_guard<std::mutex> lock(host_layout_mutex_);
+    host_buffer_layouts_.clear();
 }
 
 bool GroupSet::hasAllocatedDeviceBlocks(const std::vector<BlockIdxType>& blocks) const {
@@ -100,6 +102,64 @@ bool GroupSet::hasAllocatedDeviceBlocks(const std::vector<BlockIdxType>& blocks)
         }
     }
     return true;
+}
+
+std::vector<BlockInfo>
+GroupSet::convertHostIndexToBuffer(int layer_id, const std::string& tag, BlockIdxType block) const {
+    RTP_LLM_CHECK(host_pool_ != nullptr && device_pools_.size() == group_tags_.size());
+    const auto host = host_pool_->blockBuffer(block);
+    RTP_LLM_CHECK_WITH_INFO(host.payload_bytes == payload_bytes_, "HOST payload size mismatch for tag=%s", tag.c_str());
+    std::lock_guard<std::mutex> lock(host_layout_mutex_);
+    if (host_buffer_layouts_.empty()) {
+        HostBufferLayouts layouts;
+        size_t            host_offset = 0;
+        for (size_t member = 0; member < group_tags_.size(); ++member) {
+            const auto& member_tag   = group_tags_[member];
+            const auto& member_group = group(member_tag);
+            const auto  layers       = topology_->layerIdsForGroup(member_tag);
+            for (size_t local_layer = 0; local_layer < layers.size(); ++local_layer) {
+                // Resolve layout metadata once; never read or retain DEVICE addresses.
+                auto buffers = device_pools_[member]->convertIndexToBuffer(static_cast<int>(local_layer), 0);
+                if (!uses_physical_payload_geometry_) {
+                    const size_t scale_bytes = member_group.kvScaleStrideBytes();
+                    RTP_LLM_CHECK(buffers.size() >= (scale_bytes == 0 ? 1u : 2u));
+                    buffers[0].size_bytes = member_group.kvBlockStrideBytes();
+                    if (scale_bytes != 0) {
+                        buffers[1].size_bytes = scale_bytes;
+                    }
+                    buffers.resize(scale_bytes == 0 ? 1 : 2);
+                }
+                auto& regions = layouts[member_tag][layers[local_layer]];
+                for (auto buffer : buffers) {
+                    RTP_LLM_CHECK_WITH_INFO(host_offset <= host.payload_bytes
+                                                && buffer.size_bytes <= host.payload_bytes - host_offset,
+                                            "HOST payload offset exceeds block size for tag=%s",
+                                            member_tag.c_str());
+                    buffer.is_cuda      = false;
+                    buffer.device_index = 0;
+                    buffer.addr         = nullptr;
+                    regions.push_back({host_offset, buffer});
+                    host_offset += buffer.size_bytes;
+                }
+            }
+        }
+        RTP_LLM_CHECK_WITH_INFO(host_offset == host.payload_bytes, "HOST payload layout size mismatch");
+        host_buffer_layouts_ = std::move(layouts);
+    }
+    const auto tag_layout = host_buffer_layouts_.find(tag);
+    RTP_LLM_CHECK_WITH_INFO(tag_layout != host_buffer_layouts_.end(), "unknown HOST storage tag=%s", tag.c_str());
+    const auto layer_layout = tag_layout->second.find(layer_id);
+    RTP_LLM_CHECK_WITH_INFO(layer_layout != tag_layout->second.end(),
+                            "layer_id=%d does not belong to HOST storage tag=%s",
+                            layer_id,
+                            tag.c_str());
+    std::vector<BlockInfo> buffers;
+    buffers.reserve(layer_layout->second.size());
+    for (const auto& region : layer_layout->second) {
+        buffers.push_back(region.info);
+        buffers.back().addr = static_cast<uint8_t*>(host.addr) + region.offset;
+    }
+    return buffers;
 }
 
 void GroupSet::referenceBlocks(const MultiNodeResource& resource) const {

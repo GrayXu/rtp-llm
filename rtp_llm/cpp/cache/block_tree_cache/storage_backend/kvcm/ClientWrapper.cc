@@ -135,6 +135,7 @@ bool ClientWrapper::initImpl(const ConfigMap&                     config_map,
             init_params_.role_type = kv_cache_manager::RoleType::WORKER;
         }
         const auto config_json = autil::legacy::ToJsonString(config_map_.begin()->second);
+        transfer_config_json_  = config_json;
         std::vector<std::unique_ptr<kv_cache_manager::TransferClient>> clients;
         clients.reserve(pool_registrations_.size());
         for (size_t index = 0; index < pool_registrations_.size(); ++index) {
@@ -167,6 +168,7 @@ bool ClientWrapper::initImpl(const ConfigMap&                     config_map,
         transfer_clients_.clear();
         tag_to_index_.clear();
         meta_client_map_.clear();
+        transfer_config_json_.clear();
         subscriber_.reset();
         config_map_.clear();
         init_params_.regist_span = nullptr;
@@ -199,6 +201,7 @@ void ClientWrapper::shutdown() noexcept {
         std::unique_lock<std::shared_mutex> transfer_guard(transfer_mutex_);
         transfer_clients_.clear();
         tag_to_index_.clear();
+        transfer_config_json_.clear();
     }
     {
         std::unique_lock<std::shared_mutex> metadata_guard(rr_mutex_);
@@ -564,7 +567,37 @@ ClientWrapper::saveKvCachesForTag(const std::string&                            
         RTP_LLM_LOG_ERROR("kvcm client not find transfer client");
         return {false, {}};
     }
-    auto [ec, result] = transfer_clients_[slot->second]->SaveKvCaches(uri_str_vec, block_buffers, trace_info);
+    const bool has_cpu_source = std::any_of(block_buffers.begin(), block_buffers.end(), [](const auto& buffer) {
+        return std::any_of(buffer.iovs.begin(), buffer.iovs.end(), [](const auto& iov) {
+            return iov.type == kv_cache_manager::MemoryType::CPU;
+        });
+    });
+    std::unique_ptr<kv_cache_manager::TransferClient> host_client;
+    auto*                                             client          = transfer_clients_[slot->second].get();
+    auto                                              effective_trace = trace_info;
+    if (has_cpu_source) {
+        auto params                    = init_params_;
+        params.role_type               = kv_cache_manager::RoleType::WORKER;
+        params.regist_span             = nullptr;
+        params.self_location_spec_name = pool_registrations_[slot->second].location_spec_name;
+        // The SDK can return a timeout while its worker still reads caller memory.
+        // A write-scoped client drains those workers on destruction before the
+        // rank-local HOST snapshot may be released.
+        host_client = client_factory_->createTransferClient(transfer_config_json_, params);
+        if (!host_client) {
+            RTP_LLM_LOG_ERROR("create HOST transfer client failed for tag=%s "
+                              "(regist_span=nullptr; Mooncake storage requires a registered span)",
+                              tag.c_str());
+            return {false, {}};
+        }
+        client = host_client.get();
+        // SDK debug hashing runs a GPU kernel over raw addresses; CPU sources
+        // must not enter that path, including when KVCM_SDK_CHECK is enabled.
+        effective_trace = std::make_shared<kv_cache_manager::TransferTraceInfo>(
+            trace_info ? *trace_info : kv_cache_manager::TransferTraceInfo{});
+        effective_trace->need_print = false;
+    }
+    auto [ec, result] = client->SaveKvCaches(uri_str_vec, block_buffers, effective_trace);
     if (ec != kv_cache_manager::ClientErrorCode::ER_OK) {
         RTP_LLM_LOG_ERROR("kvcm client saveKvCaches fail, ec [%d]", ec);
         return {false, {}};

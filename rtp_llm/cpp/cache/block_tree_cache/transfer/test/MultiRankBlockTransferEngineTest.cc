@@ -763,6 +763,90 @@ private:
     std::shared_ptr<std::promise<void>> release_;
 };
 
+class HostStoreObserverBackend final: public StorageBackend {
+public:
+    ~HostStoreObserverBackend() override {
+        shutdown();
+    }
+    size_t writes() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return writes_;
+    }
+    bool waitForWrite() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(5), [this] { return writes_ > 0; });
+    }
+
+private:
+    bool initImpl() override {
+        return true;
+    }
+    StorageMatchResult matchImpl(const StorageRequest&) override {
+        return {};
+    }
+    void readImpl(const StorageRequest&, const std::shared_ptr<StorageBackendMatchMeta>&) override {}
+    void writeImpl(const StorageRequest& request) override {
+        EXPECT_EQ(request.source_tier, Tier::HOST);
+        EXPECT_EQ(*request.keys, (CacheKeysType{100}));
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++writes_;
+        cv_.notify_all();
+    }
+    mutable std::mutex      mutex_;
+    std::condition_variable cv_;
+    size_t                  writes_{0};
+};
+
+TEST_F(MultiRankBlockTransferEngineTest, HostRemoteStoreWaitsForAllRanksAndSkipsFailedTransfer) {
+    for (bool transfer_success : {true, false}) {
+        auto                                               state = std::make_shared<MultiRankBlockTransferRpcState>();
+        auto                                               release_promise = std::make_shared<std::promise<void>>();
+        auto                                               released        = release_promise->get_future().share();
+        const std::vector<MultiRankBlockTransferRpcConfig> configs{
+            {true, MemoryOperationResponsePB::OK, grpc::Status::OK, state},
+            {true,
+             transfer_success ? MemoryOperationResponsePB::OK : MemoryOperationResponsePB::FAILED,
+             grpc::Status::OK,
+             state,
+             0,
+             released}};
+        std::vector<std::unique_ptr<MultiRankBlockTransferRpcServer>> servers;
+        auto broadcast_manager = makeBroadcastManager(configs, servers);
+        ASSERT_NE(broadcast_manager, nullptr);
+        auto host_pool = makeHostPool(256, 8);
+        auto group     = makeBroadcastGroup("host_remote_rank_fence", host_pool);
+        initializeBroadcastGroups({group});
+        auto                 backend = std::make_shared<HostStoreObserverBackend>();
+        BlockTreeCacheConfig config;
+        config.enable_device_cache        = false;
+        config.enable_host_cache          = true;
+        config.enable_remote_cache        = true;
+        config.host_cache_sync_timeout_ms = 10000;
+        auto       cache                  = makeBlockTreeCacheForTest({group}, config, backend, broadcast_manager);
+        const auto holder                 = allocateDeviceBlocksForTest(*group, 1);
+        ASSERT_EQ(holder.size(), 1u);
+        ScopedRpcResponseRelease                   release_responses(release_promise);
+        std::vector<std::vector<GroupSetResource>> resources(1, std::vector<GroupSetResource>(1));
+        resources[0][0].device_blocks = holder[0];
+        cache->insert({100}, resources, Tier::HOST);
+        ASSERT_TRUE(waitForRpcRequests(state, 2, std::chrono::seconds(5)));
+        ASSERT_TRUE(waitForBusinessTasksToReturn(*cache, std::chrono::seconds(5)));
+        EXPECT_EQ(backend->writes(), 0u);
+        EXPECT_TRUE(cache->tree()->findNode({100}).empty());
+        release_responses.release();
+        cache->transfer_dispatcher_->drainTransfers();
+        BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+        if (transfer_success) {
+            EXPECT_TRUE(backend->waitForWrite());
+            EXPECT_EQ(backend->writes(), 1u);
+        } else {
+            EXPECT_EQ(backend->writes(), 0u);
+            EXPECT_EQ(host_pool->freeBlocksNum(), 8u);
+        }
+        releaseDeviceBlocks(*cache, group->devicePools()[0], holder[0]);
+    }
+}
+
 TEST_F(MultiRankBlockTransferEngineTest, CacheShutdownWaitsForLateMultiRankEvictionSettlement) {
     for (bool transfer_success : {true, false}) {
         SCOPED_TRACE(transfer_success ? "success" : "failure");
