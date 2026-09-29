@@ -97,6 +97,14 @@ With `kvcm_read_backend_type` set, locations are mapped by group/rank into TP pa
 
 ## I/O lifetime
 
+When a request reaches `FINISHED` successfully and cache reuse is allowed, complete KV blocks are stored in the highest enabled local tier (DEVICE, then HOST, then DISK), and a KVCM remote write is submitted alongside it. With all local tiers disabled and remote cache enabled, only the remote write is submitted. Deployment remote-cache controls, per-request `reuse_cache`, and `RTP_LLM_IGNORE_REQUEST_CACHE_SWITCHES` retain their existing behavior.
+
+The submission includes available complete blocks, including reused prefixes; the final partial block is not published. Remote writes honor the offset/bool mask returned by `StartWrite` to skip blocks with enough replicas. Local asynchronous stores and remote tasks retain independent source references after request release, releasing them on completion or rejection.
+
+Request finish explicitly selects DEVICE sources for remote I/O. Completion of its local HOST copy does not submit a duplicate remote write, and local copy failure does not affect an already submitted remote task. Direct ready-HOST submissions and independent DEVICE-to-HOST stores retain the CPU-source path.
+
+Request finish triggers submission; it does not guarantee task admission or remote durability. DEVICE publication is synchronous, while HOST/DISK and remote writes complete independently and asynchronously. Rejection releases temporary references. Remote I/O failure follows the existing `FinishWrite` abort rules without rolling back local cache or changing request success.
+
 RTP requires `sdk_config.drain_on_timeout=true`. Caller waits are bounded by `kvcm_get_broadcast_timeout` (read/metadata) and `kvcm_put_broadcast_timeout` (write), including single-rank calls and shutdown. Both must be positive and default to 15s. Allow room above the SDK budgets (12s by default) for metadata and TP dispatch. Timeout returns failure without waiting for submitted I/O; failed reads are not published as reusable cache entries.
 
 On timeout or uncertain completion (SDK transfer errors or failed TP payload RPCs), RTP retains the operation's resources for the process lifetime: controller allocation pins prevent block reuse, and followers retain the backing pools. The affected backend rejects new operations, and shutdown does not wait for retained work. Even transient transfer errors are treated conservatively; restoring remote-cache capacity requires replacing the instance. All TP ranks must run the same version. This bounds caller waits without cancelling backend I/O or releasing memory it may still access.
@@ -113,6 +121,12 @@ See [KV cache event publisher](backend/kv_cache_event_publisher.md) for publishe
 
 ## Supported scope
 
-The integration supports SDK query/management interfaces, backend-specific reads, replica controls, same-layout TP payload routing, and cache event reporting. It uses the existing DEVICE block IOV/group layout. RTP CPU/HOST-source writes, zero-copy, asymmetric TP/CP, and GDR are outside this integration.
+The integration supports SDK query/management interfaces, backend-specific reads, replica controls, same-layout TP payload routing, cache event reporting, explicit CPU/HOST-source writes, and request-finish local/remote writes. Zero-copy, asymmetric TP/CP, and GDR are outside this integration. See [HOST-source writes](backend/remote_cache_host_write.md) for the CPU IOV and lifetime contract.
 
 Models require matching client/server artifacts and an attention backend and page size supported by the target GPU. Publisher topology limits are documented in [KV cache event publisher](backend/kv_cache_event_publisher.md).
+
+## Historical acceptance
+
+The original request-finish change reported 122 passing component cases under CUDA 13/SM103: `block_tree_storer_test` (25), `stream_cache_resource_test` (42), `storage_backend_test` (33), and `kvcm_mock_only_full_test` (22). They covered DEVICE/HOST/DISK/remote-only finish paths, complete blocks and reused prefixes, masks, asynchronous failures, and reference release.
+
+Those results used mock KVCM calls and apply to the original change only. They do not validate this transplant or its current V2 artifacts. No compilation or tests have been run for this transplant. Real PACE I/O, SDK runtime ABI, timeout/DMA/TP timing, and P/D end-to-end behavior remain unverified here. See [P1 smoke](kvcm_remote_cache_smoke.md) for the smoke entry points and artifact requirements.

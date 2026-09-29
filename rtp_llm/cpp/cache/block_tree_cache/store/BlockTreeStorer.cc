@@ -44,15 +44,17 @@ StorageWriteTask BlockTreeStorer::storeLocked(const CacheKeysType&              
                                               const std::vector<std::vector<GroupSetResource>>& resources,
                                               Tier                                              target_tier,
                                               bool                                              is_resident,
-                                              size_t& resident_prefix_length) {
+                                              size_t&                                           resident_prefix_length,
+                                              bool                                              write_remote_from_device) {
     resident_prefix_length = 0;
     assert(!is_resident || target_tier == Tier::DEVICE);
-    RTP_LLM_CHECK_WITH_INFO(target_tier == Tier::DEVICE || target_tier == Tier::HOST || target_tier == Tier::DISK,
+    RTP_LLM_CHECK_WITH_INFO(target_tier == Tier::DEVICE || target_tier == Tier::HOST || target_tier == Tier::DISK
+                                || target_tier == Tier::REMOTE,
                             "unsupported store target tier: %s",
                             tierName(target_tier));
     if (target_tier == Tier::DEVICE) {
         publishDeviceLocked(cache_keys, resources, is_resident, resident_prefix_length);
-    } else {
+    } else if (target_tier == Tier::HOST || target_tier == Tier::DISK) {
         const bool host_source =
             target_tier == Tier::HOST && std::any_of(resources.begin(), resources.end(), [](const auto& key_resources) {
                 return std::any_of(key_resources.begin(), key_resources.end(), [](const auto& resource) {
@@ -80,9 +82,16 @@ StorageWriteTask BlockTreeStorer::storeLocked(const CacheKeysType&              
             }
             return storage_write;
         }
-        submitLowerTierLocked(cache_keys, resources, target_tier);
-        return {};
+        // Request finish submits DEVICE I/O independently of the local copy.
+        // A completed HOST copy must not submit the same remote write again.
+        auto storage_write = write_remote_from_device && storage_backend_ ?
+                                 storage_backend_->prepareWrite(makeStorageRequest(cache_keys, resources)) :
+                                 StorageWriteTask{};
+        submitLowerTierLocked(cache_keys, resources, target_tier, !write_remote_from_device);
+        return storage_write;
     }
+    // Pin the complete device sources before request release, independently of
+    // the local store. BlockTreeCache submits remote I/O after unlocking.
     return storage_backend_ ? storage_backend_->prepareWrite(makeStorageRequest(cache_keys, resources)) :
                               StorageWriteTask{};
 }
@@ -132,7 +141,8 @@ StorageRequest BlockTreeStorer::makeStorageRequest(const CacheKeysType&         
 
 void BlockTreeStorer::submitLowerTierLocked(const CacheKeysType&                              cache_keys,
                                             const std::vector<std::vector<GroupSetResource>>& resources,
-                                            Tier                                              target_tier) {
+                                            Tier                                              target_tier,
+                                            bool                                              write_remote_from_host) {
     if (stopping_.load()) {
         return;
     }
@@ -141,6 +151,7 @@ void BlockTreeStorer::submitLowerTierLocked(const CacheKeysType&                
         target_tier,
         cache_keys,
         std::chrono::milliseconds(target_tier == Tier::DISK ? disk_timeout_ms_ : host_timeout_ms_));
+    task->write_remote_from_host = write_remote_from_host;
 
     block_tree_cache_detail::ScopeRollback prepare_guard([this, &task]() { settleLocked(*task, /*publish=*/false); });
 
@@ -259,7 +270,7 @@ size_t BlockTreeStorer::settleLocked(const StoreTask& task, bool publish, Storag
             resources[descriptor.path_index][descriptor.group_set_id].setBlocks(
                 task.target_tier, {descriptor.singleBlockAt(task.target_tier)});
         }
-        if (task.target_tier == Tier::HOST && storage_backend_ && storage_write) {
+        if (task.target_tier == Tier::HOST && task.write_remote_from_host && storage_backend_ && storage_write) {
             // Pin completed HOST payload before publication, duplicate cleanup or watermark eviction.
             try {
                 *storage_write =

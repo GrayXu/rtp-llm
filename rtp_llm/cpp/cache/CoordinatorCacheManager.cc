@@ -865,7 +865,8 @@ void CoordinatorCacheManager::insertIntoCache(const InsertInfo& insert_info, siz
                 block_tree_cache_->insert(insert_keys, resources, insert_info.target_tier, true);
             resident_prefix_length += batch_resident_prefix_length;
         } else {
-            block_tree_cache_->insert(insert_keys, resources, insert_info.target_tier);
+            block_tree_cache_->insert(
+                insert_keys, resources, insert_info.target_tier, false, insert_info.write_remote_from_device);
         }
     }
 }
