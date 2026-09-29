@@ -4,6 +4,8 @@
 
 `BlockTreeCache::insert(..., Tier::HOST)` 支持已经填好的 HOST-only `GroupSetResource::host_block`；caller 在调用期间持有对应 pool 的有效引用。原有 DEVICE 源存入 HOST 的流程则在各 rank 拷贝成功后提交 HOST remote 写入。失败、超时或停机回滚的本地拷贝不提交 remote 写入。自动迁移及驱逐流程没有新增写入动作。
 
+集成 request finish 双写后，成功请求设置内部 `InsertInfo::write_remote_from_device`，从 DEVICE 独立提交一次 remote 写入；该请求的 HOST 拷贝完成后不重复提交 CPU 写入。本地拷贝失败不影响已提交的 DEVICE remote 任务。直接 ready HOST 和独立 DEVICE→HOST 存储仍保持上述 CPU 源路径，详见 [request finish 契约与验收](../kvcm_remote_cache.md)。
+
 直接使用 `StorageBackend` 时，初始化同时传入按 tag 绑定的 HOST pools 和 HOST buffer resolver，设置 `StorageRequest::source_tier = Tier::HOST`，再调用 `prepareWrite` 和 `write`。一个请求使用同一种来源。match/read 仍只接收 DEVICE handles。
 
 HOST pool 中一个 packed block 可包含多个 group；每个 group 按 layer、KV/scale 顺序解析多个 CPU 地址。采用与 `DeviceHostTransferExecutor` 一致的实际布局，保留异构 layer 大小及 MTP 物理大小，不把 pool 对齐 padding 写入 remote。各 TP rank 继续使用自身 shard 和对齐的 block index；直接提交 HOST 数据的 caller 需要保证各 rank 对应 payload 已就绪。HOST RPC 标志遵循已有 same-build KV 协议，所有 TP peer 需使用同一实现。
