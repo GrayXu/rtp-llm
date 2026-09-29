@@ -422,6 +422,7 @@ TEST_F(KVCMIndependentPoolTest, WorkerRoutesRepeatedTagsAcrossIndependentOrdersA
     for (size_t group : {2u, 0u, 1u, 0u}) {
         operation.add_group_tags(config_.groupTags().at(group));
         operation.add_block_ids(blocks_[group]);
+        operation.add_block_generations(pools_[group]->blockAllocationGeneration(blocks_[group]));
         operation.add_uris("group_" + std::to_string(group) + "_" + std::to_string(operation.uris_size()));
     }
     RemoteOperationResponsePB response;

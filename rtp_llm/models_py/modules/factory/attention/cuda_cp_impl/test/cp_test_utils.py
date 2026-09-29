@@ -227,6 +227,7 @@ def make_kv_cache(
     tokens_per_block: int,
     head_dim: int,
     device: torch.device = torch.device("cuda"),
+    dtype: torch.dtype = torch.bfloat16,
 ) -> LayerKVCache:
     kv = LayerKVCache()
     kv.kv_cache_base = torch.zeros(
@@ -235,7 +236,7 @@ def make_kv_cache(
         kv_head_num,
         tokens_per_block,
         head_dim,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         device=device,
     )
     return kv
@@ -311,6 +312,52 @@ def compute_rank_positions(lengths: List[int], cp_size: int) -> List[List[int]]:
             all_rank_positions[r].extend([p + seq_offset for p in positions])
         seq_offset += ln
     return all_rank_positions
+
+
+class ShardedCPAttnTestMixin:
+    def test_sharded_partial_kernel_tail(self):
+        for rank in range(4):
+            with self.subTest(rank=rank):
+                self.run_with_prefix(
+                    batch_size=1, new_lengths=[24], prefix_lengths=[64],
+                    cp_size=4, cp_rank=rank, sharded=True,
+                )
+
+    def test_sharded_cold_and_prefix_cp2_cp4(self):
+        for cp_size in [2, 4]:
+            for cp_rank in range(cp_size):
+                for prefix in [0, 64]:
+                    with self.subTest(cp_size=cp_size, cp_rank=cp_rank, prefix=prefix):
+                        self.run_with_prefix(
+                            batch_size=1, new_lengths=[32], prefix_lengths=[prefix],
+                            cp_size=cp_size, cp_rank=cp_rank, sharded=True,
+                        )
+
+    def test_sharded_mixed_prefix_batch(self):
+        for rank in range(4):
+            with self.subTest(rank=rank):
+                self.run_with_prefix(
+                    batch_size=2, new_lengths=[64, 32], prefix_lengths=[128, 0],
+                    cp_size=4, cp_rank=rank, sharded=True,
+                )
+
+    def test_sharded_physical_blocks_with_multiple_kernel_pages(self):
+        for cp_size in [2, 4]:
+            for rank in range(cp_size):
+                with self.subTest(cp_size=cp_size, rank=rank):
+                    self.run_with_prefix(
+                        batch_size=1, new_lengths=[32], prefix_lengths=[64 * cp_size],
+                        cp_size=cp_size, cp_rank=rank, sharded=True,
+                        tokens_per_block=16, physical_tokens_per_block=64,
+                    )
+
+    def test_sharded_fp16_prefix(self):
+        for rank in range(4):
+            with self.subTest(rank=rank):
+                self.run_with_prefix(
+                    batch_size=1, new_lengths=[32], prefix_lengths=[64],
+                    cp_size=4, cp_rank=rank, sharded=True, dtype=torch.float16,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +540,9 @@ class CPAttnTestBase(unittest.TestCase):
         tokens_per_block: int = 16,
         rtol: float = 1e-2,
         atol: float = 1e-2,
+        sharded: bool = False,
+        physical_tokens_per_block: int = 0,
+        dtype: torch.dtype = torch.bfloat16,
     ):
         """Test CP attention **with** prefix cache.
 
@@ -522,24 +572,24 @@ class CPAttnTestBase(unittest.TestCase):
             total_prefix,
             kv_head_num,
             head_dim,
-            dtype=torch.bfloat16,
+            dtype=dtype,
             device=self.device,
         )
         prefix_v = torch.randn(
             total_prefix,
             kv_head_num,
             head_dim,
-            dtype=torch.bfloat16,
+            dtype=dtype,
             device=self.device,
         )
         new_q = torch.randn(
-            total_new, head_num, head_dim, dtype=torch.bfloat16, device=self.device
+            total_new, head_num, head_dim, dtype=dtype, device=self.device
         )
         new_k = torch.randn(
-            total_new, kv_head_num, head_dim, dtype=torch.bfloat16, device=self.device
+            total_new, kv_head_num, head_dim, dtype=dtype, device=self.device
         )
         new_v = torch.randn(
-            total_new, kv_head_num, head_dim, dtype=torch.bfloat16, device=self.device
+            total_new, kv_head_num, head_dim, dtype=dtype, device=self.device
         )
 
         ref_output = reference_prefill_with_prefix(
@@ -585,9 +635,23 @@ class CPAttnTestBase(unittest.TestCase):
             prefix_lengths=prefix_lengths,
             device=self.device,
         )
+        attn_inputs.dtype = get_typemeta(torch.zeros(1, dtype=dtype))
+        attn_cfg.dtype = dtype
+        all_shuffle = [torch.cat([
+            torch.tensor(
+                zigzag_positions_for_rank(length, cp_size, rank),
+                dtype=torch.int32, device=self.device,
+            )
+            for length in new_lengths
+        ]) for rank in range(cp_size)]
+        attn_inputs.context_parallel_info.prefill_shuffle_indices = all_shuffle[cp_rank]
+        self._test_ring_kv = {
+            rank: torch.cat([all_local_k[rank], all_local_v[rank]])
+            for rank in range(cp_size)
+        }
         total_blocks = sum(math.ceil(s / tokens_per_block) for s in sequence_lengths)
         kv_cache = make_kv_cache(
-            total_blocks, kv_head_num, tokens_per_block, head_dim, device=self.device
+            total_blocks, kv_head_num, tokens_per_block, head_dim, device=self.device, dtype=dtype
         )
         fill_prefix_into_kv_cache(
             kv_cache,
@@ -598,9 +662,52 @@ class CPAttnTestBase(unittest.TestCase):
             tokens_per_block,
         )
 
+        local_prefix_pages = []
+        if sharded:
+            physical_tokens = physical_tokens_per_block or tokens_per_block
+            pages_per_physical = physical_tokens // tokens_per_block
+            assert all(pl % (physical_tokens * cp_size) == 0 for pl in prefix_lengths)
+            attn_cfg.tokens_per_block = physical_tokens
+            par_cfg.prefill_cp_config.kv_cache_sharded = True
+            page_counts = [math.ceil(sl / tokens_per_block) for sl in sequence_lengths]
+            local_counts = [
+                math.ceil(math.ceil(sl / physical_tokens) / cp_size) * pages_per_physical
+                for sl in sequence_lengths
+            ]
+            local_table = torch.zeros_like(attn_inputs.kv_cache_kernel_block_id)
+            offset = 1  # Slot zero is a sentinel, never a request's physical page.
+            for batch, count in enumerate(local_counts):
+                local_table[batch, :count] = torch.arange(offset, offset + count)
+                offset += count
+            full_cache = kv_cache.kv_cache_base
+            for rank in range(cp_size):
+                local_cache = make_kv_cache(
+                    offset, kv_head_num, tokens_per_block, head_dim, device=self.device, dtype=dtype
+                )
+                local_cache.kv_cache_base[0].fill_(777)
+                global_offset = 0
+                prefix_parts = []
+                for batch, pages in enumerate(page_counts):
+                    indices = torch.arange(pages, device=self.device)
+                    owned = indices[(indices // pages_per_physical) % cp_size == rank]
+                    physical = local_table[batch, :owned.numel()].long().to(self.device)
+                    local_cache.kv_cache_base[physical] = full_cache[global_offset + owned]
+                    prefix_count = prefix_lengths[batch] // (tokens_per_block * cp_size)
+                    prefix_parts.append(local_cache.kv_cache_base[physical[:prefix_count]])
+                    global_offset += pages
+                local_prefix_pages.append(torch.cat(prefix_parts))
+                if rank == cp_rank:
+                    kv_cache = local_cache
+            attn_inputs.kv_cache_kernel_block_id = local_table
+            attn_inputs.kv_cache_kernel_block_id_device = local_table.to(self.device)
+
         call_idx = [0]
 
         def mock_ag(tensor, group=None):
+            if tensor.dtype == torch.int32:
+                return torch.cat(all_shuffle)
+            if sharded and tensor.ndim == 5:
+                return torch.cat(local_prefix_pages)
             data = all_local_k if call_idx[0] % 2 == 0 else all_local_v
             call_idx[0] += 1
             return torch.cat(data, dim=0)
@@ -609,6 +716,10 @@ class CPAttnTestBase(unittest.TestCase):
             stack.enter_context(
                 patch(f"{self.AG_MODULE}.all_gather", side_effect=mock_ag)
             )
+            stack.enter_context(patch(
+                "rtp_llm.models_py.modules.factory.attention.cuda_cp_impl.prefill_mha.cp_utils.all_gather",
+                side_effect=mock_ag, create=True,
+            ))
             self._extra_patches(stack)
 
             op = self.OP_CLASS(attn_cfg, attn_inputs, par_cfg)
@@ -617,9 +728,6 @@ class CPAttnTestBase(unittest.TestCase):
 
         self._assert_close(output, ref_output[rank_idx], rtol=rtol, atol=atol)
 
-        cache_k, cache_v = extract_kv_from_paged_cache(
-            kv_cache, sequence_lengths, tokens_per_block
-        )
         expected_k_parts: List[torch.Tensor] = []
         expected_v_parts: List[torch.Tensor] = []
         pk_off, nk_off = 0, 0
@@ -632,6 +740,24 @@ class CPAttnTestBase(unittest.TestCase):
             nk_off += new_len
         expected_cache_k = torch.cat(expected_k_parts, dim=0)
         expected_cache_v = torch.cat(expected_v_parts, dim=0)
+        if sharded:
+            token_offset = 0
+            for batch, seq_len in enumerate(sequence_lengths):
+                owned = [page for page in range(page_counts[batch])
+                         if (page // pages_per_physical) % cp_size == cp_rank]
+                for local, logical in enumerate(owned):
+                    physical = int(local_table[batch, local])
+                    begin = token_offset + logical * tokens_per_block
+                    count = min(tokens_per_block, seq_len - logical * tokens_per_block)
+                    for component, expected in enumerate([expected_cache_k, expected_cache_v]):
+                        actual = kv_cache.kv_cache_base[physical, component, :, :count].permute(1, 0, 2)
+                        self.assertTrue(torch.equal(actual, expected[begin:begin + count]))
+                token_offset += seq_len
+            self.assertTrue(torch.all(kv_cache.kv_cache_base[0] == 777))
+            return
+        cache_k, cache_v = extract_kv_from_paged_cache(
+            kv_cache, sequence_lengths, tokens_per_block
+        )
         self.assertTrue(
             torch.equal(cache_k, expected_cache_k),
             f"KV cache K mismatch: max_diff="

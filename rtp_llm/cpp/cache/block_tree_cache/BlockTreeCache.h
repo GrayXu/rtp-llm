@@ -122,16 +122,19 @@ public:
     ~BlockTreeCache();
     bool init();
 
-    BlockTreeMatchResult match(const CacheKeysType& cache_keys);
+    BlockTreeMatchResult match(const CacheKeysType&                 cache_keys,
+                               std::shared_ptr<const CacheKeysType> remote_keys = nullptr);
     void                 insert(const CacheKeysType&                              cache_keys,
                                 const std::vector<std::vector<GroupSetResource>>& resources,
-                                Tier                                              target_tier);
+                                Tier                                              target_tier,
+                                std::shared_ptr<const StorageRequest>             remote_write = nullptr);
     // Returns the resident key-prefix count, including nodes that were already resident.
     size_t insert(const CacheKeysType&                              cache_keys,
                   const std::vector<std::vector<GroupSetResource>>& resources,
                   Tier                                              target_tier,
                   bool                                              is_resident,
-                  bool                                              write_remote_from_device = false);
+                  bool                                              write_remote_from_device = false,
+                  std::shared_ptr<const StorageRequest>             remote_write             = nullptr);
     // Directly reclaim up to num_blocks device blocks belonging to one group set
     // (target_tier = NONE, content dropped). Returns the number actually freed.
     int evictForGroup(std::string_view group_tag, size_t num_blocks);

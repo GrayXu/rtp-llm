@@ -41,7 +41,8 @@ public:
                                  bool                                              is_resident,
                                  size_t&                                           resident_prefix_length,
                                  bool                                              write_remote_from_device,
-                                 bool                                              allow_remote_write = true);
+                                 bool                                              allow_remote_write = true,
+                                 std::shared_ptr<const StorageRequest>             remote_write       = nullptr);
     void             stopAdmissionLocked();
 
 private:

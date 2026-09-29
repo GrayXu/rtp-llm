@@ -4,6 +4,7 @@
 #include <typeinfo>
 #include <limits>
 #include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/GroupPolicy.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/CanonicalCacheLayout.h"
 #include "rtp_llm/cpp/cache/Types.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/Logger.h"
@@ -24,7 +25,9 @@ std::string genLocationSpecName(int tp_rank, const std::string& group_name) {
     return "tp" + std::to_string(tp_rank) + "_" + group_name;
 }
 
-bool GroupPolicy::buildLocationSpecGroups(int tp_size, LocationSpecGroups& location_spec_groups) {
+bool GroupPolicy::buildLocationSpecGroups(int                               tp_size,
+                                          LocationSpecGroups&               location_spec_groups,
+                                          const std::map<std::string, int>* logical_shards) {
     if (tp_size <= 0 || groups_.empty()) {
         RTP_LLM_LOG_ERROR("cannot build KVCM location groups: tp_size=%d groups=%zu", tp_size, groups_.size());
         return false;
@@ -39,11 +42,13 @@ bool GroupPolicy::buildLocationSpecGroups(int tp_size, LocationSpecGroups& locat
             return false;
         }
         new_location_spec_group_map[group.group_name_bithash] = group.group_name;
-        for (int rank = 0; rank < tp_size; ++rank) {
-            const std::string spec_name = genLocationSpecName(rank, group.group_name);
+        const int count = logical_shards ? logical_shards->at(group.tag) : tp_size;
+        for (int rank = 0; rank < count; ++rank) {
+            const std::string spec_name = logical_shards ? genCanonicalSpecName(rank, group.group_name) :
+                                                           genLocationSpecName(rank, group.group_name);
             group_it->second.push_back(spec_name);
-            const auto [unused_it, spec_inserted] =
-                new_spec_name_to_info.emplace(spec_name, SpecInfo{group_id, rank, group.tag});
+            const auto [unused_it, spec_inserted] = new_spec_name_to_info.emplace(
+                spec_name, SpecInfo{group_id, logical_shards ? -1 : rank, group.tag, logical_shards ? rank : -1});
             (void)unused_it;
             if (!spec_inserted) {
                 RTP_LLM_LOG_ERROR("duplicate KVCM location spec [%s]", spec_name.c_str());

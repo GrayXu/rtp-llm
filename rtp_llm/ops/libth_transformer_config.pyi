@@ -731,6 +731,7 @@ class KVCacheConfig:
     kvcm_asyncwrapper_thread_num: int
     kvcm_client_config: str
     kvcm_default_query_type: int
+    kvcm_remote_layout: str
     kvcm_query_type: int
     kvcm_sw_size: int
     kvcm_read_backend_type: int

@@ -339,6 +339,15 @@ def init_kv_cache_group_args(parser, kv_cache_config):
         help="instance_group名称",
     )
     kv_cache_group.add_argument(
+        "--kvcm_remote_layout",
+        env_name="KVCM_REMOTE_LAYOUT",
+        bind_to=(kv_cache_config, "kvcm_remote_layout"),
+        type=str,
+        choices=["legacy", "canonical_v1"],
+        default="legacy",
+        help="Remote storage layout; canonical_v1 shares KV across attention TP/CP topologies",
+    )
+    kv_cache_group.add_argument(
         "--kvcm_default_query_type",
         env_name="KVCM_DEFAULT_QUERY_TYPE",
         bind_to=(kv_cache_config, "kvcm_default_query_type"),

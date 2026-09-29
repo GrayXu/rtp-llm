@@ -49,6 +49,11 @@ struct StorageRequest {
     Tier source_tier{Tier::DEVICE};
     // Shared HOST writes retain pins while local payload completion is unknown.
     std::shared_ptr<std::atomic<bool>> host_payload_dispatched;
+    // Complete original fixed-token-block keys at the remote CP boundary.
+    // Local tree keys may each represent one full CP round.
+    std::shared_ptr<const CacheKeysType> remote_keys;
+    // Explicit global-key write assembled before CP local-tree projection.
+    bool keys_are_global{false};
 
     bool empty() const {
         for (const auto& key_handles : handles) {
@@ -145,6 +150,8 @@ protected:
     BufferResolver bufferResolver(Tier source = Tier::DEVICE) const {
         return source == Tier::HOST ? host_buffer_resolver_ : buffer_resolver_;
     }
+    const PoolsByTag& devicePools() const { return pools_by_tag_; }
+    const HostPoolsByTag& hostPools() const { return host_pools_by_tag_; }
     const CacheTopology&      topology() const;
     const DeviceBlockPoolPtr& devicePool(const std::string& tag) const;
     const std::shared_ptr<HostBlockPool>& hostPool(const std::string& tag) const;
@@ -157,6 +164,11 @@ protected:
     // this predicate for each candidate prefix; the core applies the same rule
     // before allocating read targets.
     bool isHandleRequired(size_t key_index, size_t matched_key_count, std::string_view tag) const;
+    // RPC execution participates in shutdown/drain. Worker ranks borrow the
+    // registered pool span; TP0 additionally holds allocator references.
+    bool runTransfer(StorageRequest request,
+                     bool allocation_owner,
+                     const std::function<bool(StorageWriteTask)>& transfer);
 
     virtual bool               initImpl()                                                           = 0;
     virtual StorageMatchResult matchImpl(const StorageRequest& request)                             = 0;
@@ -175,7 +187,8 @@ private:
     };
     using Operation = std::function<void(Lifecycle outcome)>;
 
-    std::shared_ptr<storage_backend_detail::StorageTaskState> prepare(StorageRequest request, bool allow_host = false);
+    std::shared_ptr<storage_backend_detail::StorageTaskState>
+         prepare(StorageRequest request, bool allow_host = false, bool allocation_owner = true);
     void validateRequest(const StorageRequest& request, bool allow_null_blocks, bool allow_host = false) const;
     bool                                 dispatch(Operation operation);
     void                                 taskFinished();

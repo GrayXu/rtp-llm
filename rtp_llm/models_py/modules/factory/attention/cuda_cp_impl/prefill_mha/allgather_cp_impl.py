@@ -10,6 +10,7 @@ from rtp_llm.ops.compute_ops import (
     ParamsBase,
     PyAttentionInputs,
     fill_mla_params,
+    get_scalar_type,
 )
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,7 @@ from rtp_llm.models_py.modules.factory.attention.cuda_cp_impl.prefill_mha.cp_uti
     generate_full_causal_kv_indices,
     generate_q_indices,
     plan_prefix_paged_attention,
+    CPKVCachePlan,
 )
 from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
     get_py_flashinfer_workspace_buffer,
@@ -69,7 +71,11 @@ class PCPAllGatherAttnOp:
         self.prefill_cp_rank = parallelism_config.tp_rank
         self.prefill_cp_size = parallelism_config.tp_size
 
-        self.seq_size_per_block = attn_configs.tokens_per_block
+        self.seq_size_per_block = (
+            attn_configs.kernel_tokens_per_block or attn_configs.tokens_per_block
+        )
+        self.parallelism_config = parallelism_config
+        self.q_dtype = get_scalar_type(attn_inputs.dtype)
 
         self.q0_idx = self.q1_idx = None
         self.kv0_idx = self.kv1_idx = None
@@ -118,12 +124,16 @@ class PCPAllGatherAttnOp:
         self.q0_idx = torch.tensor(q0_idx, device=self.device)
         self.q1_idx = torch.tensor(q1_idx, device=self.device)
 
+
+        self.cache_plan = CPKVCachePlan(
+            attention_inputs, self.attn_configs, self.parallelism_config
+        )
         params = fill_mla_params(
             self.attn_inputs.prefix_lengths,
             self.attn_inputs.sequence_lengths,
             self.cp_info.prefill_actual_input_lengths_cpu,
-            self.attn_inputs.kv_cache_kernel_block_id,
-            self.attn_configs.kernel_tokens_per_block,
+            self.cache_plan.block_table,
+            self.seq_size_per_block,
         )
 
         self._plan_ragged(qo_indptr)
@@ -139,6 +149,7 @@ class PCPAllGatherAttnOp:
                 head_dim=self.head_dim,
                 page_size=self.seq_size_per_block,
                 device=self.device,
+                q_data_type=self.q_dtype,
             )
         return params
 
@@ -150,7 +161,7 @@ class PCPAllGatherAttnOp:
             "num_kv_heads": self.num_kv_heads,
             "head_dim_qk": self.head_dim,
             "causal": True,
-            "q_data_type": torch.bfloat16,
+            "q_data_type": self.q_dtype,
         }
         self.prefill_wrappers["ragged"]["part0"].plan(
             qo_indptr=qo_indptr,
@@ -197,6 +208,8 @@ class PCPAllGatherAttnOp:
         kv_cache_tensor = kv_cache.kv_cache_base.view(
             -1, 2, self.num_kv_heads, self.seq_size_per_block, self.head_dim
         )
+        local_cache = kv_cache_tensor
+        kv_cache_tensor = self.cache_plan.materialize(local_cache)
         append_paged_kv_cache(
             append_key=restore_k,
             append_value=restore_v,
@@ -208,6 +221,7 @@ class PCPAllGatherAttnOp:
             kv_last_page_len=params.paged_kv_last_page_len_d,
             kv_layout="HND",
         )
+        self.cache_plan.store(kv_cache_tensor, local_cache)
 
         q0 = torch.index_select(q_reshaped, 0, self.q0_idx).contiguous()
         q1 = torch.index_select(q_reshaped, 0, self.q1_idx).contiguous()

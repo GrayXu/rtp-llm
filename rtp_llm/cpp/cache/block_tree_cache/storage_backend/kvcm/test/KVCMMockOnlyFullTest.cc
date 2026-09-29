@@ -21,6 +21,7 @@ TEST(KVCMMockOnlyFullTest, TPFollowerUsesControllerBlockIdsWithoutLocalAllocatio
         [&](int layer, const std::string&, int block) {
             return environment.device_pool->convertIndexToBuffer(layer, block);
         }));
+    const auto generation = environment.device_pool->blockAllocationGeneration(environment.block_id);
     environment.device_pool->decRef(environment.block_id);
     ASSERT_FALSE(environment.device_pool->isAllocated(environment.block_id));
     EXPECT_CALL(*client, saveKvCachesForTag("default", kv_cache_manager::UriStrVec{"write_uri"}, _, _))
@@ -29,6 +30,7 @@ TEST(KVCMMockOnlyFullTest, TPFollowerUsesControllerBlockIdsWithoutLocalAllocatio
     request.set_op(REMOTE_OPERATION_WRITE);
     request.add_group_tags("default");
     request.add_block_ids(environment.block_id);
+    request.add_block_generations(generation);
     request.add_uris("write_uri");
     RemoteOperationResponsePB response;
     EXPECT_TRUE(backend->execute(request, response));
@@ -357,6 +359,7 @@ TEST(KVCMMockOnlyFullTest, TP2WorkerRegistersItsRankAndExecutesLocalPayload) {
     read_request.set_op(REMOTE_OPERATION_READ);
     read_request.add_group_tags("default");
     read_request.add_block_ids(environment.block_id);
+    read_request.add_block_generations(environment.device_pool->blockAllocationGeneration(environment.block_id));
     read_request.add_uris(expected_read_uris.front());
     RemoteOperationResponsePB read_response;
     EXPECT_TRUE(backend->execute(read_request, read_response));
@@ -368,6 +371,7 @@ TEST(KVCMMockOnlyFullTest, TP2WorkerRegistersItsRankAndExecutesLocalPayload) {
     write_request.set_op(REMOTE_OPERATION_WRITE);
     write_request.add_group_tags("default");
     write_request.add_block_ids(environment.block_id);
+    write_request.add_block_generations(environment.device_pool->blockAllocationGeneration(environment.block_id));
     write_request.add_uris(expected_write_uris.front());
     RemoteOperationResponsePB write_response;
     ASSERT_TRUE(backend->execute(write_request, write_response));

@@ -1,4 +1,6 @@
 import torch
+
+from rtp_llm.models_py.distributed.collective_torch import Group, all_gather
 from flashinfer import BatchPrefillWithPagedKVCacheWrapper
 
 
@@ -13,6 +15,7 @@ def plan_prefix_paged_attention(
     head_dim: int,
     page_size: int,
     device,
+    q_data_type: torch.dtype = torch.bfloat16,
 ) -> None:
     """Plan paged attention for the prefix portion of KV cache.
 
@@ -56,7 +59,7 @@ def plan_prefix_paged_attention(
         head_dim_qk=head_dim,
         page_size=page_size,
         causal=False,
-        q_data_type=torch.bfloat16,
+        q_data_type=q_data_type,
     )
 
 
@@ -228,3 +231,78 @@ def generate_half_kv_indices(cp_chunk_lengths):
         half_kv_indices.extend(range(offset, offset + (chunk_len) // 2))
         offset += chunk_len
     return half_kv_indices
+
+
+class CPKVCachePlan:
+    """Map compact CP storage to one layer's logical attention pages."""
+
+    def __init__(self, inputs, configs, parallelism):
+        self.enabled = parallelism.prefill_cp_config.kv_cache_sharded
+        self.rank = parallelism.tp_rank
+        self.size = parallelism.tp_size
+        self.page_size = configs.kernel_tokens_per_block or configs.tokens_per_block
+        self.pages_per_block = configs.tokens_per_block // self.page_size
+        self.block_table = inputs.kv_cache_kernel_block_id
+        if not self.enabled:
+            return
+        self.device = torch.cuda.current_device()
+        host_table = self.block_table.cpu()
+        self.local_block_table = self.block_table.to(self.device)
+        prefix = inputs.prefix_lengths.tolist()
+        if any(length % (configs.tokens_per_block * self.size) for length in prefix):
+            raise ValueError("sharded CP prefix must contain complete ownership rounds")
+        self.prefix_pages = [length // (self.page_size * self.size) for length in prefix]
+        lengths = inputs.prefix_lengths + inputs.context_parallel_info.prefill_actual_input_lengths_cpu
+        self.page_counts = ((lengths + self.page_size - 1) // self.page_size).tolist()
+        self.page_starts = []
+        self.block_table = torch.zeros(
+            len(self.page_counts), max(self.page_counts, default=0), dtype=torch.int32
+        )
+        start = 0
+        for batch, count in enumerate(self.page_counts):
+            owned_count = sum(
+                (page // self.pages_per_block) % self.size == self.rank
+                for page in range(count)
+            )
+            needed = host_table[batch, :owned_count]
+            if needed.numel() != owned_count or torch.any(needed <= 0).item():
+                raise ValueError("sharded CP owned pages must have allocated local slots")
+            self.page_starts.append(start)
+            self.block_table[batch, :count] = torch.arange(start, start + count)
+            start += count
+
+    def materialize(self, local_cache):
+        if not self.enabled:
+            return local_cache
+        cache = local_cache.new_zeros((sum(self.page_counts), *local_cache.shape[1:]))
+        total = sum(self.prefix_pages)
+        if not total:
+            return cache
+        local_prefix = torch.cat([
+            local_cache[self.local_block_table[batch, :count].long()]
+            for batch, count in enumerate(self.prefix_pages)
+        ])
+        gathered = all_gather(local_prefix, group=Group.TP).view(
+            self.size, total, *local_cache.shape[1:]
+        )
+        offset = 0
+        for batch, count in enumerate(self.prefix_pages):
+            if count:
+                pages = gathered[:, offset:offset + count].reshape(
+                    self.size, count // self.pages_per_block,
+                    self.pages_per_block, *local_cache.shape[1:]
+                ).transpose(0, 1).flatten(0, 2)
+                start = self.page_starts[batch]
+                cache[start:start + count * self.size] = pages
+            offset += count
+        return cache
+
+    def store(self, cache, local_cache):
+        if not self.enabled:
+            return
+        for batch, count in enumerate(self.page_counts):
+            pages = torch.arange(count, device=self.device)
+            owned = pages[(pages // self.pages_per_block) % self.size == self.rank]
+            if owned.numel():
+                physical = self.local_block_table[batch, :owned.numel()].long()
+                local_cache.index_copy_(0, physical, cache[self.page_starts[batch] + owned])

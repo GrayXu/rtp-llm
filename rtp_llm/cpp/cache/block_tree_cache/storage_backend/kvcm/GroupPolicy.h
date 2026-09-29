@@ -53,6 +53,7 @@ public:
         int32_t     group_id;
         int32_t     tp_rank;
         std::string tag;
+        int32_t     shard = -1;  // canonical_v1 logical component; legacy uses tp_rank
     };
     using SpecInfoMap        = std::map<std::string, SpecInfo, std::less<>>;
     using SpecNames          = std::vector<std::string>;
@@ -97,7 +98,9 @@ public:
 
     // Build singleton and reachable aggregate location groups using the
     // canonical group-name order used by the legacy KVCM protocol.
-    bool buildLocationSpecGroups(int tp_size, LocationSpecGroups& location_spec_groups);
+    bool buildLocationSpecGroups(int                               tp_size,
+                                 LocationSpecGroups&               location_spec_groups,
+                                 const std::map<std::string, int>* logical_shards = nullptr);
 
     bool validateWriteLocation(const kv_cache_manager::Location& location,
                                const std::string&                location_spec_group_name) const;

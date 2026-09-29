@@ -4,6 +4,7 @@
 #include <exception>
 #include <mutex>
 #include <memory>
+#include <numeric>
 #include <thread>
 #include <unistd.h>
 #include <limits.h>
@@ -781,7 +782,8 @@ BroadcastLoadRequestPB DecodeRpcServer::constructRemoteLoadRequestForMla(
 
 BroadcastLoadRequestPB DecodeRpcServer::constructRemoteLoadRequest(const LoadKVCacheContext&       load_context,
                                                                    int                             index,
-                                                                   const std::vector<std::string>& peer_addrs) const {
+                                                                   const std::vector<std::string>& peer_addrs,
+                                                                   bool split_cp_heads) const {
     load_context.groupBlockIds().validate();
     BroadcastLoadRequestPB request;
     request.set_request_id(load_context.request_id);
@@ -789,11 +791,22 @@ BroadcastLoadRequestPB DecodeRpcServer::constructRemoteLoadRequest(const LoadKVC
     request.set_dp_rank(maga_init_params_.parallelism_config.dp_rank);
     request.set_prefill_cp_size(load_context.prefill_cp_size);
     if (load_context.prefill_cp_size > 1) {
-        // CP-sharded prefill: each peer owns a page-level or in-page shard.
-        // Keep one logical partition and let loadCache route groups/blocks to
-        // the owning peer.
+        // CP peers own token pages with all KV heads. Partition each selected
+        // page into the decode head groups, including GQA replicas.
         request.set_partition_count(1);
         request.set_partition_id(0);
+        if (split_cp_heads) {
+            const int workers = static_cast<int>(resource_.workers.size());
+            const int heads   = static_cast<int>(maga_init_params_.model_config_.attn_config.kv_head_num);
+            RTP_LLM_CHECK_WITH_INFO(workers > 0 && heads > 0 && index >= 0 && index < workers,
+                                    "invalid CP-to-TP head partition: workers=%d heads=%d index=%d",
+                                    workers,
+                                    heads,
+                                    index);
+            const int partitions = std::gcd(workers, heads);
+            request.set_partition_count(partitions);
+            request.set_partition_id(index / (workers / partitions));
+        }
         for (const auto& addr : peer_addrs) {
             request.add_peer_addrs(addr);
         }
@@ -896,7 +909,8 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCacheForAllRank(DecodeGene
 DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCacheAsyncForTp(DecodeGenerateContext& decode_context,
                                                                       LoadKVCacheContext&    load_context) {
     RTP_LLM_PROFILE_FUNCTION();
-    validateGroupTags(load_context, engine_->resourceContext().cache_manager->cacheConfig().topology());
+    const auto& cache_config = engine_->resourceContext().cache_manager->cacheConfig();
+    validateGroupTags(load_context, cache_config.topology());
     int64_t load_cache_begin_time_us = currentTimeUs();
 
     struct WorkerRpcContext {
@@ -938,10 +952,17 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCacheAsyncForTp(DecodeGene
         rpc_context.stub  = connect_status.value().stub;
         BroadcastLoadRequestPB load_request;
 
-        if (engine_->resourceContext().cache_manager->cacheConfig().use_mla) {
+        if (cache_config.use_mla) {
             load_request = constructRemoteLoadRequestForMla(load_context, i, decode_context.peer_addrs);
         } else {
-            load_request = constructRemoteLoadRequest(load_context, i, decode_context.peer_addrs);
+            // Opaque and hybrid records pack multiple state components;
+            // contiguous head partitioning applies to separate MHA K/V records.
+            load_request = constructRemoteLoadRequest(
+                load_context,
+                i,
+                decode_context.peer_addrs,
+                cache_config.groupNums() == 1 && !cache_config.use_opaque_kv_cache_store
+                    && cache_config.topology().groups().front().policy.group_type != CacheGroupType::LINEAR);
         }
         std::unique_ptr<ClientAsyncResponseReader<BroadcastLoadResponsePB>> reader(rpc_context.stub->AsyncRemoteLoad(
             rpc_context.client_context.get(), load_request, &completion_queues[i % completion_queues.size()]));
@@ -1225,12 +1246,13 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
                         makeCacheKey(model_id, std::to_string(load_context.cache_keys[cache_key_index]), layer_id, tag);
 
                     const bool             use_kv_key_prefix  = use_mla || use_opaque_kv_store || use_hybrid;
-                    const bool             use_whole_kv_block = is_page_level_rr || use_kv_key_prefix;
                     std::vector<BlockInfo> parts;
-                    if (use_whole_kv_block) {
+                    if (use_kv_key_prefix) {
                         parts = cache_manager->convertIndexToBuffer(layer_id, tag, block_id);
                     } else {
-                        parts = cache_manager->convertIndexToBuffer(layer_id, tag, block_id, peer_cnt, i);
+                        // Page RR selects the whole block from one peer; MHA PD keys still need separate K/V parts.
+                        parts = cache_manager->convertIndexToBuffer(
+                            layer_id, tag, block_id, is_page_level_rr ? 1 : peer_cnt, is_page_level_rr ? 0 : i);
                     }
 
                     parts            = sliceCpDestinationForPeer(std::move(parts), cache_config, tag, i);
@@ -1361,13 +1383,15 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
                                 const bool mtp_use_mla = mtp_cache_cfg.use_mla;
                                 const bool mtp_use_kv_key_prefix =
                                     mtp_use_mla || mtp_use_opaque_kv_store || mtp_use_hybrid;
-                                const bool mtp_use_whole_kv_block = is_page_level_rr || mtp_use_kv_key_prefix;
                                 std::vector<BlockInfo> parts;
-                                if (mtp_use_whole_kv_block) {
+                                if (mtp_use_kv_key_prefix) {
                                     parts = cache_manager->convertIndexToBuffer(global_layer_id, tag, block_id);
                                 } else {
-                                    parts = cache_manager->convertIndexToBuffer(
-                                        global_layer_id, tag, block_id, peer_cnt, i);
+                                    parts = cache_manager->convertIndexToBuffer(global_layer_id,
+                                                                                tag,
+                                                                                block_id,
+                                                                                is_page_level_rr ? 1 : peer_cnt,
+                                                                                is_page_level_rr ? 0 : i);
                                 }
 
                                 parts            = sliceCpDestinationForPeer(std::move(parts), mtp_cache_cfg, tag, i);

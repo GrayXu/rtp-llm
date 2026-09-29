@@ -24,12 +24,12 @@ class KVCacheConfigPickleTest(TestCase):
         for name, value in field_values.items():
             setattr(config, name, value)
         state = config.__getstate__()
-        self.assertEqual(len(state), 74)
-        self.assertEqual(state[:2], ("KVCacheConfig", 8))
+        self.assertEqual(len(state), 76)
+        self.assertEqual(state[:2], ("KVCacheConfig", 10))
         self.assertEqual(state[64:69], tuple(KV_CACHE_EVENT_FIELD_VALUES.values()))
         self.assertEqual(state[69:74], tuple(KVCM_PICKLE_FIELD_VALUES.values()))
         # setstate must normalize its private slice, not mutate the supplied
-        # version-8 tuple retained by another Python reference.
+        # version-10 tuple retained by another Python reference.
         original_state = tuple(list(state))
         direct = KVCacheConfig.__new__(KVCacheConfig)
         direct.__setstate__(state)
@@ -66,6 +66,31 @@ class KVCacheConfigPickleTest(TestCase):
                     self.assertEqual(getattr(restored, name), getattr(expected, name), name)
                 for name in KVCM_PICKLE_FIELD_VALUES:
                     self.assertEqual(getattr(restored, name), getattr(defaults, name), name)
+
+    def test_remote_layout_round_trip_and_previous_sdk_state(self):
+        source = KVCacheConfig()
+        source.kvcm_remote_layout = "canonical_v1"
+        source.kvcm_min_replica_count = 2
+        restored = pickle.loads(pickle.dumps(source))
+        self.assertEqual(restored.kvcm_remote_layout, "canonical_v1")
+        state = source.__getstate__()
+        previous = (state[0], 8, *state[2:74])
+        restored = KVCacheConfig.__new__(KVCacheConfig)
+        restored.__setstate__(previous)
+        self.assertEqual(restored.kvcm_remote_layout, "legacy")
+        self.assertEqual(restored.kvcm_min_replica_count, 2)
+
+    def test_version_nine_fields_preserve_their_original_meaning(self):
+        source = KVCacheConfig()
+        source.enable_remote_cache_write_on_finish = True
+        source.kvcm_remote_layout = "canonical_v1"
+        state = source.__getstate__()
+        for last_field in (True, "canonical_v1"):
+            previous = (state[0], 9, *state[2:74], last_field)
+            restored = KVCacheConfig.__new__(KVCacheConfig)
+            restored.__setstate__(previous)
+            self.assertEqual(restored.enable_remote_cache_write_on_finish, last_field is True)
+            self.assertEqual(restored.kvcm_remote_layout, "canonical_v1" if isinstance(last_field, str) else "legacy")
 
     def test_malformed_event_states_are_rejected(self):
         state = KVCacheConfig().__getstate__()

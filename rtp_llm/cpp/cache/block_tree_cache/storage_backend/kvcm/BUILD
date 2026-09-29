@@ -18,6 +18,8 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":client",
+        ":canonical_cache_layout",
+        "//rtp_llm/cpp/cache:worker_cache_io_fence",
         ":group_policy",
         "//rtp_llm/cpp/cache/block_tree_cache",
         "//rtp_llm/cpp/model_rpc:broadcast_manager",
@@ -40,9 +42,19 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//3rdparty/remote_kv_cache_manager:remote_kv_cache_manager_client_headers",
+        ":canonical_cache_layout",
         "//rtp_llm/cpp/cache/block_tree_cache",
         "//rtp_llm/cpp/utils:core_utils",
     ],
+)
+
+cc_library(
+    name = "canonical_cache_layout",
+    srcs = ["CanonicalCacheLayout.cc"],
+    hdrs = ["CanonicalCacheLayout.h"],
+    copts = copts(),
+    visibility = ["//visibility:public"],
+    deps = ["//rtp_llm/cpp/cache:cache_config"],
 )
 
 cc_library(

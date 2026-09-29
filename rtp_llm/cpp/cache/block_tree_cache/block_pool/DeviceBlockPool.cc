@@ -161,6 +161,7 @@ bool DeviceBlockPool::tryReplaceRequestReferences(const std::vector<RequestRefer
             auto& change     = changes[reclaimable[i]];
             change.new_count = 1;
             replacements.push_back(change.block);
+            ++allocation_generations_[change.block];
         }
         replacements.insert(replacements.end(), fresh_blocks->begin(), fresh_blocks->end());
 

@@ -59,6 +59,12 @@ struct GptModelInputs {
     // - hybrid cache: [group_nums, batch_size, block_nums]
     torch::Tensor kv_cache_block_id;
     torch::Tensor kv_cache_kernel_block_id;  // [group, batch, kernel_blocks], int32
+    // Internal TP wire metadata: [rows, 3] = global group index, physical block ID, allocation generation.
+    torch::Tensor worker_cache_block_generations;
+    // Root-only immutable publication pair; avoids reading a just-published
+    // CUDA block table back to CPU when preparing allocation generations.
+    torch::Tensor cache_generation_host_blocks;
+    torch::Tensor cache_generation_published_blocks;
 
     std::vector<std::string> kv_cache_group_tags;      // Local payload row -> group identity; not transmitted by TP.
     torch::Tensor            kv_cache_group_types;     // [group_num], int32, Convention: 0 -> LINEAR, 1 -> FULL.

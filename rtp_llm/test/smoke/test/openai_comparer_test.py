@@ -1,6 +1,7 @@
 import copy
 import json
 import unittest
+from pathlib import Path
 
 from smoke.common_def import QueryStatus, SmokeException, Tracer
 from smoke.openai_comparer import OpenaiComparer
@@ -114,6 +115,79 @@ class OpenaiComparerGraphStatusTest(unittest.TestCase):
             self._parse(self.golden),
             self._parse(self._response({GRAPH_STATUS: REPLAYED})),
         )
+
+
+class OpenaiComparerAsymmetricCacheTest(unittest.TestCase):
+    def setUp(self):
+        fixture_dir = Path(__file__).resolve().parent.parent / "data/model/qwen25"
+        self.fixtures = [
+            json.loads(
+                (
+                    fixture_dir / f"q_r_l20_remote_cache_pd_asymmetric_{layout}.json"
+                ).read_text()
+            )
+            for layout in ("tp", "cp")
+        ]
+
+    def _compare(self, row, content, aux_info):
+        comparer = OpenaiComparer(None, "", row, Tracer(), False)
+        expected = comparer.format_result(row["result"])
+        actual = comparer.format_result(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 149,
+                    "completion_tokens": 12,
+                    "total_tokens": 161,
+                },
+                "aux_info": aux_info,
+            }
+        )
+        comparer.compare_result(expected, actual)
+
+    def test_valid_json_does_not_require_identical_generated_text(self):
+        for fixture in self.fixtures:
+            for row in fixture["query_result"]:
+                for content in (
+                    '{"recommendation":"Kung Fu Panda"}',
+                    '{\n  "recommendation": "Zootopia"\n}',
+                ):
+                    with self.subTest(content=content, checks=row["compare_config"]):
+                        aux = dict(row["compare_config"]["required_aux_info"])
+                        aux.update(iter_count=12, output_len=12, cost_time=20.0)
+                        self._compare(row, content, aux)
+
+    def test_invalid_json_or_wrong_cache_attribution_is_rejected(self):
+        for fixture in self.fixtures:
+            row = fixture["query_result"][1]
+            required = row["compare_config"]["required_aux_info"]
+            invalid = [
+                ("not JSON", required),
+                ("{}", required),
+                ('{"recommendation":"Zootopia"}', None),
+            ]
+            for field in (
+                "prefill_remote_reuse_len",
+                "decode_remote_reuse_len",
+                "prefill_local_reuse_len",
+                "decode_local_reuse_len",
+            ):
+                aux = dict(required)
+                aux[field] = 0 if "remote" in field else 1
+                invalid.append(('{"recommendation":"Zootopia"}', aux))
+            for content, aux in invalid:
+                with self.subTest(content=content, aux=aux):
+                    with self.assertRaises(SmokeException) as raised:
+                        self._compare(row, content, aux)
+                    self.assertEqual(
+                        raised.exception.error_status, QueryStatus.COMPARE_FAILED
+                    )
 
 
 if __name__ == "__main__":

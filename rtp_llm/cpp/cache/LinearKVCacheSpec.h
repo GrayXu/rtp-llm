@@ -82,6 +82,10 @@ struct LinearKVCacheSpec: public KVCacheSpec {
                                 tp);
 
         auto spec                  = std::make_shared<LinearKVCacheSpec>(desc.tag, seq, kernel, local_v_heads);
+        spec->global_kv_head_num   = value_heads;
+        spec->global_key_heads     = key_heads;
+        spec->conv_kernel          = static_cast<uint32_t>(linear.linear_conv_kernel_dim - 1);
+        spec->head_dim             = static_cast<uint32_t>(linear.linear_key_head_dim);
         spec->memory_layout_dtype_ = desc.dtype != DataType::TYPE_INVALID ? desc.dtype : ctx.dtype;
         RTP_LLM_CHECK_WITH_INFO(spec->memory_layout_dtype_ != DataType::TYPE_INVALID,
                                 "KVCacheSpecDesc tag=%s cache_type=%d requires valid dtype",
@@ -136,6 +140,13 @@ struct LinearKVCacheSpec: public KVCacheSpec {
         return std::make_shared<LinearKVCacheSpec>(*this);
     }
 
+    DataType ssmStateDType() const {
+        return ssm_state_dtype;
+    }
+    DataType convStateDType() const {
+        return conv_state_dtype;
+    }
+
     std::string debugString(size_t indent = 0) const override {
         std::ostringstream os;
         os << std::string(indent, ' ') << "LinearKVCacheSpec{\n";
@@ -143,6 +154,11 @@ struct LinearKVCacheSpec: public KVCacheSpec {
         os << std::string(indent, ' ') << "}\n";
         return os.str();
     }
+
+    // State layout: SSM[value_head, value_dim, key_dim], Conv[history, Q|K|V].
+    uint32_t global_key_heads = 0;
+    uint32_t conv_kernel      = 0;
+    uint32_t head_dim         = 0;
 
 private:
     DataType memory_layout_dtype_ = DataType::TYPE_INVALID;

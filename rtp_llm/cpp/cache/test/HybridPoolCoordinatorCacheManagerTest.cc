@@ -605,6 +605,7 @@ static void runStorageRoundTrip(const CacheConfig&                           con
     auto          writer         = makeAllocator(config);
     KVCacheConfig remote_config;
     remote_config.enable_remote_cache = true;
+    remote_config.enable_remote_cache_write_on_finish = true;
     writer->setBlockTreeCacheConfigForTest(remote_config);
     writer->setStorageBackendForTest(writer_backend);
     ASSERT_TRUE(writer->init());
@@ -690,7 +691,14 @@ TEST_F(HybridPoolCoordinatorCacheManagerTest, StorageRoundTripMapsCpCanonicalFul
                         request_keys,
                         /*reader_seq_len=*/41,
                         cp_mapper,
-                        {{"linear", "full"}, {"linear", "full"}, {"linear", "full"}, {"linear", "full"}},
+                        {{"full"},
+                         {"linear", "full"},
+                         {"full"},
+                         {"linear", "full"},
+                         {"full"},
+                         {"linear", "full"},
+                         {"full"},
+                         {"linear", "full"}},
                         {{"full"}, {"full"}, {"full"}, {"linear", "full"}});
 }
 
@@ -1718,6 +1726,9 @@ TEST_F(HybridPoolCoordinatorCacheManagerTest, InitMallocRollbackReleasesLowerTie
         }
     }
     cache->insert(cached_keys, slots, Tier::HOST);
+    for (const auto& [group_set, source_block] : host_sources) {
+        group_set->releaseSingleBlock(Tier::HOST, source_block, BlockTreeRefType::CACHE);
+    }
 
     const auto counters_before = snapshotPoolCounters(allocator);
     for (const auto& [group_set, source_block] : host_sources) {

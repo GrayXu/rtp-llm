@@ -9,6 +9,8 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <future>
+#include <chrono>
 #include <vector>
 
 #include "rtp_llm/cpp/cache/BatchKVCacheResource.h"
@@ -230,6 +232,74 @@ TEST_F(HybridCoordinatorCacheManagerCPShardTest, InsertIntoCacheUsesCanonicalKey
     ASSERT_EQ(allocator->blockTreeCacheOwner()->matchedBlocksForGroup("full", match.matched_device_resources),
               full_blocks);
     block_tree_cache_test::releaseRequestRefsForTest(*allocator->blockTreeCacheOwner(), match.matched_device_resources);
+}
+
+namespace {
+class RecordingCpStorageBackend final: public StorageBackend {
+public:
+    ~RecordingCpStorageBackend() override {
+        shutdown();
+    }
+    std::promise<StorageRequest> written;
+
+protected:
+    bool initImpl() override {
+        return true;
+    }
+    StorageMatchResult matchImpl(const StorageRequest& request) override {
+        return {request.local_matched_blocks_num, nullptr};
+    }
+    void readImpl(const StorageRequest&, const std::shared_ptr<StorageBackendMatchMeta>&) override {}
+    void writeImpl(const StorageRequest& request) override {
+        written.set_value(request);
+    }
+};
+}  // namespace
+
+TEST_F(HybridCoordinatorCacheManagerCPShardTest, RemoteWritePreservesGlobalFullKeysBeforeVirtualTreeProjection) {
+    for (size_t count : {size_t{3}, size_t{5}}) {
+        auto config    = makeCPHybridConfig();
+        auto storage   = std::make_shared<RecordingCpStorageBackend>();
+        auto written   = storage->written.get_future();
+        auto allocator = std::make_shared<TestHybridTypeCoordinatorCacheManager>(config, AllocationType::DEVICE);
+        KVCacheConfig options;
+        options.enable_remote_cache                 = true;
+        options.enable_remote_cache_write_on_finish = true;
+        allocator->setBlockTreeCacheConfigForTest(options);
+        allocator->setStorageBackendForTest(storage);
+        allocator->setCPSlotMapper(std::make_shared<CPSlotMapper>(0, 4, 4));
+        ASSERT_TRUE(allocator->init());
+        CacheKeysType keys;
+        for (size_t i = 0; i < count; ++i) {
+            keys.push_back(100 + i);
+        }
+        auto       resource = makeBatchRes(1, config, keys);
+        auto       tokens   = makeTokens(1, count * 4, 4);
+        MallocInfo malloc_info{resource, tokens};
+        malloc_info.enable_cache_lookup = false;
+        malloc_info.reuse_cache         = false;
+        ASSERT_TRUE(allocator->malloc(malloc_info).success);
+        const auto local_blocks = resource->blocks(0, "full");
+        size_t     resident     = 0;
+        allocator->insertIntoCache(InsertInfo{resource, tokens, false, Tier::DEVICE}, resident);
+        ASSERT_EQ(written.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+        const auto request = written.get();
+        EXPECT_TRUE(request.keys_are_global);
+        ASSERT_TRUE(request.keys);
+        EXPECT_EQ(*request.keys, keys);
+        ASSERT_EQ(request.handles.size(), count);
+        for (size_t key = 0; key < count; ++key) {
+            const auto& handles = request.handles[key];
+            const auto  full    = std::find_if(
+                handles.begin(), handles.end(), [](const StorageBlockHandle& handle) { return handle.tag == "full"; });
+            ASSERT_NE(full, handles.end());
+            EXPECT_EQ(full->block, local_blocks.at(key / 4));
+        }
+        const auto snapshot = allocator->blockTreeCacheOwner()->getKeySnapshot();
+        EXPECT_EQ(snapshot.keys, count == 3 ? CacheKeysType{} : CacheKeysType{103});
+        storage->shutdown();
+        allocator->free(FreeInfo{resource, tokens});
+    }
 }
 
 // 6) Two-malloc smoke: cp_size=4 sharding, request occupies 8 logical blocks ⇒ 2 per rank.

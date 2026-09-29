@@ -196,11 +196,12 @@ StorageBackend::HostWriteResolution BlockTreeCache::resolveHostWrite(const Cache
     return {storage_backend_->prepareWrite(std::move(request)), std::move(blocks)};
 }
 
-BlockTreeMatchResult BlockTreeCache::match(const CacheKeysType& cache_keys) {
+BlockTreeMatchResult BlockTreeCache::match(const CacheKeysType&                 cache_keys,
+                                           std::shared_ptr<const CacheKeysType> remote_keys) {
     BlockTreeMatchResult result;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        result = loader_.matchLocked(cache_keys);
+        result = loader_.matchLocked(cache_keys, std::move(remote_keys));
     }
     metrics_reporter_->reportCacheReuseTimeMetrics(result.reuse_time_metrics_snapshots);
     return result;
@@ -208,28 +209,32 @@ BlockTreeMatchResult BlockTreeCache::match(const CacheKeysType& cache_keys) {
 
 void BlockTreeCache::insert(const CacheKeysType&                              cache_keys,
                             const std::vector<std::vector<GroupSetResource>>& resources,
-                            Tier                                              target_tier) {
-    (void)insert(cache_keys, resources, target_tier, false);
+                            Tier                                              target_tier,
+                            std::shared_ptr<const StorageRequest>             remote_write) {
+    (void)insert(cache_keys, resources, target_tier, false, false, std::move(remote_write));
 }
 
 size_t BlockTreeCache::insert(const CacheKeysType&                              cache_keys,
                               const std::vector<std::vector<GroupSetResource>>& resources,
                               Tier                                              target_tier,
                               bool                                              is_resident,
-                              bool                                              write_remote_from_device) {
+                              bool                                              write_remote_from_device,
+                              std::shared_ptr<const StorageRequest>             remote_write) {
     size_t           resident_prefix_length = 0;
     StorageWriteTask storage_write;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        // Request finish marks its DEVICE source explicitly; direct writes keep their existing admission.
-        const bool allow_remote_write = !write_remote_from_device || config_.enable_remote_cache_write_on_finish;
-        storage_write = storer_.storeLocked(cache_keys,
-                                           resources,
-                                           target_tier,
-                                           is_resident,
-                                           resident_prefix_length,
-                                           write_remote_from_device,
-                                           allow_remote_write);
+        // Both DEVICE and global-key writes initiated at request finish use the opt-in gate.
+        const bool finish_write       = write_remote_from_device || remote_write != nullptr;
+        const bool allow_remote_write = !finish_write || config_.enable_remote_cache_write_on_finish;
+        storage_write                 = storer_.storeLocked(cache_keys,
+                                                            resources,
+                                                            target_tier,
+                                                            is_resident,
+                                                            resident_prefix_length,
+                                                            write_remote_from_device,
+                                                            allow_remote_write,
+                                                            std::move(remote_write));
     }
     if (storage_write) {
         storage_backend_->write(std::move(storage_write));

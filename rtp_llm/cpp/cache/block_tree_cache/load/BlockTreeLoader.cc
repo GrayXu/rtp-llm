@@ -45,14 +45,15 @@ BlockTreeLoader::BlockTreeLoader(BlockTree*                      tree,
                 context.loadDescs(), context.joinedLoads(), 0, context.contextId(), /*release_transferred_refs=*/false);
         })) {}
 
-BlockTreeMatchResult BlockTreeLoader::matchLocked(const CacheKeysType& cache_keys) {
+BlockTreeMatchResult BlockTreeLoader::matchLocked(const CacheKeysType&                 cache_keys,
+                                                  std::shared_ptr<const CacheKeysType> remote_keys) {
     if (cache_keys.empty()) {
         RTP_LLM_LOG_DEBUG("empty cache_keys, returning empty result");
         return {};
     }
 
     std::vector<TreeNode*> path   = tree_->findNode(cache_keys);
-    BlockTreeMatchResult   result = createMatchResult(path, cache_keys);
+    BlockTreeMatchResult   result = createMatchResult(path, cache_keys, std::move(remote_keys));
     RTP_LLM_LOG_DEBUG("matched %zu device blocks, cache_keys=%zu, tree_nodes=%zu",
                       result.matched_device_blocks,
                       cache_keys.size(),
@@ -139,7 +140,9 @@ std::vector<BlockTreeCacheReuseTimeMetricsSnapshot> BlockTreeLoader::collectReus
     return metrics_reporter_.collectCacheReuseTimeMetrics(reuse_time_samples);
 }
 
-BlockTreeMatchResult BlockTreeLoader::createMatchResult(std::vector<TreeNode*>& path, const CacheKeysType& cache_keys) {
+BlockTreeMatchResult BlockTreeLoader::createMatchResult(std::vector<TreeNode*>&              path,
+                                                        const CacheKeysType&                 cache_keys,
+                                                        std::shared_ptr<const CacheKeysType> remote_keys) {
     BlockTreeMatchResult result;
     std::vector<bool>    candidate_valid;
     if (!path.empty() && !validMatch(path, candidate_valid) && !storage_backend_) {
@@ -216,6 +219,7 @@ BlockTreeMatchResult BlockTreeLoader::createMatchResult(std::vector<TreeNode*>& 
     StorageRequest storage_request;
     if (storage_backend_ && path.size() < cache_keys.size()) {
         storage_request = makeStorageRequest(cache_keys, path.size());
+        storage_request.remote_keys = std::move(remote_keys);
     }
     const bool use_storage = !storage_request.empty();
     if (!pending_load_descs.empty() || use_storage) {

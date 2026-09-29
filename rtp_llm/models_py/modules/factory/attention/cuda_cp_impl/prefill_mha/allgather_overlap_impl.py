@@ -11,6 +11,7 @@ from rtp_llm.ops.compute_ops import (
     ParamsBase,
     PyAttentionInputs,
     fill_mla_params,
+    get_scalar_type,
 )
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,7 @@ from rtp_llm.models_py.modules.factory.attention.cuda_cp_impl.prefill_mha.cp_uti
     generate_nonlocal_causal_kv_indices,
     generate_q_indices,
     plan_prefix_paged_attention,
+    CPKVCachePlan,
 )
 from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
     get_py_flashinfer_workspace_buffer,
@@ -71,7 +73,12 @@ class PCPAllGatherOverlapAttnOp:
         self.prefill_cp_rank = parallelism_config.tp_rank
         self.prefill_cp_size = parallelism_config.tp_size
 
-        self.seq_size_per_block = attn_configs.tokens_per_block
+        self.seq_size_per_block = (
+            attn_configs.kernel_tokens_per_block or attn_configs.tokens_per_block
+        )
+        self.parallelism_config = parallelism_config
+        self.q_dtype = get_scalar_type(attn_inputs.dtype)
+
 
         # write kv cache params
         self.kv_restore_unpad_indices = None
@@ -128,12 +135,15 @@ class PCPAllGatherOverlapAttnOp:
         self.kv0_idx = kv_restore_indices[kv0_idx]
         self.kv1_idx = kv_restore_indices[kv1_idx]
 
+        self.cache_plan = CPKVCachePlan(
+            attention_inputs, self.attn_configs, self.parallelism_config
+        )
         params = fill_mla_params(
             self.attn_inputs.prefix_lengths,
             self.attn_inputs.sequence_lengths,
             cp_info.prefill_actual_input_lengths_cpu,
-            self.attn_inputs.kv_cache_kernel_block_id,
-            self.attn_configs.kernel_tokens_per_block,
+            self.cache_plan.block_table,
+            self.seq_size_per_block,
         )
 
         self._plan_ragged(cu_seqlens, qo_indptr)
@@ -149,6 +159,7 @@ class PCPAllGatherOverlapAttnOp:
                 head_dim=self.head_dim,
                 page_size=self.seq_size_per_block,
                 device=self.device,
+                q_data_type=self.q_dtype,
             )
 
         return params
@@ -162,7 +173,7 @@ class PCPAllGatherOverlapAttnOp:
             "num_qo_heads": self.num_qo_heads,
             "num_kv_heads": self.num_kv_heads,
             "head_dim_qk": self.head_dim,
-            "q_data_type": torch.bfloat16,
+            "q_data_type": self.q_dtype,
         }
         configs = [
             {
@@ -208,14 +219,11 @@ class PCPAllGatherOverlapAttnOp:
         self,
         all_keys: torch.Tensor,
         all_values: torch.Tensor,
-        kv_cache: KVCache,
+        kv_cache_tensor: torch.Tensor,
         params: ParamsBase,
     ):
         restore_k = all_keys[self.kv_restore_unpad_indices]
         restore_v = all_values[self.kv_restore_unpad_indices]
-        kv_cache_tensor = kv_cache.kv_cache_base.view(
-            -1, 2, self.num_kv_heads, self.seq_size_per_block, self.head_dim
-        )
         append_paged_kv_cache(
             append_key=restore_k,
             append_value=restore_v,
@@ -249,6 +257,11 @@ class PCPAllGatherOverlapAttnOp:
         k = k.contiguous()
         v = v.contiguous()
 
+        local_cache = kv_cache.kv_cache_base.view(
+            -1, 2, self.num_kv_heads, self.seq_size_per_block, self.head_dim
+        )
+        kv_cache_tensor = self.cache_plan.materialize(local_cache)
+
         self.communication_stream.wait_stream(torch.cuda.current_stream())
 
         with torch.cuda.stream(self.communication_stream):
@@ -266,9 +279,6 @@ class PCPAllGatherOverlapAttnOp:
 
         if self.has_prefix:
             # Prefix paged attention (also overlaps with all-gather)
-            kv_cache_tensor = kv_cache.kv_cache_base.view(
-                -1, 2, self.num_kv_heads, self.seq_size_per_block, self.head_dim
-            )
             prefix_out, prefix_lse = self.prefill_wrappers["paged"]["prefix"].run(
                 q_reshaped, kv_cache_tensor, return_lse=True
             )
@@ -278,7 +288,8 @@ class PCPAllGatherOverlapAttnOp:
 
         torch.cuda.current_stream().wait_stream(self.communication_stream)
 
-        self._write_kv_cache(all_keys, all_values, kv_cache, params)
+        self._write_kv_cache(all_keys, all_values, kv_cache_tensor, params)
+        self.cache_plan.store(kv_cache_tensor, local_cache)
 
         q0 = torch.index_select(q_reshaped, 0, self.q0_idx).contiguous()
         q1 = torch.index_select(q_reshaped, 0, self.q1_idx).contiguous()

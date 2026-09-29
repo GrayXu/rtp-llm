@@ -216,3 +216,46 @@ cc_test_wrapper(
         "@local_config_cuda//cuda:cudart",
     ],
 )
+
+cc_test_wrapper(
+    name = "canonical_cache_layout_test",
+    srcs = ["CanonicalCacheLayoutTest.cc"],
+    copts = copts(),
+    deps = [
+        "//rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm:canonical_cache_layout",
+        "//rtp_llm/cpp/cache:kv_cache_specs",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test_wrapper(
+    name = "kvcm_canonical_test",
+    exec_properties = {"gpu": "A10_CU13"},
+    srcs = [
+        "KVCMCanonicalTest.cc",
+        "KVCMMockTestBase.h",
+        "MockKVCMClient.h",
+    ],
+    copts = ["-fno-access-control"] + copts(),
+    tags = [
+        "A10_CU13",
+        "exclusive-if-local",
+    ],
+    target_compatible_with = select({
+        "//:using_remote_kv_cache": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = kvcm_backend_test_deps,
+)
+
+cc_test_wrapper(
+    name = "worker_cache_io_fence_test",
+    srcs = ["WorkerCacheIOFenceTest.cc"],
+    copts = copts(),
+    deps = [
+        "//rtp_llm/cpp/cache:worker_cache_io_fence",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

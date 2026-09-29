@@ -44,6 +44,7 @@ struct StorageTaskState {
     StorageRequest   request;
     std::vector<Pin> pins;
     std::vector<HostPin> host_pins;
+    std::vector<std::shared_ptr<IBlockPool>> borrowed_pools;
     std::once_flag   finish_once;
     void             finish(bool safe = true) {
         std::call_once(finish_once, [this, safe] {
@@ -281,8 +282,8 @@ void StorageBackend::shutdown() {
     lifecycle_cv_.notify_all();
 }
 
-std::shared_ptr<storage_backend_detail::StorageTaskState> StorageBackend::prepare(StorageRequest request,
-                                                                                  bool           allow_host) {
+std::shared_ptr<storage_backend_detail::StorageTaskState>
+StorageBackend::prepare(StorageRequest request, bool allow_host, bool allocation_owner) {
     validateRequest(request, /*allow_null_blocks=*/false, allow_host);
     auto state     = std::make_shared<storage_backend_detail::StorageTaskState>();
     state->request = std::move(request);
@@ -294,6 +295,12 @@ std::shared_ptr<storage_backend_detail::StorageTaskState> StorageBackend::prepar
             if (state->request.source_tier == Tier::HOST) {
                 const auto& pool = host_pools_by_tag_.at(handle.tag);
                 if (pinned.insert({pool.get(), handle.block}).second) {
+                    if (!allocation_owner) {
+                        RTP_LLM_CHECK_WITH_INFO(pool->validBlock(handle.block), "invalid worker HOST cache block ID");
+                        state->borrowed_pools.push_back(pool);
+                        continue;
+                    }
+                    // Several tags can share one packed HOST block.
                     state->host_pins.push_back({pool, handle.block});
                     try {
                         pool->incTreeRef(handle.block, BlockTreeRefType::STORE);
@@ -318,13 +325,37 @@ std::shared_ptr<storage_backend_detail::StorageTaskState> StorageBackend::prepar
             } else {
                 const auto& pool = devicePool(handle.tag);
                 if (pinned.insert({pool.get(), handle.block}).second) {
-                    pool->incRef(handle.block);
-                    state->pins.push_back({pool, nullptr, handle.block});
+                    if (allocation_owner) {
+                        pool->incRef(handle.block);
+                        state->pins.push_back({pool, nullptr, handle.block});
+                    } else {
+                        RTP_LLM_CHECK_WITH_INFO(pool->validBlock(handle.block), "invalid worker cache block ID");
+                        state->borrowed_pools.push_back(pool);
+                    }
                 }
             }
         }
     }
     return state;
+}
+
+bool StorageBackend::runTransfer(StorageRequest request,
+                                  bool allocation_owner,
+                                  const std::function<bool(StorageWriteTask)>& transfer) {
+    {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        if (lifecycle_ != Lifecycle::ACCEPTING) {
+            return false;
+        }
+        ++in_flight_;
+    }
+    struct Completion {
+        StorageBackend* backend;
+        ~Completion() {
+            backend->taskFinished();
+        }
+    } completion{this};
+    return transfer(StorageWriteTask(prepare(std::move(request), /*allow_host=*/true, allocation_owner)));
 }
 
 void StorageBackend::validateRequest(const StorageRequest& request, bool allow_null_blocks, bool allow_host) const {

@@ -233,6 +233,12 @@ public:
     void set_default_query_type(int32_t query_type) {
         default_query_type_ = query_type;
     }
+    const std::string& instance_id() const {
+        return instance_id_;
+    }
+    const ModelDeployment& model_deployment() const {
+        return model_deployment_;
+    }
 
 private:
     bool                                 enable_vipserver_ = false;

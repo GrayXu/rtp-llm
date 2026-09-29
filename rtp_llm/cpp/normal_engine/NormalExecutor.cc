@@ -289,7 +289,7 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
         // GPU packed-buffer path instead of CPU execBroadcastCpu/unpack loops.
         ensureModelInputsOnCuda(model_input, "process.before_tp_sync");
 
-        tpSyncModelInputs(model_input, parallelism_config_);
+        tpSyncModelInputs(model_input, parallelism_config_, cache_manager_.get());
         if (model_input.skip_run) {
             return absl::OkStatus();
         }

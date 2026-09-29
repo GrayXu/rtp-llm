@@ -818,6 +818,11 @@ message RemoteOperationRequestPB {
     repeated uint32 coordinate_ids = 9;
     // Full key path for WRITE_HOST; each coordinate indexes this sequence.
     repeated int64 cache_keys = 10;
+    // TP0 allocation generation for each tag/block/URI, preventing late worker I/O after reuse.
+    repeated uint64 block_generations = 11;
+    // canonical_v1: one logical head/state shard per tag/block/URI entry.
+    repeated int32 logical_shards = 12;
+    string storage_layout = 13;
 }
 
 message RemoteMetadataRequestPB {
