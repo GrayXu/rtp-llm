@@ -797,7 +797,7 @@ TEST(KVCMInternalTest, BufferSizeMismatchDoesNotPublishPartialBuffers) {
 
 TEST(KVCMInternalTest, HostSourcePreservesLayerScaleIovsAndRejectsDeviceMismatch) {
     auto topology =
-        CacheTopology::create({makeGroup("full", 0, CacheGroupType::FULL, 16)}, {{0, {"full"}}, {3, {"full"}}});
+        CacheTopology::create({makeGroup("full", 0, CacheGroupType::FULL, 16)}, {{0, {"full"}}, {1, {"full"}}});
     std::array<uint8_t, 32> data{};
     bool                    invalid_device = false;
     auto                    resolver       = [&](int layer, const std::string& tag, int block, Tier source) {

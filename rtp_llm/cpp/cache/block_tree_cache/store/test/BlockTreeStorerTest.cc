@@ -805,12 +805,20 @@ TEST(BlockTreeStorerTest, HostAndDiskInsertReturnBeforeTransferSettlement) {
         const GroupSetResource& resource = path.back()->group_set_resources[0];
         ASSERT_TRUE(resource.hasTier(target_tier));
         const BlockIdxType target_block = resource.getBlocks(target_tier).front();
+        const bool writes_remote = target_tier == Tier::HOST;
+        EXPECT_EQ(env->poolFor(target_tier).treeRefCount(target_block), writes_remote ? 2u : 1u);
+        EXPECT_EQ(env->storeRefCount(), writes_remote ? 1u : 0u);
+        EXPECT_EQ(backend->submittedCount(), writes_remote ? 1u : 0u);
+        backend->finishWrite();
+        if (writes_remote) {
+            EXPECT_EQ(backend->blocks(), (std::vector<BlockIdxType>{target_block}));
+            EXPECT_EQ(backend->keyHandleCounts(), (std::vector<size_t>{1}));
+        } else {
+            EXPECT_TRUE(backend->blocks().empty());
+            EXPECT_TRUE(backend->keyHandleCounts().empty());
+        }
         EXPECT_EQ(env->poolFor(target_tier).treeRefCount(target_block), 1u);
         EXPECT_EQ(env->storeRefCount(), 0u);
-        backend->finishWrite();
-        EXPECT_TRUE(backend->blocks().empty());
-        EXPECT_TRUE(backend->keyHandleCounts().empty());
-        EXPECT_EQ(backend->submittedCount(), 0u);
         EXPECT_EQ(env->device_pools[0]->refCount(holder[0][0]), 1u);
         releaseDeviceBlocks(*env->cache, env->device_pools[0], holder[0]);
     }

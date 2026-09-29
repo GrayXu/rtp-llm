@@ -43,7 +43,7 @@ TEST(GroupSetTest, StoresOrderedTagMembershipAndLogicalPayload) {
 }
 
 TEST(GroupSetTest, ResolvesPackedHostGroupsLayersAndScalesWithPhysicalOrLogicalGeometry) {
-    const auto topology = makeTestTopology({makeGroupBase({0, 4}), makeGroupBase({0})});
+    const auto topology = makeTestTopology({makeGroupBase({0, 1}), makeGroupBase({0})});
     const auto pool_a   = makeTestDevicePool({{80, 16}, {96, 24}}, 4, "host_geometry_a");
     const auto pool_b   = makeTestDevicePool({{128, 32}}, 4, "host_geometry_b");
     for (bool physical : {false, true}) {
@@ -56,7 +56,7 @@ TEST(GroupSetTest, ResolvesPackedHostGroupsLayersAndScalesWithPhysicalOrLogicalG
         ASSERT_FALSE(isNullBlockIdx(block));
         auto*      base  = static_cast<uint8_t*>(host_pool->blockBuffer(block).addr);
         const auto first = group->convertHostIndexToBuffer(0, "group1", block);
-        const auto last  = group->convertHostIndexToBuffer(4, "group0", block);
+        const auto last  = group->convertHostIndexToBuffer(1, "group0", block);
         ASSERT_EQ(first.size(), 2u);
         ASSERT_EQ(last.size(), 2u);
         EXPECT_FALSE(first[0].is_cuda);
@@ -72,7 +72,7 @@ TEST(GroupSetTest, ResolvesPackedHostGroupsLayersAndScalesWithPhysicalOrLogicalG
         EXPECT_EQ(static_cast<uint8_t*>(last[1].addr) + last[1].size_bytes, base + payload_bytes);
         const auto second = group->allocateSingleBlock(Tier::HOST, BlockTreeRefType::STORE);
         ASSERT_FALSE(isNullBlockIdx(second));
-        const auto second_last = group->convertHostIndexToBuffer(4, "group0", second);
+        const auto second_last = group->convertHostIndexToBuffer(1, "group0", second);
         auto*      second_base = static_cast<uint8_t*>(host_pool->blockBuffer(second).addr);
         EXPECT_EQ(second_last[0].addr, second_base + (physical ? 256 : 160));
         EXPECT_NE(second_last[0].addr, last[0].addr);

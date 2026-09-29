@@ -299,7 +299,8 @@ TEST(ClientWrapperTest, HostTimeoutDrainsWriteScopedClientAndPreservesTagAndCpuT
     buffers[0].iovs.push_back({kv_cache_manager::MemoryType::CPU, &payload, 1, false});
     auto trace        = std::make_shared<kv_cache_manager::TransferTraceInfo>();
     trace->need_print = true;
-    BoundedThread<bool> write([&] { return wrapper.saveKvCachesForTag("alpha", {"alpha_uri"}, buffers, trace).first; });
+    block_tree_cache_test::BoundedThread<bool> write(
+        [&] { return wrapper.saveKvCachesForTag("alpha", {"alpha_uri"}, buffers, trace).first; });
     const auto          started_status = started.wait_for(std::chrono::seconds(5));
     EXPECT_EQ(started_status, std::future_status::ready);
     EXPECT_EQ(write.waitFor(std::chrono::milliseconds(50)), std::future_status::timeout);
