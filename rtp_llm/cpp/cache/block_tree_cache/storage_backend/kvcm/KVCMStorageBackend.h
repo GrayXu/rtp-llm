@@ -29,6 +29,8 @@ public:
                        std::shared_ptr<BroadcastManager>    broadcast_manager,
                        std::shared_ptr<kvcm::ClientWrapper> client_wrapper = nullptr);
     ~KVCMStorageBackend() override;
+    bool requiresSharedHostMemory() const override { return true; }
+    bool canInitiateHostWrite() const override;
 
     bool execute(const RemoteOperationRequestPB& request, RemoteOperationResponsePB& response);
 

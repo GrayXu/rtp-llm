@@ -1,8 +1,10 @@
 #pragma once
 
 #include <unordered_map>
+#include <atomic>
 
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -17,12 +19,14 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/block_pool/DeviceBlockPool.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/block_pool/HostBlockPool.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/StorageBackendExecutor.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/transfer/TransferTypes.h"
 
 namespace rtp_llm {
 
 struct StorageBlockHandle {
     std::string  tag;
     BlockIdxType block{NULL_BLOCK_IDX};
+    Tier         tier{Tier::DEVICE};
 };
 
 struct StorageBackendMatchMeta {
@@ -43,6 +47,8 @@ struct StorageRequest {
     size_t local_matched_blocks_num{0};
     // Write sources may be DEVICE or HOST. Match/read requests stay on DEVICE.
     Tier source_tier{Tier::DEVICE};
+    // Shared HOST writes retain pins while local payload completion is unknown.
+    std::shared_ptr<std::atomic<bool>> host_payload_dispatched;
 
     bool empty() const {
         for (const auto& key_handles : handles) {
@@ -70,6 +76,7 @@ public:
     explicit operator bool() const {
         return state_ != nullptr;
     }
+    void quarantine();
 
 private:
     explicit StorageWriteTask(std::shared_ptr<storage_backend_detail::StorageTaskState> state);
@@ -87,6 +94,25 @@ public:
     using PoolsByTag     = std::unordered_map<std::string, DeviceBlockPoolPtr>;
     using HostPoolsByTag = std::unordered_map<std::string, std::shared_ptr<HostBlockPool>>;
     using BufferResolver = std::function<std::vector<BlockInfo>(int layer_id, const std::string& tag, int block_id)>;
+    struct HostPoolBinding {
+        std::shared_ptr<HostBlockPool> pool;
+        std::shared_ptr<HostBlockPool> read_pool;
+        size_t                         group_set_id{0};
+        size_t                         member_index{0};
+        size_t                         member_count{0};
+        size_t                         offset_bytes{0};
+        size_t                         payload_bytes{0};
+    };
+    using HostBindingsByTag = std::unordered_map<std::string, HostPoolBinding>;
+    using HostToDevice = std::function<bool(std::vector<TransferDescriptor>, std::vector<HostBufferView>, int timeout_ms)>;
+    struct HostWriteResolution {
+        StorageWriteTask             pins;
+        std::vector<BlockIdxType>    local_blocks;
+    };
+    using HostWriteResolver = std::function<HostWriteResolution(const CacheKeysType&,
+                                                                 const std::vector<std::string>&,
+                                                                 const std::vector<uint32_t>&,
+                                                                 int timeout_ms)>;
 
     // An injected executor may be observed by its owner but belongs to only
     // one backend; init rejects binding the same instance a second time.
@@ -95,11 +121,16 @@ public:
 
     // Initialization is single-attempt. A failed start may permanently stop
     // an injected executor; create a fresh backend/executor to retry.
-    bool             init(std::shared_ptr<const CacheTopology> topology,
-                          PoolsByTag                           pools_by_tag,
-                          BufferResolver                       buffer_resolver,
-                          HostPoolsByTag                       host_pools_by_tag    = {},
-                          BufferResolver                       host_buffer_resolver = {});
+    bool init(std::shared_ptr<const CacheTopology> topology,
+              PoolsByTag pools_by_tag,
+              BufferResolver buffer_resolver,
+              HostPoolsByTag host_pools_by_tag = {},
+              BufferResolver host_buffer_resolver = {},
+              HostBindingsByTag host_bindings_by_tag = {},
+              HostToDevice host_to_device = {},
+              HostWriteResolver host_write_resolver = {});
+    virtual bool requiresSharedHostMemory() const { return false; }
+    virtual bool canInitiateHostWrite() const { return false; }
     void match(StorageRequest request, MatchDone done);
     void read(StorageRequest request, std::shared_ptr<StorageBackendMatchMeta> match_meta, Done done);
     StorageWriteTask prepareWrite(StorageRequest request);
@@ -117,6 +148,9 @@ protected:
     const CacheTopology&      topology() const;
     const DeviceBlockPoolPtr& devicePool(const std::string& tag) const;
     const std::shared_ptr<HostBlockPool>& hostPool(const std::string& tag) const;
+    const HostBindingsByTag& hostPoolsByTag() const;
+    const HostToDevice& hostToDevice() const;
+    const HostWriteResolver& hostWriteResolver() const;
     std::vector<BlockInfo>
     convertIndexToBuffer(int layer_id, const std::string& tag, int block_id, Tier source_tier = Tier::DEVICE) const;
     // Match queries contain every possible group handle. Derived matchers use
@@ -147,6 +181,9 @@ private:
     void                                 taskFinished();
     std::shared_ptr<const CacheTopology> topology_;
     PoolsByTag                           pools_by_tag_;
+    HostBindingsByTag                    host_bindings_by_tag_;
+    HostToDevice                          host_to_device_;
+    HostWriteResolver                     host_write_resolver_;
     BufferResolver                       buffer_resolver_;
     HostPoolsByTag                          host_pools_by_tag_;
     BufferResolver                          host_buffer_resolver_;

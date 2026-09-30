@@ -84,6 +84,10 @@ std::shared_ptr<AsyncContext> PerRankBlockTransferEngine::execute(TransferTask t
             return invalidTransferContext();
         }
         const auto* group_set = group_sets_[descriptor.group_set_id].get();
+        if ((source == Tier::HOST || target == Tier::HOST) && group_set->hostPool()
+            && group_set->hostPool()->hasUncertainRemoteIo()) {
+            return invalidTransferContext();
+        }
         group_sets.push_back(group_set);
         if (source == Tier::HOST || target == Tier::HOST) {
             hosts.push_back(resolveHostView(*group_set, descriptor.singleBlockAt(Tier::HOST)));
@@ -109,6 +113,24 @@ std::shared_ptr<AsyncContext> PerRankBlockTransferEngine::execute(TransferTask t
         return host_disk_executor_->execute(std::move(task), std::move(hosts), std::move(group_sets));
     }
     return invalidTransferContext();
+}
+
+std::shared_ptr<AsyncContext>
+PerRankBlockTransferEngine::executeHostToDeviceFromViews(TransferTask task, std::vector<HostBufferView> hosts) {
+    const auto& descriptors = task.descriptors();
+    if (task.expired() || descriptors.empty() || hosts.size() != descriptors.size()) {
+        return invalidTransferContext();
+    }
+    std::vector<const GroupSet*> group_sets;
+    group_sets.reserve(descriptors.size());
+    for (const auto& descriptor : descriptors) {
+        if (descriptor.source_tier != Tier::HOST || descriptor.target_tier != Tier::DEVICE
+            || descriptor.group_set_id >= group_sets_.size()) {
+            return invalidTransferContext();
+        }
+        group_sets.push_back(group_sets_[descriptor.group_set_id].get());
+    }
+    return device_host_executor_->execute(std::move(task), std::move(hosts), std::move(group_sets));
 }
 
 HostBufferView PerRankBlockTransferEngine::resolveHostView(const GroupSet& group_set, BlockIdxType host_block) {

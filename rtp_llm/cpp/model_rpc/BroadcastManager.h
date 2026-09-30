@@ -34,7 +34,9 @@ public:
 
 public:
     explicit BroadcastResult(const std::vector<std::shared_ptr<WorkerRpcContext>>& worker_rpc_contexts):
-        worker_contexts_(worker_rpc_contexts), finished_(worker_rpc_contexts.size(), false) {}
+        worker_contexts_(worker_rpc_contexts),
+        finished_(worker_rpc_contexts.size(), false),
+        rank_success_(worker_rpc_contexts.size(), false) {}
     ~BroadcastResult() = default;
 
 public:
@@ -66,6 +68,12 @@ public:
 
     bool success() const {
         return all_request_success_.load(std::memory_order_acquire);
+    }
+
+    bool rankCompletedSuccessfully(size_t rank) const {
+        // Preserve a completed rank's outcome even when a peer fails the aggregate.
+        std::lock_guard<std::mutex> lock(wait_done_mutex_);
+        return rank < rank_success_.size() && rank_success_[rank];
     }
 
     void onDone(DoneCallback callback) {
@@ -110,6 +118,7 @@ public:
                 return;
             } else {
                 finished_[rank] = true;
+                rank_success_[rank] = cq_event_ok && worker_contexts_[rank]->status.ok();
                 ++finished_count_;
                 const auto& ctx = worker_contexts_[rank];
                 if (!cq_event_ok) {
@@ -151,6 +160,7 @@ private:
 
     std::vector<std::shared_ptr<WorkerRpcContext>> worker_contexts_;
     std::vector<bool>                              finished_;
+    std::vector<bool>                              rank_success_;
     int                                            finished_count_{0};
     std::atomic<bool>                              already_done_{false};
     std::atomic<bool>                              all_request_success_{false};

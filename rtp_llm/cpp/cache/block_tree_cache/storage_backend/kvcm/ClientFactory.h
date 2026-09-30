@@ -19,6 +19,10 @@ public:
     createMetaClient(const std::string& config, const kv_cache_manager::InitParams& init_params) const;
     virtual std::unique_ptr<kv_cache_manager::TransferClient>
     createTransferClient(const std::string& config, const kv_cache_manager::InitParams& init_params) const;
+    virtual std::unique_ptr<kv_cache_manager::TransferClient>
+    createTransferClient(const std::string& config,
+                         const kv_cache_manager::InitParams& init_params,
+                         const kv_cache_manager::SharedMemoryRegistration& shared_memory) const;
     virtual std::unique_ptr<Subscriber> createSubscriber(bool enable_vipserver) const;
 };
 

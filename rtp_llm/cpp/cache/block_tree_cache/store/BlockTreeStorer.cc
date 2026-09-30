@@ -121,7 +121,12 @@ StorageRequest BlockTreeStorer::makeStorageRequest(const CacheKeysType&         
     }
     StorageRequest request{std::make_shared<CacheKeysType>(cache_keys),
                            std::vector<std::vector<StorageBlockHandle>>(cache_keys.size())};
-    request.source_tier = source_tier;
+    const bool shared_host = source_tier == Tier::HOST && storage_backend_
+                             && storage_backend_->requiresSharedHostMemory();
+    request.source_tier = shared_host ? Tier::DEVICE : source_tier;
+    if (shared_host) {
+        request.host_payload_dispatched = std::make_shared<std::atomic<bool>>(false);
+    }
     for (size_t key_index = 0; key_index < resources.size(); ++key_index) {
         auto& key_handles = request.handles[key_index];
         for (size_t group_set = 0; group_set < tree_->groupSets().size(); ++group_set) {
@@ -132,7 +137,7 @@ StorageRequest BlockTreeStorer::makeStorageRequest(const CacheKeysType&         
             const auto& group = *tree_->groupSets()[group_set];
             for (size_t member = 0; member < group.groupTags().size(); ++member) {
                 const auto block = source_tier == Tier::HOST ? resource.host_block : resource.device_blocks[member];
-                key_handles.push_back({group.groupTags()[member], block});
+                key_handles.push_back({group.groupTags()[member], block, shared_host ? Tier::HOST : Tier::DEVICE});
             }
         }
     }

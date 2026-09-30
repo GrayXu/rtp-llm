@@ -579,6 +579,22 @@ TEST_F(BroadcastManagerTest, CqFailureStillPublishesCompletionCallback) {
     EXPECT_FALSE(result->success());
 }
 
+TEST_F(BroadcastManagerTest, PeerFailureRetainsSuccessfulLocalRankResult) {
+    auto local = makeIdleContext();
+    auto peer  = makeIdleContext();
+    peer->status = grpc::Status(grpc::StatusCode::UNAVAILABLE, "peer failed");
+    FunctionBroadcastResult result(
+        std::vector<std::shared_ptr<FunctionBroadcastResult::WorkerRpcContext>>{local, peer});
+
+    result.finishRank(/*rank=*/0, /*cq_event_ok=*/true);
+    result.finishRank(/*rank=*/1, /*cq_event_ok=*/true);
+
+    EXPECT_TRUE(result.waitDone(/*timeout_ms=*/1000));
+    EXPECT_FALSE(result.success());
+    EXPECT_TRUE(result.rankCompletedSuccessfully(0));
+    EXPECT_FALSE(result.rankCompletedSuccessfully(1));
+}
+
 // ---------------------------- workerNum ----------------------------
 
 TEST_F(BroadcastManagerTest, WorkerNum) {

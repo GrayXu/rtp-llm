@@ -10,13 +10,13 @@ Direct `StorageBackend` callers provide tag-bound HOST pools and a HOST buffer r
 
 A packed HOST block can contain multiple groups. Each group resolves CPU addresses in layer and KV/scale order, matching the physical layout used by `DeviceHostTransferExecutor`. This preserves heterogeneous layer sizes and MTP physical sizes and excludes pool alignment padding from remote payloads. Each TP rank uses its own shard and aligned block indices. Callers directly submitting HOST data must ensure that the corresponding payload is ready on every rank. All TP peers must use the same protocol implementation.
 
-The target backend is PACE/TairMempool. A storage configuration containing Mooncake cannot create the HOST client because `regist_span=nullptr` does not meet its registration requirement; client creation fails and the write session is aborted with a diagnostic. GPU clients are unaffected. This change does not add Mooncake CPU transfers or establish support for other backends.
+The target backend is PACE/TairMempool. CPU writes reuse the persistent transfer client registered for each tag. Unregistered CPU buffers do not guarantee zero-copy. Mooncake CPU transfers and other backends are outside the validated scope.
 
 ## Writes and lifetime
 
 - Explicit HOST writes take STORE references before local publication, duplicate-block cleanup, or watermark eviction. References are deduplicated by `(pool, block)`, so tags sharing a packed block share one reference.
 - Each rank resolves real CPU IOVs from its HOST pool and copies them into a transfer-owned CPU snapshot, preserving IOV count and byte order. CPU traces bypass SDK GPU-kernel address hashing. GPU payloads retain the DEVICE resolver, persistent transfer client, and check path.
-- CPU writes create a temporary transfer client configured for the tag/spec. Its destruction drains SDK workers before the rank-local snapshot is released; an SDK timeout result alone does not permit snapshot release. Draining can exceed the timeout. TP payload broadcasts wait for peers to finish after the budget expires, then report failure and release controller references. The default factory serializes client creation within a process to protect shared PACE initialization state and its random generator.
+- CPU writes reuse persistent clients registered by tag/spec. The paired SDK must use `drain_on_timeout=true` and drain submitted work before a transfer snapshot is released. TP payload broadcasts wait for peers after the budget expires before reporting failure and releasing controller references. Backend completion guarantees still apply; client reuse does not make arbitrary CPU buffers zero-copy.
 - GroupSet caches HOST layout offsets. Later resolution looks up the tag/layer and adds the current block's CPU base address instead of rescanning the layout for every layer.
 - `StartWrite -> SaveKvCaches -> FinishWrite`, offset/sparse masks, actual URI propagation, group/pool routing, and multiple TP/group URIs per key are preserved. RTP does not reimplement SDK `GroupBySdk`.
 

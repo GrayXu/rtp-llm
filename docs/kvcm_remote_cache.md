@@ -101,6 +101,16 @@ Example protobuf JSON:
 
 With `kvcm_read_backend_type` set, locations are mapped by group/rank into TP payload requests, and their URIs are passed to `TransferClient::LoadKvCaches`. Event URIs describe locations and are not used as payload backends by this integration.
 
+## HOST shared-memory I/O
+
+With KVCM remote cache and HOST cache capacity enabled, HOST pools use fd-backed CUDA-pinned shared memory. Each group set registers its main cache region. A separate bounded region serves remote reads; its blocks, including reserved block 0, count against the existing HOST budget. Temporary reads therefore do not change main-pool block allocation order. HOST cache remains disabled by default, and GPU-only configurations allocate no shared HOST regions.
+
+Shared HOST writes use completed, tree-admitted blocks. Each rank resolves the full key path and pins its own HOST block; rank 0 block indices are not identities on other ranks. Only rank 0 initiates metadata writes. Remote reads enter the separate HOST region and then use the existing HOST-to-DEVICE transfer. Missing registration, insufficient read capacity, or incomplete group members fall back to DEVICE reads. If HOST registration fails, writes try CPU IOVs through the original client and fail if the backend does not support them.
+
+Tags map to contiguous portions of packed HOST blocks in group-set member order. CPU writes reuse registered clients; registration alone does not guarantee a direct transfer. PACE capability, tiering, cache state, and fallback still determine the actual path. This does not remove GPU-to-DRAM transfers or reduce the PACE consumer's reserved pools.
+
+When local HOST payload completion is uncertain, its block references remain charged to the pool. Pre-submission failures and known local success release local pins even if another rank fails. An uncertain main pool rejects subsequent HOST transfers and writes; an uncertain read pool falls back to DEVICE reads. Uncertain mappings and file descriptors remain alive until process exit. The shared read region is part of the existing budget, not a reduction in physical memory usage.
+
 ## I/O lifetime
 
 When a request reaches `FINISHED` successfully and cache reuse is allowed, complete KV blocks are stored in the highest enabled local tier (DEVICE, then HOST, then DISK), and a KVCM remote write is submitted alongside it. With all local tiers disabled and remote cache enabled, only the remote write is submitted. Deployment remote-cache controls, per-request `reuse_cache`, and `RTP_LLM_IGNORE_REQUEST_CACHE_SWITCHES` retain their existing behavior.

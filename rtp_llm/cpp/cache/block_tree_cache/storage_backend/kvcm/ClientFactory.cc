@@ -6,6 +6,9 @@
 
 namespace rtp_llm {
 namespace kvcm {
+namespace {
+std::mutex transfer_client_init_mutex;
+}  // namespace
 
 std::unique_ptr<kv_cache_manager::MetaClient>
 ClientFactory::createMetaClient(const std::string& config, const kv_cache_manager::InitParams& init_params) const {
@@ -15,9 +18,16 @@ ClientFactory::createMetaClient(const std::string& config, const kv_cache_manage
 std::unique_ptr<kv_cache_manager::TransferClient>
 ClientFactory::createTransferClient(const std::string& config, const kv_cache_manager::InitParams& init_params) const {
     // PACE SDK initializers use process-wide state and an unguarded random generator.
-    static std::mutex           init_mutex;
-    std::lock_guard<std::mutex> lock(init_mutex);
+    std::lock_guard<std::mutex> lock(transfer_client_init_mutex);
     return kv_cache_manager::TransferClient::Create(config, init_params);
+}
+
+std::unique_ptr<kv_cache_manager::TransferClient>
+ClientFactory::createTransferClient(const std::string& config,
+                                    const kv_cache_manager::InitParams& init_params,
+                                    const kv_cache_manager::SharedMemoryRegistration& shared_memory) const {
+    std::lock_guard<std::mutex> lock(transfer_client_init_mutex);
+    return kv_cache_manager::TransferClient::Create(config, init_params, shared_memory);
 }
 
 std::unique_ptr<Subscriber> ClientFactory::createSubscriber(bool enable_vipserver) const {

@@ -33,6 +33,7 @@ void invokeCallback(const StorageBackend* backend, Callback&& callback) noexcept
 struct StorageTaskState {
     struct Pin {
         DeviceBlockPoolPtr pool;
+        std::shared_ptr<HostBlockPool> host_pool;
         BlockIdxType       block;
     };
     struct HostPin {
@@ -44,10 +45,18 @@ struct StorageTaskState {
     std::vector<Pin> pins;
     std::vector<HostPin> host_pins;
     std::once_flag   finish_once;
-    void             finish() {
-        std::call_once(finish_once, [this] {
+    void             finish(bool safe = true) {
+        std::call_once(finish_once, [this, safe] {
             for (const Pin& pin : pins) {
-                pin.pool->decRef(pin.block);
+                if (pin.host_pool) {
+                    if (safe) {
+                        pin.host_pool->decTreeRef(pin.block, BlockTreeRefType::STORE);
+                    } else {
+                        pin.host_pool->markUncertainRemoteIo();
+                    }
+                } else {
+                    pin.pool->decRef(pin.block);
+                }
             }
             pins.clear();
             for (const HostPin& pin : host_pins) {
@@ -86,6 +95,12 @@ struct BlockKeyHash {
 StorageWriteTask::StorageWriteTask(std::shared_ptr<storage_backend_detail::StorageTaskState> state):
     state_(std::move(state)) {}
 
+void StorageWriteTask::quarantine() {
+    if (state_) {
+        state_->finish(false);
+    }
+}
+
 StorageBackend::StorageBackend(std::shared_ptr<StorageBackendExecutor> executor): executor_(std::move(executor)) {}
 
 StorageBackend::~StorageBackend() {
@@ -97,8 +112,11 @@ StorageBackend::~StorageBackend() {
 bool StorageBackend::init(std::shared_ptr<const CacheTopology> topology,
                           PoolsByTag                           pools_by_tag,
                           BufferResolver                       buffer_resolver,
-                          HostPoolsByTag                       host_pools_by_tag,
-                          BufferResolver                       host_buffer_resolver) {
+                          HostPoolsByTag host_pools_by_tag,
+                          BufferResolver host_buffer_resolver,
+                          HostBindingsByTag host_bindings_by_tag,
+                          HostToDevice host_to_device,
+                          HostWriteResolver host_write_resolver) {
     if (init_attempted_) {
         RTP_LLM_LOG_ERROR("StorageBackend initialization has already been attempted");
         return false;
@@ -118,6 +136,19 @@ bool StorageBackend::init(std::shared_ptr<const CacheTopology> topology,
         (void)topology->group(tag);
         RTP_LLM_CHECK_WITH_INFO(pool != nullptr, "null host storage pool for tag=%s", tag.c_str());
     }
+    for (const auto& [tag, binding] : host_bindings_by_tag) {
+        (void)topology->group(tag);
+        RTP_LLM_CHECK_WITH_INFO(binding.pool != nullptr && binding.payload_bytes > 0
+                                    && binding.member_count > 0 && binding.member_index < binding.member_count
+                                    && binding.offset_bytes <= binding.pool->payloadBytes()
+                                    && binding.payload_bytes <= binding.pool->payloadBytes() - binding.offset_bytes,
+                                "invalid host storage binding for tag=%s", tag.c_str());
+        if (binding.read_pool) {
+            RTP_LLM_CHECK_WITH_INFO(binding.offset_bytes <= binding.read_pool->payloadBytes()
+                                        && binding.payload_bytes <= binding.read_pool->payloadBytes() - binding.offset_bytes,
+                                    "invalid HOST read pool binding for tag=%s", tag.c_str());
+        }
+    }
     init_attempted_ = true;
     if (executor_ == nullptr) {
         executor_ = makeDefaultStorageBackendExecutor();
@@ -129,14 +160,20 @@ bool StorageBackend::init(std::shared_ptr<const CacheTopology> topology,
     topology_            = std::move(topology);
     pools_by_tag_        = std::move(pools_by_tag);
     buffer_resolver_     = std::move(buffer_resolver);
-    host_pools_by_tag_    = std::move(host_pools_by_tag);
+    host_pools_by_tag_ = std::move(host_pools_by_tag);
     host_buffer_resolver_ = std::move(host_buffer_resolver);
+    host_bindings_by_tag_ = std::move(host_bindings_by_tag);
+    host_to_device_ = std::move(host_to_device);
+    host_write_resolver_ = std::move(host_write_resolver);
     const auto fail_init = [this] {
         shutdownImpl();
         buffer_resolver_ = {};
         pools_by_tag_.clear();
         host_buffer_resolver_ = {};
         host_pools_by_tag_.clear();
+        host_bindings_by_tag_.clear();
+        host_to_device_ = {};
+        host_write_resolver_ = {};
         topology_.reset();
         return false;
     };
@@ -257,7 +294,6 @@ std::shared_ptr<storage_backend_detail::StorageTaskState> StorageBackend::prepar
             if (state->request.source_tier == Tier::HOST) {
                 const auto& pool = host_pools_by_tag_.at(handle.tag);
                 if (pinned.insert({pool.get(), handle.block}).second) {
-                    // Several tags can share one packed HOST block.
                     state->host_pins.push_back({pool, handle.block});
                     try {
                         pool->incTreeRef(handle.block, BlockTreeRefType::STORE);
@@ -268,11 +304,23 @@ std::shared_ptr<storage_backend_detail::StorageTaskState> StorageBackend::prepar
                 }
                 continue;
             }
-            const auto&    pool = devicePool(handle.tag);
-            const BlockKey key{pool.get(), handle.block};
-            if (pinned.insert(key).second) {
-                pool->incRef(handle.block);
-                state->pins.push_back({pool, handle.block});
+            if (handle.tier == Tier::HOST) {
+                const auto& pool = host_bindings_by_tag_.at(handle.tag).pool;
+                if (pinned.insert({pool.get(), handle.block}).second) {
+                    state->pins.push_back({nullptr, pool, handle.block});
+                    try {
+                        pool->incTreeRef(handle.block, BlockTreeRefType::STORE);
+                    } catch (...) {
+                        state->pins.pop_back();
+                        throw;
+                    }
+                }
+            } else {
+                const auto& pool = devicePool(handle.tag);
+                if (pinned.insert({pool.get(), handle.block}).second) {
+                    pool->incRef(handle.block);
+                    state->pins.push_back({pool, nullptr, handle.block});
+                }
             }
         }
     }
@@ -298,6 +346,14 @@ void StorageBackend::validateRequest(const StorageRequest& request, bool allow_n
                                         "storage has no HOST source for tag=%s",
                                         handle.tag.c_str());
             }
+            RTP_LLM_CHECK_WITH_INFO(handle.tier == Tier::DEVICE || (allow_host && handle.tier == Tier::HOST),
+                                    "unsupported storage handle tier");
+            if (handle.tier == Tier::HOST) {
+                const auto binding = host_bindings_by_tag_.find(handle.tag);
+                RTP_LLM_CHECK_WITH_INFO(request.source_tier == Tier::DEVICE && binding != host_bindings_by_tag_.end()
+                                            && binding->second.pool->isAllocated(handle.block),
+                                        "storage has no allocated shared HOST source for tag=%s", handle.tag.c_str());
+            }
             RTP_LLM_CHECK_WITH_INFO(seen_tags.emplace(handle.tag).second,
                                     "storage request has duplicate tag=%s at key=%zu",
                                     handle.tag.c_str(),
@@ -321,6 +377,18 @@ const DeviceBlockPoolPtr& StorageBackend::devicePool(const std::string& tag) con
 
 const std::shared_ptr<HostBlockPool>& StorageBackend::hostPool(const std::string& tag) const {
     return host_pools_by_tag_.at(tag);
+}
+
+const StorageBackend::HostBindingsByTag& StorageBackend::hostPoolsByTag() const {
+    return host_bindings_by_tag_;
+}
+
+const StorageBackend::HostToDevice& StorageBackend::hostToDevice() const {
+    return host_to_device_;
+}
+
+const StorageBackend::HostWriteResolver& StorageBackend::hostWriteResolver() const {
+    return host_write_resolver_;
 }
 
 std::vector<BlockInfo>
@@ -367,7 +435,7 @@ void StorageBackend::read(StorageRequest request, std::shared_ptr<StorageBackend
                 readImpl(state->request, match_meta);
             } catch (...) { success = false; }
         }
-        state->finish();
+        state->finish(success);
         if (done) {
             done(success);
         }
@@ -387,12 +455,15 @@ bool StorageBackend::write(StorageWriteTask task) {
     RTP_LLM_CHECK(task.state_ != nullptr);
     auto state = std::move(task.state_);
     return dispatch([this, state](Lifecycle outcome) {
+        bool success = outcome == Lifecycle::ACCEPTING;
         if (outcome == Lifecycle::ACCEPTING) {
             try {
                 writeImpl(state->request);
-            } catch (...) {}
+            } catch (...) { success = false; }
         }
-        state->finish();
+        const bool safe = success || (state->request.host_payload_dispatched
+                                      && !state->request.host_payload_dispatched->load(std::memory_order_acquire));
+        state->finish(safe);
     });
 }
 

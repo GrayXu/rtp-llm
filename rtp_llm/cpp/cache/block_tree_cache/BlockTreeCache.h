@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -146,6 +147,10 @@ public:
                                            const std::vector<MultiNodeResource>& matched_resources) const;
 
     bool executeTransfer(TransferTask task);
+    StorageBackend::HostWriteResolution resolveHostWrite(const CacheKeysType& keys,
+                                                         const std::vector<std::string>& tags,
+                                                         const std::vector<uint32_t>& coordinates,
+                                                         int timeout_ms);
 
     // Accessors
     BlockTree* tree() const {
@@ -191,6 +196,7 @@ private:
     std::unique_ptr<BlockTreeTaskPool>             task_pool_;
     std::shared_ptr<BlockTreeCacheMetricsReporter> metrics_reporter_;
     mutable std::mutex                             mutex_;
+    std::condition_variable                        host_publication_cv_;
     BlockTreeEvictor                               evictor_;
     bool                                           initialized_{false};
     // Preserve the historical empty-cache wire value. The first successful
