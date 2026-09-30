@@ -52,6 +52,8 @@ SDK packaging must isolate its internal autil/gRPC symbols from RTP to avoid sym
 
 Explicit `KVCM_CLIENT_CONFIG` JSON takes precedence over the generated Instance configuration; an omitted `default_query_type` defaults to 2. Requests can override it with `kvcm_query_type`. Each backend binds to one default Instance. Backend-specific queries use batch mode and accept only `kvcm_query_type=0` or `1`; use `kvcm_read_backend_type=0` for regular Mamba/SWA queries.
 
+Custom `block_size`, `location_spec_infos`, and `location_spec_groups` must match the local key token stride, group payload sizes, and group/TP rank mapping. Spec lists within a group may be reordered; a single group may omit the explicit group map.
+
 Set `--kvcm_model_sdk_config` (environment variable `RECO_MODEL_SDK_CONFIG`) for one data backend:
 
 - DRAM: `[{"type":"pace","sdk_log_level":"INFO"}]`.
@@ -70,7 +72,11 @@ TENT uses an RDMA device slot, so `--no_rdma` disables it. Updating the SDK depe
 
 Batch/SWA misses preserve their original key positions. For layouts containing SWA groups, internal payload matching translates SWA queries to batch queries so FULL locations outside the window remain available; explicit metadata queries retain the requested mode. Reuse requires a complete FULL prefix, final LINEAR state, and complete SWA window across every TP rank; missing URIs do not count as hits. Mixed LINEAR+SWA writes may store the FULL+LINEAR portion first, but reads still require the complete SWA window. Existing IOV, pool/group, FULL+LINEAR, and same-layout TP support is retained.
 
-Generated Instance identities include the default query mode and registered group configuration, so an upgrade may select a new cache namespace. Custom IDs must match the existing server configuration. `KVCacheConfig` uses pickle version 8 with 74 items and reads versions 1-7; communicating processes must use the same build.
+Groups in one Instance must share `cacheKeyTokenStride()`, used as the registered token `block_size`; mismatches reject initialization. Each location spec describes its group's fixed KV/scale payload bytes, which may differ between groups. Multiple standard FULL MHA/MLA groups remain subject to model-layout validation.
+
+Generated Instance identities include the default query mode and registered group configuration. Multi-group identities also include tag-sorted per-layer physical layouts and layer ownership, creating a new cache namespace. Sharded CP registers the base token stride multiplied by CP size, so single-group CP also changes namespace. Single-group identities remain unchanged when their registered token stride is unchanged.
+
+Custom IDs must match the existing server configuration. `KVCacheConfig` uses pickle version 8 with 74 items and reads versions 1-7; communicating processes must use the same build.
 
 ## RPC interface
 
@@ -109,7 +115,7 @@ RTP requires `sdk_config.drain_on_timeout=true`. Caller waits are bounded by `kv
 
 On timeout or uncertain completion (SDK transfer errors or failed TP payload RPCs), RTP retains the operation's resources for the process lifetime: controller allocation pins prevent block reuse, and followers retain the backing pools. The affected backend rejects new operations, and shutdown does not wait for retained work. Even transient transfer errors are treated conservatively; restoring remote-cache capacity requires replacing the instance. All TP ranks must run the same version. This bounds caller waits without cancelling backend I/O or releasing memory it may still access.
 
-Writes map offset/bool masks back to the original keys and fill actual URIs into specs in the same order. Writes known to have failed abort through FinishWrite; uncertain writes leave their sessions for server expiry rather than immediately recycling destinations; empty sessions are closed on a best-effort basis, with server expiry as a fallback. PACE fallback preserves the hostname. DRAM uses `PREFER_LOCAL` (0) to avoid colliding with the legacy `ONLY_REMOTE` value 2; SSD uses `LOC_DEFAULT | MEDIA_TYPE_LOCALSSD` (5).
+Each StartWrite location must contain exactly the selected group's TP specs, all with nonempty URIs. Writes map offset/bool masks back to the original keys and fill actual URIs into specs in the same order. Writes known to have failed abort through FinishWrite; uncertain writes leave their sessions for server expiry rather than immediately recycling destinations; empty sessions are closed on a best-effort basis, with server expiry as a fallback. PACE fallback preserves the hostname. DRAM uses `PREFER_LOCAL` (0) to avoid colliding with the legacy `ONLY_REMOTE` value 2; SSD uses `LOC_DEFAULT | MEDIA_TYPE_LOCALSSD` (5).
 
 ## Server event configuration
 
@@ -134,3 +140,7 @@ Those cases covered DEVICE/HOST/DISK/remote-only finish paths, complete blocks a
 The source record also reports an incremental model-library build and ten Qwen2.5-0.5B requests across remote-only, HOST, HOST TP2, DISK, and DEVICE scenarios using the former P1 source lock and paired KVCM/PACE artifacts. HOST/DISK logs confirmed local publication. After watermark eviction removed local reuse, warm requests reused 640 remote tokens; cold reuse and warm local/memory/disk reuse were zero, and outputs matched the strict cold-start baseline.
 
 DISK in that record means the RTP local disk tier; remote storage used PACE/DRAM. Remote SSD, real SDK slow I/O/queue saturation, P/D, cross-layout TP/CP, performance, and full CI were outside that acceptance. These historical results do not validate this transplant or its current V2 artifacts. No compilation or tests have been run for this transplant. See [P1 smoke](kvcm_remote_cache_smoke.md) for smoke entry points and artifact requirements.
+
+## Multi-pool checks
+
+The component suite is `//rtp_llm/test/smoke:smoke_kvcm_p2_multi_pool`. The manual `//rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/test:kvcm_multi_pool_pace_test` target requires `KVCM_P2_SERVER_ADDRESS` and `KVCM_P2_INSTANCE_GROUP` for a configured KVCM/PACE environment; it verifies payloads through matching and byte-for-byte readback.

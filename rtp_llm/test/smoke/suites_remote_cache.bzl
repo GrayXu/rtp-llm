@@ -78,6 +78,14 @@ def _pace_suites():
     native.test_suite(name = "smoke_kvcm_p1_cpu", tests = [":remote_cache_pace_contract"])
     native.test_suite(name = "smoke_kvcm_p1_cpu_ssd", tests = [":remote_cache_pace_ssd_contract"])
     native.test_suite(
+        name = "smoke_kvcm_p2_multi_pool",
+        tests = [
+            "//rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/test:" + name
+            for name in ["kvcm_multi_pool_config_test", "kvcm_independent_pool_test", "kvcm_internal_test",
+                         "kvcm_mock_only_full_test", "kvcm_mock_full_linear_test", "client_wrapper_test"]
+        ],
+    )
+    native.test_suite(
         name = "smoke_kvcm_p1_gpu_ssd",
         tests = [_pace_smoke(
             "remote_cache_pace_ssd", "data/model/qwen25/q_r_l20_remote_cache.json",

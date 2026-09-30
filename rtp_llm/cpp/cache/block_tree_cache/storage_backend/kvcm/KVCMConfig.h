@@ -218,6 +218,15 @@ public:
     inline const auto& sdk_wrapper_config() const {
         return sdk_wrapper_config_;
     }
+    int32_t block_size() const {
+        return block_size_;
+    }
+    const auto& location_spec_infos() const {
+        return location_spec_info_map_;
+    }
+    const auto& location_spec_groups() const {
+        return location_spec_groups_;
+    }
     int32_t default_query_type() const {
         return default_query_type_;
     }

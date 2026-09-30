@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -832,6 +833,75 @@ TEST(KVCMInternalTest, RejectsInvalidGroupModeInputs) {
     EXPECT_FALSE(FullLayerGroupPolicy(*topology, unusedResolver(), {"full"}, {"linear"}).init());
     EXPECT_FALSE(FullLinearLayerGroupPolicy(*topology, unusedResolver(), {}, {"linear"}, 0).init());
     EXPECT_FALSE(FullLinearLayerGroupPolicy(*topology, unusedResolver(), {"full"}, {}, 0).init());
+}
+
+TEST(KVCMInternalTest, RejectsUnknownZeroAndOutOfRangePhysicalSizeOverrides) {
+    auto topology = CacheTopology::create({makeGroup("full", 0, CacheGroupType::FULL)}, {{0, {"full"}}});
+    for (const auto& sizes : std::vector<std::unordered_map<std::string, size_t>>{
+             {{"unknown", 16}}, {{"full", 0}}, {{"full", std::numeric_limits<size_t>::max()}}}) {
+        FullLayerGroupPolicy policy(*topology, unusedResolver(), {"full"}, {}, sizes);
+        EXPECT_FALSE(policy.init());
+        EXPECT_TRUE(policy.groups().empty());
+    }
+}
+
+TEST(KVCMInternalTest, SameGroupRejectsDifferentBlockSizesWithoutPublishingPartialBuffers) {
+    std::array<char, 17> storage{};
+    auto topology = CacheTopology::create({makeGroup("full", 0, CacheGroupType::FULL)}, {{0, {"full"}}});
+    FullLayerGroupPolicy policy(*topology, [&](int, const std::string&, int block, Tier) {
+        BlockInfo info;
+        info.is_cuda = true;
+        info.addr = storage.data();
+        info.size_bytes = block == 7 ? 16 : 17;
+        return std::vector<BlockInfo>{info};
+    }, {"full"}, {});
+    ASSERT_TRUE(policy.init());
+    kv_cache_manager::BlockBuffers buffers;
+    EXPECT_FALSE(policy.genBlockBuffers({"full", "full"}, {7, 8}, buffers));
+    EXPECT_TRUE(buffers.empty());
+}
+
+TEST(KVCMInternalTest, EmptyLayerCannotBeCompensatedByAnotherLayerPayload) {
+    std::array<char, 32> storage{};
+    auto topology = CacheTopology::create({makeGroup("full", 0, CacheGroupType::FULL)},
+                                          {{0, {"full"}}, {1, {"full"}}});
+    FullLayerGroupPolicy policy(*topology, [&](int layer, const std::string&, int, Tier) {
+        if (layer == 1) {
+            return std::vector<BlockInfo>{};
+        }
+        BlockInfo info;
+        info.is_cuda = true;
+        info.addr = storage.data();
+        info.size_bytes = storage.size();
+        return std::vector<BlockInfo>{info};
+    }, {"full"}, {});
+    ASSERT_TRUE(policy.init());
+    kv_cache_manager::BlockBuffers buffers;
+    EXPECT_FALSE(policy.genBlockBuffers({"full"}, {7}, buffers));
+    EXPECT_TRUE(buffers.empty());
+}
+
+TEST(KVCMInternalTest, WriteLocationRequiresEverySelectedGroupAndRankExactlyOnce) {
+    auto topology = makeMultiGroupTopology(2, 1);
+    FullLinearLayerGroupPolicy policy(*topology, unusedResolver(), {"full0", "full1"}, {"linear0"}, 1);
+    ASSERT_TRUE(policy.init());
+    GroupPolicy::LocationSpecGroups groups;
+    ASSERT_TRUE(policy.buildLocationSpecGroups(2, groups));
+    auto all = makeMultiGroupLocation(2, 1, 2, true);
+    EXPECT_TRUE(policy.validateWriteLocation(all, ""));
+    EXPECT_TRUE(policy.validateWriteLocation(all, "Ffull0Ffull1Llinear0"));
+    EXPECT_TRUE(policy.validateWriteLocation(makeMultiGroupLocation(2, 1, 2, false), "Ffull0Ffull1"));
+    EXPECT_FALSE(policy.validateWriteLocation(all, "Ffull0Ffull1"));
+    all.pop_back();
+    EXPECT_FALSE(policy.validateWriteLocation(all, ""));
+    all = makeMultiGroupLocation(2, 1, 2, true);
+    all[1] = all[0];
+    EXPECT_FALSE(policy.validateWriteLocation(all, ""));
+    all = makeMultiGroupLocation(2, 1, 2, true);
+    all.back().uri.clear();
+    EXPECT_FALSE(policy.validateWriteLocation(all, ""));
+    LocationsView loaded;
+    EXPECT_FALSE(policy.filterNeedLoadLocations({all}, loaded));
 }
 
 }  // namespace

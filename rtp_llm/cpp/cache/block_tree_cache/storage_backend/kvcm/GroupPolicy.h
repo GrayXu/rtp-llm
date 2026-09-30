@@ -99,6 +99,9 @@ public:
     // canonical group-name order used by the legacy KVCM protocol.
     bool buildLocationSpecGroups(int tp_size, LocationSpecGroups& location_spec_groups);
 
+    bool validateWriteLocation(const kv_cache_manager::Location& location,
+                               const std::string&                location_spec_group_name) const;
+
     const SpecInfoMap& spec_info_map() const {
         return spec_name_to_info_;
     }

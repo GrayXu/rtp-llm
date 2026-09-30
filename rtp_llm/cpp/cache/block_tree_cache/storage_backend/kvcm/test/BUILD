@@ -162,6 +162,7 @@ cc_test_wrapper(
         "KVCMIndependentPoolTest.cc",
         "KVCMMockTestBase.h",
         "MockKVCMClient.h",
+        "MultiPoolTestUtils.h",
     ],
     copts = ["-fno-access-control"] + copts(),
     tags = [
@@ -175,6 +176,40 @@ cc_test_wrapper(
     deps = kvcm_backend_test_deps + [
         "//rtp_llm/cpp/cache:coordinator_cache_manager",
         "//rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm:subscriber",
+        "//rtp_llm/cpp/testing:device_test_utils",
+        "@local_config_cuda//cuda:cuda_headers",
+        "@local_config_cuda//cuda:cudart",
+    ],
+)
+
+cc_test_wrapper(
+    name = "kvcm_multi_pool_config_test",
+    testonly = True,
+    exec_properties = {"gpu": "A10_CU13"},
+    srcs = ["KVCMMultiPoolConfigTest.cc", "KVCMMockTestBase.h", "MockKVCMClient.h", "MultiPoolTestUtils.h"],
+    copts = ["-fno-access-control"] + copts(),
+    tags = ["exclusive-if-local"],
+    target_compatible_with = select({
+        "//:using_remote_kv_cache": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = kvcm_backend_test_deps,
+)
+
+# Requires an explicitly supplied TCP PACE/KVCM test environment.
+cc_test_wrapper(
+    name = "kvcm_multi_pool_pace_test",
+    testonly = True,
+    exec_properties = {"gpu": "A10_CU13"},
+    srcs = ["KVCMMultiPoolPaceTest.cc", "KVCMMockTestBase.h", "MockKVCMClient.h", "MultiPoolTestUtils.h"],
+    copts = ["-fno-access-control"] + copts(),
+    tags = ["manual", "exclusive-if-local"],
+    target_compatible_with = select({
+        "//:using_remote_kv_cache": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = kvcm_backend_test_deps + [
+        "//rtp_llm/cpp/cache:coordinator_cache_manager",
         "//rtp_llm/cpp/testing:device_test_utils",
         "@local_config_cuda//cuda:cuda_headers",
         "@local_config_cuda//cuda:cudart",

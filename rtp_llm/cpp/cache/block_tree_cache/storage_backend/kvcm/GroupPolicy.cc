@@ -108,6 +108,10 @@ bool GroupPolicy::validateLocationSpecs(const kv_cache_manager::Location& locati
     std::vector<std::string_view> actual_specs;
     actual_specs.reserve(location.size());
     for (const auto& unit : location) {
+        if (unit.uri.empty()) {
+            RTP_LLM_LOG_WARNING("KVCM %s spec [%s] has an empty URI", kind, unit.spec_name.c_str());
+            return false;
+        }
         actual_specs.emplace_back(unit.spec_name);
     }
     std::sort(actual_specs.begin(), actual_specs.end());
@@ -123,6 +127,25 @@ bool GroupPolicy::validateLocationSpecs(const kv_cache_manager::Location& locati
         }
     }
     return true;
+}
+
+bool GroupPolicy::validateWriteLocation(const kv_cache_manager::Location& location,
+                                        const std::string&                location_spec_group_name) const {
+    if (location_spec_group_name.empty()) {
+        return validateLocationSpecs(location, all_spec_names_, "write");
+    }
+    const auto mask = std::find_if(location_spec_group_map_.begin(), location_spec_group_map_.end(),
+                                   [&](const auto& entry) { return entry.second == location_spec_group_name; });
+    if (mask == location_spec_group_map_.end()) {
+        return false;
+    }
+    SpecNames expected_specs;
+    for (const auto& [name, info] : spec_name_to_info_) {
+        if ((groups_.at(info.group_id).group_name_bithash & mask->first) != 0) {
+            expected_specs.push_back(name);
+        }
+    }
+    return validateLocationSpecs(location, expected_specs, "write");
 }
 
 bool GroupPolicy::setLocationView(const kv_cache_manager::Location& location,
@@ -176,6 +199,13 @@ bool DefaultLayerGroupPolicy::init() {
                             "remote cache group byte-size table has %zu entries but topology has %zu groups",
                             group_block_size_bytes_.size(),
                             topology_.groups().size());
+    for (const auto& [tag, bytes] : group_block_size_bytes_) {
+        const auto& tags = topology_.groupTags();
+        if (std::find(tags.begin(), tags.end(), tag) == tags.end()) {
+            RTP_LLM_LOG_ERROR("invalid remote cache group byte size: tag=%s bytes=%zu", tag.c_str(), bytes);
+            return false;
+        }
+    }
     std::vector<std::string> intersection;
     std::set_intersection(full_group_tags_.begin(),
                           full_group_tags_.end(),
@@ -251,6 +281,10 @@ bool DefaultLayerGroupPolicy::init() {
                 const size_t      block_size_bytes = exact_bytes == group_block_size_bytes_.end() ?
                                                          topology_.blockSizeBytesForGroup(cache_tag) :
                                                          exact_bytes->second;
+                if (block_size_bytes == 0 || block_size_bytes > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+                    RTP_LLM_LOG_ERROR("invalid remote cache payload size for tag=%s", cache_tag.c_str());
+                    return false;
+                }
                 pending_groups[group_idx] =
                     Group{is_full_group, group_name_bithash, group_name, cache_tag, block_size_bytes};
                 pending_group_to_layer_ids[group_idx] = {};
@@ -378,6 +412,7 @@ bool DefaultLayerGroupPolicy::genBlockBuffers(const std::vector<std::string>& gr
                                     layer_ids[j],
                                     group_id,
                                     block_ids[i]);
+                return false;
             }
             for (size_t idx = 0; idx < block_infos.size(); ++idx) {
                 if (block_infos[idx].is_cuda != (source_tier == Tier::DEVICE)) {
@@ -392,6 +427,10 @@ bool DefaultLayerGroupPolicy::genBlockBuffers(const std::vector<std::string>& gr
                     layer_ids[j],
                     group_id,
                     block_ids[i]);
+                if (block_infos[idx].size_bytes > groups_.at(group_id).block_size_bytes - actual_block_bytes) {
+                    RTP_LLM_LOG_WARNING("remote cache buffer exceeds payload size for tag=%s", tag.c_str());
+                    return false;
+                }
                 actual_block_bytes += block_infos[idx].size_bytes;
                 push_iov(iovs, block_infos[idx]);
             }
