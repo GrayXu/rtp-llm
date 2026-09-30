@@ -45,7 +45,8 @@ StorageWriteTask BlockTreeStorer::storeLocked(const CacheKeysType&              
                                               Tier                                              target_tier,
                                               bool                                              is_resident,
                                               size_t&                                           resident_prefix_length,
-                                              bool                                              write_remote_from_device) {
+                                              bool                                              write_remote_from_device,
+                                              bool                                              allow_remote_write) {
     resident_prefix_length = 0;
     assert(!is_resident || target_tier == Tier::DEVICE);
     RTP_LLM_CHECK_WITH_INFO(target_tier == Tier::DEVICE || target_tier == Tier::HOST || target_tier == Tier::DISK
@@ -72,7 +73,7 @@ StorageWriteTask BlockTreeStorer::storeLocked(const CacheKeysType&              
                 }
             }
             auto storage_write =
-                storage_backend_ ?
+                allow_remote_write && storage_backend_ ?
                     storage_backend_->prepareWrite(makeStorageRequest(cache_keys, resources, Tier::HOST)) :
                     StorageWriteTask{};
             const auto insert_result = tree_->insertNode(cache_keys, resources, true, false);
@@ -84,7 +85,7 @@ StorageWriteTask BlockTreeStorer::storeLocked(const CacheKeysType&              
         }
         // Request finish submits DEVICE I/O independently of the local copy.
         // A completed HOST copy must not submit the same remote write again.
-        auto storage_write = write_remote_from_device && storage_backend_ ?
+        auto storage_write = allow_remote_write && write_remote_from_device && storage_backend_ ?
                                  storage_backend_->prepareWrite(makeStorageRequest(cache_keys, resources)) :
                                  StorageWriteTask{};
         submitLowerTierLocked(cache_keys, resources, target_tier);
@@ -92,8 +93,9 @@ StorageWriteTask BlockTreeStorer::storeLocked(const CacheKeysType&              
     }
     // Pin the complete device sources before request release, independently of
     // the local store. BlockTreeCache submits remote I/O after unlocking.
-    return storage_backend_ ? storage_backend_->prepareWrite(makeStorageRequest(cache_keys, resources)) :
-                              StorageWriteTask{};
+    return allow_remote_write && storage_backend_ ?
+               storage_backend_->prepareWrite(makeStorageRequest(cache_keys, resources)) :
+               StorageWriteTask{};
 }
 
 void BlockTreeStorer::publishDeviceLocked(const CacheKeysType&                              cache_keys,

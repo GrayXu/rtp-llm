@@ -74,7 +74,8 @@ StoreEnvironment makeStoreEnvironment(const std::string&              name,
                                       const std::vector<size_t>&      lower_tier_blocks = {2},
                                       int                             task_pool_size    = 4,
                                       std::shared_ptr<StorageBackend> storage_backend   = nullptr,
-                                      TierWatermark                   device_watermark  = {}) {
+                                      TierWatermark                   device_watermark  = {},
+                                      bool                            finish_remote_write = false) {
     StoreEnvironment env;
     for (size_t group_set_id = 0; group_set_id < lower_tier_blocks.size(); ++group_set_id) {
         env.device_pools.push_back(
@@ -93,6 +94,7 @@ StoreEnvironment makeStoreEnvironment(const std::string&              name,
     config.enable_host_cache        = host_cache_on;
     config.enable_disk_cache        = disk_cache_on;
     config.enable_remote_cache      = storage_backend != nullptr;
+    config.enable_remote_cache_write_on_finish = finish_remote_write;
     config.watermark_device         = device_watermark;
     config.task_pool_size           = task_pool_size;
     std::vector<GroupSetPtr> groups = env.groups;
@@ -794,6 +796,35 @@ TEST(BlockTreeStorerTest, DeviceInsertDoesNotWaitForBackendWriteOrLocalTaskPool)
     releaseDeviceBlocks(*env->cache, env->device_pools[0], holder[0]);
 }
 
+TEST(BlockTreeStorerTest, RequestFinishRemoteWritesRequireExplicitOptIn) {
+    if (!cudaAvailable()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    EXPECT_FALSE(BlockTreeCacheConfig{}.enable_remote_cache_write_on_finish);
+    for (const Tier target : {Tier::DEVICE, Tier::HOST, Tier::DISK, Tier::REMOTE}) {
+        for (const bool enabled : {false, true}) {
+            SCOPED_TRACE(std::string(tierName(target)) + " enabled=" + std::to_string(enabled));
+            auto backend = std::make_shared<PendingWriteBackend>();
+            auto env = makeStoreEnvironment("finish_write_opt_in", target == Tier::DEVICE,
+                                            target == Tier::HOST, target == Tier::DISK, {2}, 2,
+                                            backend, {}, enabled);
+            backend->setCache(env.cache.get());
+            const auto holder = allocateDeviceBlocksForTest(*env.groups[0], 1);
+            ASSERT_EQ(holder.size(), 1u);
+            env.cache->insert({100}, deviceSourceResources({holder[0]}), target, false, true);
+            EXPECT_EQ(backend->submittedCount(), enabled ? 1u : 0u);
+            backend->finishWrite();
+            BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*env.cache);
+            const auto path = env.cache->tree()->findNode({100});
+            if (target != Tier::REMOTE) {
+                ASSERT_EQ(path.size(), 1u);
+                EXPECT_TRUE(path.back()->group_set_resources[0].hasTier(target));
+            }
+            releaseDeviceBlocks(*env.cache, env.device_pools[0], holder[0]);
+        }
+    }
+}
+
 TEST(BlockTreeStorerTest, RequestFinishDualWriteReturnsBeforeLocalTransferSettlement) {
     if (!cudaAvailable()) {
         GTEST_SKIP() << "CUDA not available";
@@ -808,7 +839,7 @@ TEST(BlockTreeStorerTest, RequestFinishDualWriteReturnsBeforeLocalTransferSettle
                                  /*disk_cache_on=*/target_tier == Tier::DISK,
                                  /*lower_tier_blocks=*/{2},
                                  /*task_pool_size=*/2,
-                                 backend));
+                                 backend, {}, true));
         backend->setCache(env->cache.get());
         auto barrier = std::make_shared<CallbackBarrier>();
         installStoreTransferEngine(*env, TransferCopyAction::Succeed, barrier);
@@ -867,7 +898,7 @@ TEST(BlockTreeStorerTest, DualWriteFailuresSettleLocalAndRemoteSourcesIndependen
                              + " remote_failure=" + std::to_string(fail_remote));
                 auto backend = std::make_shared<PendingWriteBackend>();
                 auto env = makeStoreEnvironment("dual_write_failure", false, target == Tier::HOST,
-                                                target == Tier::DISK, {2}, 2, backend);
+                                                target == Tier::DISK, {2}, 2, backend, {}, true);
                 backend->setCache(env.cache.get());
                 auto barrier = std::make_shared<CallbackBarrier>();
                 block_tree_cache_detail::ScopeRollback release_barrier([barrier]() { barrier->release(); });

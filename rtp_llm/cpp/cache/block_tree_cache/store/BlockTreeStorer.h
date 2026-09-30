@@ -40,7 +40,8 @@ public:
                                  Tier                                              target_tier,
                                  bool                                              is_resident,
                                  size_t&                                           resident_prefix_length,
-                                 bool                                              write_remote_from_device);
+                                 bool                                              write_remote_from_device,
+                                 bool                                              allow_remote_write = true);
     void             stopAdmissionLocked();
 
 private:

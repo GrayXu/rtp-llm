@@ -564,6 +564,7 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
     config.enable_host_cache   = host_enabled;
     config.enable_disk_cache   = disk_enabled;
     config.enable_remote_cache = kv_cache_config.enable_remote_cache && storage_backend != nullptr;
+    config.enable_remote_cache_write_on_finish = kv_cache_config.enable_remote_cache_write_on_finish;
     if (!config.enable_remote_cache) {
         storage_backend = nullptr;
     }

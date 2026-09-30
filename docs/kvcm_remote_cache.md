@@ -76,7 +76,7 @@ Groups in one Instance must share `cacheKeyTokenStride()`, used as the registere
 
 Generated Instance identities include the default query mode and registered group configuration. Multi-group identities also include tag-sorted per-layer physical layouts and layer ownership, creating a new cache namespace. Sharded CP registers the base token stride multiplied by CP size, so single-group CP also changes namespace. Single-group identities remain unchanged when their registered token stride is unchanged.
 
-Custom IDs must match the existing server configuration. `KVCacheConfig` uses pickle version 8 with 74 items and reads versions 1-7; communicating processes must use the same build.
+Custom IDs must match the existing server configuration. `KVCacheConfig` uses pickle version 9 with 75 items and reads versions 1-8. Older states default request-finish remote writes to disabled; communicating processes must use the same build.
 
 ## RPC interface
 
@@ -113,7 +113,7 @@ When local HOST payload completion is uncertain, its block references remain cha
 
 ## I/O lifetime
 
-When a request reaches `FINISHED` successfully and cache reuse is allowed, complete KV blocks are stored in the highest enabled local tier (DEVICE, then HOST, then DISK), and a KVCM remote write is submitted alongside it. With all local tiers disabled and remote cache enabled, only the remote write is submitted. Deployment remote-cache controls, per-request `reuse_cache`, and `RTP_LLM_IGNORE_REQUEST_CACHE_SWITCHES` retain their existing behavior.
+When a request reaches `FINISHED` successfully and cache reuse is allowed, complete KV blocks are stored in the highest enabled local tier (DEVICE, then HOST, then DISK). Request-finish remote writes require both `ENABLE_REMOTE_CACHE=1` and `ENABLE_REMOTE_CACHE_WRITE_ON_FINISH=1`; the latter defaults to false and can also be set with `--enable_remote_cache_write_on_finish true`. Remote-only deployments use the same write gate. Disabling it preserves remote lookup/read and explicit writes. Per-request `reuse_cache` and `RTP_LLM_IGNORE_REQUEST_CACHE_SWITCHES` retain their existing behavior.
 
 The submission includes available complete blocks, including reused prefixes; the final partial block is not published. Remote writes honor the offset/bool mask returned by `StartWrite` to skip blocks with enough replicas. Local asynchronous stores and remote tasks retain independent source references after request release, releasing them on completion or rejection.
 

@@ -695,6 +695,7 @@ class KVCacheConfig:
     enable_memory_cache: bool
     enable_disk_cache: bool
     enable_remote_cache: bool
+    enable_remote_cache_write_on_finish: bool
     device_eviction_policy: str
     memory_eviction_policy: str
     disk_eviction_policy: str

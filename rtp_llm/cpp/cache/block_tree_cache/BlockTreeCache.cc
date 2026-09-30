@@ -221,8 +221,15 @@ size_t BlockTreeCache::insert(const CacheKeysType&                              
     StorageWriteTask storage_write;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        storage_write = storer_.storeLocked(
-            cache_keys, resources, target_tier, is_resident, resident_prefix_length, write_remote_from_device);
+        // Request finish marks its DEVICE source explicitly; direct writes keep their existing admission.
+        const bool allow_remote_write = !write_remote_from_device || config_.enable_remote_cache_write_on_finish;
+        storage_write = storer_.storeLocked(cache_keys,
+                                           resources,
+                                           target_tier,
+                                           is_resident,
+                                           resident_prefix_length,
+                                           write_remote_from_device,
+                                           allow_remote_write);
     }
     if (storage_write) {
         storage_backend_->write(std::move(storage_write));
