@@ -4,7 +4,7 @@
 
 `BlockTreeCache::insert(..., Tier::HOST)` accepts a populated HOST-only `GroupSetResource::host_block`; the caller must hold a valid reference in the corresponding pool during the call. A local DEVICE-to-HOST store only copies and publishes local cache data; it does not trigger a remote write.
 
-At request finish, a successful request sets the internal `InsertInfo::write_remote_from_device` flag and independently submits one DEVICE-source remote write. Completion of its HOST copy does not submit another CPU write. Local copy failure does not affect an already submitted DEVICE remote task. Direct ready-HOST insertion retains the explicit CPU-source path. See the [request-finish contract and historical acceptance](../kvcm_remote_cache.md).
+When request-finish remote writes are enabled, the local target is HOST, and the backend supports reuse, remote submission waits for and reuses the completed HOST copy. Single-rank KVCM uses shared HOST I/O. HOST allocation, queue, or copy failure falls back to a pre-pinned DEVICE write task. TP greater than one and other local tiers retain DEVICE sources. Ordinary local DEVICE-to-HOST stores do not automatically write remote; explicit ready-HOST writes are unchanged. See the [request-finish contract](../kvcm_remote_cache.md).
 
 Direct `StorageBackend` callers provide tag-bound HOST pools and a HOST buffer resolver during initialization, set `StorageRequest::source_tier = Tier::HOST`, then call `prepareWrite` and `write`. Each request uses one source tier. Match/read requests still accept DEVICE handles only.
 

@@ -747,8 +747,10 @@ public:
         }
     }
 
-    bool isCoordinator() const {
-        return parallelism_config_.tp_rank == 0;
+    bool canInitiateHostWrite() const {
+        // Normal request HOST publication is owned by TP0. Follower key mappings
+        // must be synchronized before request-finish writes can reuse them.
+        return parallelism_config_.tp_rank == 0 && parallelism_config_.tp_size == 1;
     }
 
 private:
@@ -1394,7 +1396,8 @@ private:
     std::vector<FunctionResponsePB> dispatchRequests(const std::vector<FunctionRequestPB>& requests,
                                                      int timeout_ms,
                                                      std::atomic<bool>* local_host_payload_dispatched) {
-        if (!broadcast_manager_) {
+        if (!broadcast_manager_
+            || (requests.size() == 1 && requests.front().remote_request().op() == REMOTE_OPERATION_WRITE_HOST)) {
             RTP_LLM_CHECK_WITH_INFO(
                 requests.size() == 1, "KVCM local transfer requires exactly one request, got %zu", requests.size());
             FunctionResponsePB response;
@@ -1549,7 +1552,7 @@ bool KVCMStorageBackend::initImpl() {
 }
 
 bool KVCMStorageBackend::canInitiateHostWrite() const {
-    return impl_->isCoordinator();
+    return impl_->canInitiateHostWrite();
 }
 
 StorageMatchResult KVCMStorageBackend::matchImpl(const StorageRequest& request) {

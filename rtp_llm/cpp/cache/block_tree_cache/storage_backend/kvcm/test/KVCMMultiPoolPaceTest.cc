@@ -1,6 +1,7 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/test/KVCMMockTestBase.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/test/MultiPoolTestUtils.h"
 #include "rtp_llm/cpp/cache/CoordinatorCacheManager.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCacheFactory.h"
 #include "rtp_llm/cpp/testing/TestBase.h"
 
 #include <chrono>
@@ -156,6 +157,85 @@ protected:
         EXPECT_TRUE(backend->execute(cleanup, response));
     }
 };
+
+TEST_F(KVCMMultiPoolPaceTest, RequestFinishHostCopyPublishesRemotePayloadWithoutDeviceSources) {
+    const auto address = autil::EnvUtil::getEnv("KVCM_P2_SERVER_ADDRESS", std::string{});
+    const auto group = autil::EnvUtil::getEnv("KVCM_P2_INSTANCE_GROUP", std::string{});
+    ASSERT_FALSE(address.empty());
+    ASSERT_FALSE(group.empty());
+    const auto config = test::makeSimpleMhaCacheConfig(1, 16, 8, DataType::TYPE_FP16, 1, 2);
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count() / 1000;
+    KVCacheConfig options;
+    options.enable_device_cache = false;
+    options.enable_memory_cache = true;
+    options.memory_cache_size_mb = 1;
+    options.enable_remote_cache = true;
+    options.enable_remote_cache_write_on_finish = true;
+    options.kvcm_server_address = address;
+    options.kvcm_instance_group = group;
+    options.kvcm_instance_id_salt = "finish_host_reuse_" + std::to_string(nonce);
+    options.kvcm_model_sdk_config = R"([{"type":"pace","sdk_log_level":"WARN"}])";
+    RuntimeConfig runtime;
+    runtime.model_name = "finish_host_reuse";
+    auto allocator = std::make_shared<CoordinatorCacheManager>(config);
+    ASSERT_TRUE(allocator->init());
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    auto backend = std::make_shared<KVCMStorageBackend>(config, options, runtime, singleRankConfig(),
+                                                       SpeculativeExecutionConfig{}, nullptr);
+    auto cache = createBlockTreeCache(config, options, allocator, singleRankConfig(), backend);
+    ASSERT_NE(cache, nullptr);
+    ASSERT_TRUE(backend->canInitiateHostWrite());
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    const auto pool = allocator->groupBlockPools().front();
+    auto sources = std::make_unique<ScopedReferencedBlocks>(pool, 2);
+    std::vector<std::vector<GroupSetResource>> resources(2, std::vector<GroupSetResource>(1));
+    const auto& tag = config.groupTags().front();
+    for (size_t key = 0; key < 2; ++key) {
+        resources[key][0].device_blocks = {sources->get()[key]};
+        for (const auto& buffer : allocator->convertIndexToBuffer(0, tag, sources->get()[key])) {
+            ASSERT_EQ(cudaMemset(buffer.addr, 0x61 + key, buffer.size_bytes), cudaSuccess);
+        }
+    }
+    const CacheKeysType keys{nonce, nonce + 1};
+    cache->insert(keys, resources, Tier::HOST, false, true);
+    block_tree_cache_test::BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+    sources.reset();
+    EXPECT_EQ(pool->usedBlocksNum(), 0u);
+    ASSERT_TRUE(waitForBackendOperationsForTest(*backend));
+    const auto path = cache->tree()->findNode(keys);
+    ASSERT_EQ(path.size(), 2u);
+    EXPECT_TRUE(path.back()->group_set_resources[0].hasTier(Tier::HOST));
+    EXPECT_EQ(cache->groupSets()[0]->hostPool()->referencedBlocksNum(BlockTreeRefType::STORE), 0u);
+
+    ScopedReferencedBlocks destinations(pool, 2);
+    StorageRequest request;
+    request.keys = std::make_shared<CacheKeysType>(keys);
+    request.handles = {{{tag, destinations.get()[0]}}, {{tag, destinations.get()[1]}}};
+    auto matched = match(*backend, request);
+    ASSERT_TRUE(matched.success);
+    ASSERT_EQ(matched.matched_blocks_num, 2u);
+    for (const auto block : destinations.get()) {
+        for (const auto& buffer : allocator->convertIndexToBuffer(0, tag, block)) {
+            ASSERT_EQ(cudaMemset(buffer.addr, 0, buffer.size_bytes), cudaSuccess);
+        }
+    }
+    ASSERT_TRUE(read(*backend, request, matched.match_meta));
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    for (size_t key = 0; key < 2; ++key) {
+        for (const auto& buffer : allocator->convertIndexToBuffer(0, tag, destinations.get()[key])) {
+            std::vector<uint8_t> actual(buffer.size_bytes);
+            ASSERT_EQ(cudaMemcpy(actual.data(), buffer.addr, actual.size(), cudaMemcpyDeviceToHost), cudaSuccess);
+            EXPECT_EQ(actual, std::vector<uint8_t>(actual.size(), 0x61 + key));
+        }
+    }
+    RemoteOperationRequestPB cleanup;
+    cleanup.set_op(REMOTE_OPERATION_REMOVE_CACHE);
+    for (const auto key : keys) {
+        cleanup.mutable_metadata()->add_block_keys(key);
+    }
+    RemoteOperationResponsePB response;
+    EXPECT_TRUE(backend->execute(cleanup, response));
+}
 
 TEST_F(KVCMMultiPoolPaceTest, HeterogeneousPoolsRoundTripThroughRealKVCMAndPace) {
     roundTrip(test::makeHeterogeneousRemoteCacheConfig());

@@ -45,7 +45,10 @@ public:
     void             stopAdmissionLocked();
 
 private:
-    using StoreTask    = StoreTaskRunner::Task;
+    struct StoreTask: StoreTaskRunner::Task {
+        using StoreTaskRunner::Task::Task;
+        StorageWriteTask device_write;
+    };
     using StoreTaskPtr = std::shared_ptr<StoreTask>;
 
     void             publishDeviceLocked(const CacheKeysType&                              cache_keys,
@@ -55,13 +58,15 @@ private:
     StorageRequest   makeStorageRequest(const CacheKeysType&                              cache_keys,
                                         const std::vector<std::vector<GroupSetResource>>& resources,
                                         Tier source_tier = Tier::DEVICE) const;
+    StorageRequest   makeHostStorageRequest(const StoreTask& task) const;
     void             submitLowerTierLocked(const CacheKeysType&                              cache_keys,
                                            const std::vector<std::vector<GroupSetResource>>& resources,
-                                           Tier                                              target_tier);
+                                           Tier                                              target_tier,
+                                           StorageWriteTask*                                 device_write = nullptr);
     void             runStoreTask(const StoreTaskPtr& task);
     void             scheduleStoreSettlement(const StoreTaskPtr& task, ErrorInfo error);
-    void             settleTask(const StoreTask& task, bool copy_success);
-    size_t           settleLocked(const StoreTask& task, bool publish);
+    void             settleTask(StoreTask& task, bool copy_success);
+    size_t           settleLocked(const StoreTask& task, bool publish, StorageWriteTask* host_write = nullptr);
 
     BlockTree*                      tree_;
     BlockTreeEvictor&               evictor_;

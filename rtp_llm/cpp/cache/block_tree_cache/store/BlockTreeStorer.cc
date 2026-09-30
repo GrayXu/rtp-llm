@@ -83,12 +83,13 @@ StorageWriteTask BlockTreeStorer::storeLocked(const CacheKeysType&              
             }
             return storage_write;
         }
-        // Request finish submits DEVICE I/O independently of the local copy.
-        // A completed HOST copy must not submit the same remote write again.
+        // Retain a DEVICE fallback before releasing the request's sources.
         auto storage_write = allow_remote_write && write_remote_from_device && storage_backend_ ?
                                  storage_backend_->prepareWrite(makeStorageRequest(cache_keys, resources)) :
                                  StorageWriteTask{};
-        submitLowerTierLocked(cache_keys, resources, target_tier);
+        const bool reuse_host = target_tier == Tier::HOST && storage_write
+                                && storage_backend_->canInitiateHostWrite();
+        submitLowerTierLocked(cache_keys, resources, target_tier, reuse_host ? &storage_write : nullptr);
         return storage_write;
     }
     // Pin the complete device sources before request release, independently of
@@ -146,9 +147,30 @@ StorageRequest BlockTreeStorer::makeStorageRequest(const CacheKeysType&         
     return request;
 }
 
+StorageRequest BlockTreeStorer::makeHostStorageRequest(const StoreTask& task) const {
+    const auto path = tree_->findNode(task.cache_keys);
+    if (path.size() != task.cache_keys.size()) {
+        return {};
+    }
+    std::vector<std::vector<GroupSetResource>> resources(
+        task.cache_keys.size(), std::vector<GroupSetResource>(tree_->groupSets().size()));
+    for (const auto& descriptor : task.descriptors()) {
+        const auto& group_set = tree_->groupSets()[descriptor.group_set_id];
+        const auto& resource = path[descriptor.path_index]->group_set_resources[descriptor.group_set_id];
+        if (!group_set->hostPool() || group_set->hostPool()->hasUncertainRemoteIo()
+            || resource.transfer_state != GroupSetTransferState::IDLE || !resource.hasTier(Tier::HOST)) {
+            return {};
+        }
+        // A duplicate store can retain the tree's old HOST block instead of this task's target.
+        resources[descriptor.path_index][descriptor.group_set_id].host_block = resource.host_block;
+    }
+    return makeStorageRequest(task.cache_keys, resources, Tier::HOST);
+}
+
 void BlockTreeStorer::submitLowerTierLocked(const CacheKeysType&                              cache_keys,
                                             const std::vector<std::vector<GroupSetResource>>& resources,
-                                            Tier                                              target_tier) {
+                                            Tier                                              target_tier,
+                                            StorageWriteTask*                                 device_write) {
     if (stopping_.load()) {
         return;
     }
@@ -157,10 +179,14 @@ void BlockTreeStorer::submitLowerTierLocked(const CacheKeysType&                
         target_tier,
         cache_keys,
         std::chrono::milliseconds(target_tier == Tier::DISK ? disk_timeout_ms_ : host_timeout_ms_));
+
     block_tree_cache_detail::ScopeRollback prepare_guard([this, &task]() { settleLocked(*task, /*publish=*/false); });
 
     if (!store_task_runner_.prepareTask(*task, resources)) {
         return;
+    }
+    if (device_write) {
+        task->device_write = std::move(*device_write);
     }
     const int64_t queue_begin = currentTimeUs();
     auto          on_timeout  = [this, task, queue_begin]() {
@@ -192,6 +218,9 @@ void BlockTreeStorer::submitLowerTierLocked(const CacheKeysType&                
         RTP_LLM_LOG_WARNING("store aborted: business task submission rejected, target=%s blocks=%zu",
                             tierName(target_tier),
                             task->descriptors().size());
+        if (device_write) {
+            *device_write = std::move(task->device_write);
+        }
         return;
     }
     prepare_guard.dismiss();
@@ -233,13 +262,21 @@ void BlockTreeStorer::scheduleStoreSettlement(const StoreTaskPtr& task, ErrorInf
     }
 }
 
-void BlockTreeStorer::settleTask(const StoreTask& task, bool copy_success) {
+void BlockTreeStorer::settleTask(StoreTask& task, bool copy_success) {
     bool   stopping = false;
     size_t accepted = 0;
+    StorageWriteTask storage_write;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         stopping = stopping_.load();
-        accepted = settleLocked(task, copy_success && !stopping);
+        accepted = settleLocked(task, copy_success && !stopping, task.device_write ? &storage_write : nullptr);
+        if (!stopping && !storage_write) {
+            storage_write = std::move(task.device_write);
+        }
+        task.device_write = {};
+    }
+    if (storage_write) {
+        storage_backend_->write(std::move(storage_write));
     }
 
     if (stopping) {
@@ -259,7 +296,7 @@ void BlockTreeStorer::settleTask(const StoreTask& task, bool copy_success) {
     }
 }
 
-size_t BlockTreeStorer::settleLocked(const StoreTask& task, bool publish) {
+size_t BlockTreeStorer::settleLocked(const StoreTask& task, bool publish, StorageWriteTask* host_write) {
     BlockTreeInsertResult insert_result;
     if (publish) {
         std::vector<std::vector<GroupSetResource>> resources(task.cache_keys.size(),
@@ -269,6 +306,16 @@ size_t BlockTreeStorer::settleLocked(const StoreTask& task, bool publish) {
                 task.target_tier, {descriptor.singleBlockAt(task.target_tier)});
         }
         insert_result = tree_->insertNode(task.cache_keys, resources, true, false);
+        if (host_write) {
+            try {
+                // Pin published HOST data before releasing task refs or checking watermarks.
+                *host_write = storage_backend_->prepareWrite(makeHostStorageRequest(task));
+            } catch (const std::exception& error) {
+                RTP_LLM_LOG_WARNING("prepare reused HOST remote write failed: %s", error.what());
+            } catch (...) {
+                RTP_LLM_LOG_WARNING("prepare reused HOST remote write failed with an unknown exception");
+            }
+        }
     }
 
     store_task_runner_.releaseTaskResources(task);

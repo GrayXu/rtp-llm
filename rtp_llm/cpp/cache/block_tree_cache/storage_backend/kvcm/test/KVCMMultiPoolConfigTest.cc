@@ -35,6 +35,20 @@ bool initializeConfig(const BackendEnvironment& environment, const std::string& 
     return initSingleRank(*backend.backend, environment);
 }
 
+TEST(KVCMMultiPoolConfigTest, RequestFinishHostReuseRequiresSingleRankCoordinator) {
+    const auto config = test::makeSimpleMhaCacheConfig(1, 16, 8, DataType::TYPE_FP16, 1, 2);
+    for (const int size : {1, 2}) {
+        for (int rank = 0; rank < size; ++rank) {
+            auto parallel = singleRankConfig();
+            parallel.tp_size = size;
+            parallel.tp_rank = rank;
+            BackendHandle backend(std::make_unique<KVCMStorageBackend>(config, KVCacheConfig{}, RuntimeConfig{},
+                parallel, SpeculativeExecutionConfig{}, nullptr));
+            EXPECT_EQ(backend->canInitiateHostWrite(), size == 1 && rank == 0);
+        }
+    }
+}
+
 TEST(KVCMMultiPoolConfigTest, CustomConfigPreservesHeterogeneousByteSizesAndAcceptsReorderedSpecs) {
     auto environment = configEnvironment(test::makeHeterogeneousRemoteCacheConfig());
     kvcm::ClientWrapper::ConfigMap configs;
