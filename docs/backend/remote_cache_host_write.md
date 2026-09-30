@@ -2,7 +2,7 @@
 
 ## 接入入口
 
-`BlockTreeCache::insert(..., Tier::HOST)` 支持已经填好的 HOST-only `GroupSetResource::host_block`；caller 在调用期间持有对应 pool 的有效引用。原有 DEVICE 源存入 HOST 的流程则在各 rank 拷贝成功后提交 HOST remote 写入。失败、超时或停机回滚的本地拷贝不提交 remote 写入。自动迁移及驱逐流程没有新增写入动作。
+`BlockTreeCache::insert(..., Tier::HOST)` 支持已经填好的 HOST-only `GroupSetResource::host_block`；caller 在调用期间持有对应 pool 的有效引用。本地 DEVICE→HOST 存储仅完成拷贝与缓存发布，不触发 remote 写入。
 
 集成 request finish 双写后，成功请求设置内部 `InsertInfo::write_remote_from_device`，从 DEVICE 独立提交一次 remote 写入；该请求的 HOST 拷贝完成后不重复提交 CPU 写入。本地拷贝失败不影响已提交的 DEVICE remote 任务。直接 ready HOST 和独立 DEVICE→HOST 存储仍保持上述 CPU 源路径，详见 [request finish 契约与验收](../kvcm_remote_cache.md)。
 
@@ -14,7 +14,7 @@ HOST pool 中一个 packed block 可包含多个 group；每个 group 按 layer�
 
 ## 写入与生命周期
 
-- HOST 写任务在发布本地数据、清理重复 block 或检查 watermark 前取得 STORE 引用，按 `(pool, block)` 去重；一个 packed block 的多个 tag 共享这一次引用。
+- 显式 HOST 写任务在发布本地数据、清理重复 block 或检查 watermark 前取得 STORE 引用，按 `(pool, block)` 去重；一个 packed block 的多个 tag 共享这一次引用。
 - 每个 rank 从自己的 HOST pool 生成真实 CPU IOV，再复制到该次传输持有的 CPU snapshot，IOV 数量和字节顺序保持不变。CPU trace 避开 SDK 的 GPU kernel 地址哈希检查。GPU 数据仍走原有 DEVICE resolver、长驻 transfer client 和检查路径。
 - CPU 写入使用按 tag/spec 配置创建的临时 transfer client。按 pinned SDK 源码契约，其析构停止并等待 SDK worker，随后才能销毁 snapshot；SDK 超时返回本身不是释放依据。该收尾可能超过 SDK 返回超时的时刻。集成 P1 后，TP payload 广播在超出预算时等待 peer 收尾，再判失败并释放调度 rank 的引用。默认 factory 的 client 创建在进程内串行，保护真实 PACE SDK 初始化中的共享状态和随机数生成器。
 - HOST 布局偏移按 GroupSet 缓存，后续按 tag/layer 查找并代入当前 block 的 CPU 基址，避免每个 layer 重复扫描全部布局。
@@ -40,7 +40,7 @@ HOST pool 中一个 packed block 可包含多个 group；每个 group 按 layer�
 
 ## 验证范围
 
-补充用例覆盖 HOST 直接入口、拷贝成功/失败入口、CPU/GPU resolver 选择、多 IOV、packed 多 group/scale/物理大小、共享 HOST pin 的完成/失败/拒绝/停机/未提交释放、SDK 超时 drain、写入 mask 及 actual URI 回填。原有 GPU、多 URI 和独立 pool 用例继续保留。
+补充用例覆盖 HOST 直接入口、本地 HOST 存储不触发 remote 写入、CPU/GPU resolver 选择、多 IOV、packed 多 group/scale/物理大小、共享 HOST pin 的完成/失败/拒绝/停机/未提交释放、SDK 超时 drain、写入 mask 及 actual URI 回填。原有 GPU、多 URI 和独立 pool 用例继续保留。
 
 2026-09-29 在独立 CUDA 13.2/Torch 2.11.0+cu130/SM103、200 GiB DRAM/TENT TCP 环境验证：
 

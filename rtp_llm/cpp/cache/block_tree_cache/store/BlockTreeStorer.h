@@ -56,12 +56,11 @@ private:
                                         Tier source_tier = Tier::DEVICE) const;
     void             submitLowerTierLocked(const CacheKeysType&                              cache_keys,
                                            const std::vector<std::vector<GroupSetResource>>& resources,
-                                           Tier                                              target_tier,
-                                           bool                                              write_remote_from_host);
+                                           Tier                                              target_tier);
     void             runStoreTask(const StoreTaskPtr& task);
     void             scheduleStoreSettlement(const StoreTaskPtr& task, ErrorInfo error);
     void             settleTask(const StoreTask& task, bool copy_success);
-    size_t           settleLocked(const StoreTask& task, bool publish, StorageWriteTask* storage_write = nullptr);
+    size_t           settleLocked(const StoreTask& task, bool publish);
 
     BlockTree*                      tree_;
     BlockTreeEvictor&               evictor_;

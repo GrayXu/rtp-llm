@@ -39,7 +39,6 @@ public:
         CacheKeysType cache_keys;
         TransferTask  transfer_task;
         Phase         phase{Phase::CREATED};
-        bool          write_remote_from_host{true};
     };
     using TaskPtr = std::shared_ptr<Task>;
 

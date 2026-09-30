@@ -87,7 +87,7 @@ StorageWriteTask BlockTreeStorer::storeLocked(const CacheKeysType&              
         auto storage_write = write_remote_from_device && storage_backend_ ?
                                  storage_backend_->prepareWrite(makeStorageRequest(cache_keys, resources)) :
                                  StorageWriteTask{};
-        submitLowerTierLocked(cache_keys, resources, target_tier, !write_remote_from_device);
+        submitLowerTierLocked(cache_keys, resources, target_tier);
         return storage_write;
     }
     // Pin the complete device sources before request release, independently of
@@ -141,8 +141,7 @@ StorageRequest BlockTreeStorer::makeStorageRequest(const CacheKeysType&         
 
 void BlockTreeStorer::submitLowerTierLocked(const CacheKeysType&                              cache_keys,
                                             const std::vector<std::vector<GroupSetResource>>& resources,
-                                            Tier                                              target_tier,
-                                            bool                                              write_remote_from_host) {
+                                            Tier                                              target_tier) {
     if (stopping_.load()) {
         return;
     }
@@ -151,8 +150,6 @@ void BlockTreeStorer::submitLowerTierLocked(const CacheKeysType&                
         target_tier,
         cache_keys,
         std::chrono::milliseconds(target_tier == Tier::DISK ? disk_timeout_ms_ : host_timeout_ms_));
-    task->write_remote_from_host = write_remote_from_host;
-
     block_tree_cache_detail::ScopeRollback prepare_guard([this, &task]() { settleLocked(*task, /*publish=*/false); });
 
     if (!store_task_runner_.prepareTask(*task, resources)) {
@@ -230,18 +227,12 @@ void BlockTreeStorer::scheduleStoreSettlement(const StoreTaskPtr& task, ErrorInf
 }
 
 void BlockTreeStorer::settleTask(const StoreTask& task, bool copy_success) {
-    // StoreTaskRunner success includes the dispatcher's all-rank transfer barrier.
     bool   stopping = false;
     size_t accepted = 0;
-    StorageWriteTask storage_write;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         stopping = stopping_.load();
-        accepted = settleLocked(task, copy_success && !stopping, &storage_write);
-    }
-
-    if (storage_write) {
-        storage_backend_->write(std::move(storage_write));
+        accepted = settleLocked(task, copy_success && !stopping);
     }
 
     if (stopping) {
@@ -261,7 +252,7 @@ void BlockTreeStorer::settleTask(const StoreTask& task, bool copy_success) {
     }
 }
 
-size_t BlockTreeStorer::settleLocked(const StoreTask& task, bool publish, StorageWriteTask* storage_write) {
+size_t BlockTreeStorer::settleLocked(const StoreTask& task, bool publish) {
     BlockTreeInsertResult insert_result;
     if (publish) {
         std::vector<std::vector<GroupSetResource>> resources(task.cache_keys.size(),
@@ -269,17 +260,6 @@ size_t BlockTreeStorer::settleLocked(const StoreTask& task, bool publish, Storag
         for (const TransferDescriptor& descriptor : task.descriptors()) {
             resources[descriptor.path_index][descriptor.group_set_id].setBlocks(
                 task.target_tier, {descriptor.singleBlockAt(task.target_tier)});
-        }
-        if (task.target_tier == Tier::HOST && task.write_remote_from_host && storage_backend_ && storage_write) {
-            // Pin completed HOST payload before publication, duplicate cleanup or watermark eviction.
-            try {
-                *storage_write =
-                    storage_backend_->prepareWrite(makeStorageRequest(task.cache_keys, resources, Tier::HOST));
-            } catch (const std::exception& error) {
-                RTP_LLM_LOG_WARNING("prepare HOST remote write failed: %s", error.what());
-            } catch (...) {
-                RTP_LLM_LOG_WARNING("prepare HOST remote write failed with an unknown exception");
-            }
         }
         insert_result = tree_->insertNode(task.cache_keys, resources, true, false);
     }
