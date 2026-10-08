@@ -21,6 +21,7 @@
 
 #include "autil/EnvUtil.h"
 #include "autil/legacy/jsonizable.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/ScopeRollback.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/ClientWrapper.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/GroupPolicy.h"
 #include "rtp_llm/cpp/model_rpc/BroadcastManager.h"
@@ -843,16 +844,34 @@ private:
                 return device_read();
             }
         }
+        bool host_read_in_flight = false;
+        block_tree_cache_detail::ScopeRollback release_targets([&]() noexcept {
+            for (const auto& item : targets) {
+                const auto& target = item.second;
+                if (isNullBlockIdx(target.host_block)) {
+                    continue;
+                }
+                if (host_read_in_flight) {
+                    target.pool->markUncertainRemoteIo();
+                    continue;
+                }
+                try {
+                    // incTreeRef can fail after malloc but before acquiring the LOAD reference.
+                    if (target.pool->treeRefCount(target.host_block) == 0) {
+                        target.pool->incTreeRef(target.host_block, BlockTreeRefType::LOAD);
+                    }
+                    target.pool->decTreeRef(target.host_block, BlockTreeRefType::LOAD);
+                } catch (...) {
+                    target.pool->markUncertainRemoteIo();
+                    RTP_LLM_LOG_WARNING("KVCM HOST read cleanup failed; isolating the read pool");
+                }
+            }
+        });
         for (auto& item : targets) {
             auto& target = item.second;
             const auto block = target.pool->malloc();
             if (!block) {
-                for (const auto& allocated_item : targets) {
-                    const auto& allocated = allocated_item.second;
-                    if (!isNullBlockIdx(allocated.host_block)) {
-                        allocated.pool->decTreeRef(allocated.host_block, BlockTreeRefType::LOAD);
-                    }
-                }
+                release_targets.run();
                 return device_read();
             }
             target.host_block = *block;
@@ -866,7 +885,7 @@ private:
         kv_cache_manager::BlockBuffers buffers;
         bool success = genHostBlockBuffers(tags, host_blocks, buffers, true)
                        && executeTagTransfers(REMOTE_OPERATION_READ, tags, host_blocks, uris, buffers, true, response,
-                                              nullptr);
+                                              nullptr, &host_read_in_flight);
         if (success) {
             std::vector<TransferDescriptor> copies;
             std::vector<HostBufferView>     views;
@@ -879,18 +898,12 @@ private:
                 const auto host = target.pool->blockBuffer(target.host_block);
                 views.push_back({host.addr, host.payload_bytes, host.stride_bytes});
             }
+            host_read_in_flight = true;
             success = host_to_device_(std::move(copies), std::move(views),
                                       std::max(1, kv_cache_config_.kvcm_get_broadcast_timeout));
+            host_read_in_flight = !success;
         }
-        for (const auto& item : targets) {
-            const auto& target = item.second;
-            if (success) {
-                target.pool->decTreeRef(target.host_block, BlockTreeRefType::LOAD);
-            } else {
-                target.pool->markUncertainRemoteIo();
-            }
-        }
-        if (!success) {
+        if (host_read_in_flight) {
             RTP_LLM_LOG_WARNING("KVCM HOST read failed; retaining %zu HOST blocks until pool destruction",
                                 targets.size());
         }
@@ -1256,7 +1269,8 @@ private:
                              kv_cache_manager::BlockBuffers&    buffers,
                              bool                               host_buffers,
                              RemoteOperationResponsePB&         response,
-                             bool*                              host_write_started) {
+                             bool*                              host_write_started,
+                             bool*                              host_read_in_flight = nullptr) {
         if (operation != REMOTE_OPERATION_READ && operation != REMOTE_OPERATION_WRITE) {
             RTP_LLM_LOG_WARNING("KVCM transfer has invalid operation [%d]", operation);
             return false;
@@ -1319,8 +1333,14 @@ private:
                         trace_info->need_print = false;
                     }
                     if (operation == REMOTE_OPERATION_READ) {
+                        if (host_read_in_flight) {
+                            *host_read_in_flight = true;
+                        }
                         if (!client_wrapper_->loadKvCachesForTag(tag, batch_uris, batch_buffers, trace_info)) {
                             throw UncertainTransfer("KVCM SDK read failed without confirmed I/O completion");
+                        }
+                        if (host_read_in_flight) {
+                            *host_read_in_flight = false;
                         }
                     } else {
                         if (host_write_started) {
