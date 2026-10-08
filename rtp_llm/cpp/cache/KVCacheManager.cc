@@ -554,7 +554,9 @@ void KVCacheManager::prepareWorkerCacheIO(GptModelInputs& inputs) {
     if (!kv_cache_config_.enable_remote_cache || parallelism_config_.tp_size <= 1) {
         return;
     }
-    const auto& tags = config_.groupTags();
+    const auto& tags      = config_.groupTags();
+    auto        wire_tags = tags;
+    std::sort(wire_tags.begin(), wire_tags.end());
     if (!isAllocatorOwner()) {
         if (!inputs.worker_cache_block_generations.defined()) {
             return;
@@ -568,7 +570,7 @@ void KVCacheManager::prepareWorkerCacheIO(GptModelInputs& inputs) {
             const int64_t group = rows[row * 3];
             RTP_LLM_CHECK(group >= 0 && group < static_cast<int64_t>(tags.size()) && rows[row * 3 + 2] > 0);
             generations.push_back(
-                {tags[group], static_cast<int32_t>(rows[row * 3 + 1]), static_cast<uint64_t>(rows[row * 3 + 2])});
+                {wire_tags[group], static_cast<int32_t>(rows[row * 3 + 1]), static_cast<uint64_t>(rows[row * 3 + 2])});
         }
         worker_cache_io_fence_->observe(generations);
         return;
@@ -585,10 +587,12 @@ void KVCacheManager::prepareWorkerCacheIO(GptModelInputs& inputs) {
         }
         const auto found = std::find(tags.begin(), tags.end(), tag);
         RTP_LLM_CHECK_WITH_INFO(found != tags.end(), "cache allocation generation has unknown tag");
-        const size_t group = std::distance(tags.begin(), found);
-        const auto   key   = std::make_pair(group, block);
+        const size_t local_group = std::distance(tags.begin(), found);
+        const size_t wire_group  =
+            std::distance(wire_tags.begin(), std::lower_bound(wire_tags.begin(), wire_tags.end(), tag));
+        const auto key = std::make_pair(wire_group, block);
         if (generations.count(key) == 0) {
-            generations.emplace(key, pools.at(group)->blockAllocationGeneration(block));
+            generations.emplace(key, pools.at(local_group)->blockAllocationGeneration(block));
         }
     };
     if (inputs.kv_cache_block_id.defined() && inputs.kv_cache_block_id.numel() > 0) {

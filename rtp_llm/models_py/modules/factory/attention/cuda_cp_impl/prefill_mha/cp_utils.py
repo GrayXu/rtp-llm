@@ -248,11 +248,15 @@ class CPKVCachePlan:
         self.device = torch.cuda.current_device()
         host_table = self.block_table.cpu()
         self.local_block_table = self.block_table.to(self.device)
-        prefix = inputs.prefix_lengths.tolist()
+        prefix_lengths = inputs.context_parallel_info.prefill_prefix_lengths_cpu
+        prefix = prefix_lengths.tolist()
         if any(length % (configs.tokens_per_block * self.size) for length in prefix):
             raise ValueError("sharded CP prefix must contain complete ownership rounds")
         self.prefix_pages = [length // (self.page_size * self.size) for length in prefix]
-        lengths = inputs.prefix_lengths + inputs.context_parallel_info.prefill_actual_input_lengths_cpu
+        lengths = (
+            prefix_lengths
+            + inputs.context_parallel_info.prefill_actual_input_lengths_cpu
+        )
         self.page_counts = ((lengths + self.page_size - 1) // self.page_size).tolist()
         self.page_starts = []
         self.block_table = torch.zeros(

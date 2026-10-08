@@ -73,7 +73,10 @@ cc_test_wrapper(
         "//:using_remote_kv_cache": [],
         "//conditions:default": ["@platforms//:incompatible"],
     }),
-    deps = kvcm_backend_test_deps,
+    deps = kvcm_backend_test_deps + [
+        "//rtp_llm/cpp/cache:worker_cache_io_fence",
+        "//rtp_llm/cpp/cache/block_tree_cache",
+    ],
 )
 
 cc_test_wrapper(

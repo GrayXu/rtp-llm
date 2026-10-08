@@ -73,7 +73,17 @@ bool BlockTreeLoader::validMatch(std::vector<TreeNode*>& path, std::vector<bool>
         TreeNode* node             = path[i];
         bool      all_groups_valid = true;
         for (size_t group_set_id = 0; group_set_id < tree_->groupSets().size(); ++group_set_id) {
-            if (!match_validators[group_set_id]->validate(node->group_set_resources[group_set_id])) {
+            const auto&             host_pool = tree_->groupSets()[group_set_id]->hostPool();
+            const GroupSetResource* resource  = &node->group_set_resources[group_set_id];
+            GroupSetResource        available;
+            if (resource->hasTier(Tier::HOST) && host_pool && host_pool->hasUncertainRemoteIo()) {
+                // Treat quarantined HOST data as a hole in the match, while
+                // leaving the tree and outstanding I/O references intact.
+                available            = *resource;
+                available.host_block = NULL_BLOCK_IDX;
+                resource             = &available;
+            }
+            if (!match_validators[group_set_id]->validate(*resource)) {
                 all_groups_valid = false;
             }
         }

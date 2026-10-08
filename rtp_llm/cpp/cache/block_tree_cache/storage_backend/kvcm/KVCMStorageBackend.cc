@@ -395,7 +395,8 @@ public:
                 std::sort(specs.begin(), specs.end());
             }
             // The legacy single-group protocol can omit explicit groups.
-            if (actual_groups != expected_groups && !(groups.size() == 1 && actual_groups.empty())) {
+            const bool implicit_legacy_group = !canonical_layout_ && groups.size() == 1 && actual_groups.empty();
+            if (actual_groups != expected_groups && !implicit_legacy_group) {
                 RTP_LLM_LOG_ERROR("KVCM client location spec groups do not match the cache layout");
                 return false;
             }
@@ -412,7 +413,6 @@ public:
             const auto expected                          = genClientConfig(expected_infos, expected_groups).at("");
             if (!config->location_spec_infos() || !config->location_spec_groups()
                 || *config->location_spec_infos() != *expected->location_spec_infos()
-                || *config->location_spec_groups() != *expected->location_spec_groups()
                 || config->block_size() != expected->block_size()
                 || config->instance_id().rfind("canonical_v1_", 0) != 0
                 || autil::legacy::ToJsonString(config->model_deployment())
@@ -785,18 +785,24 @@ public:
         }
         WorkerCacheIOFence::Lease worker_access;
         if (worker_fence_ && !tags.empty()) {
-            if (request.block_generations_size() != request.block_ids_size()) {
-                RTP_LLM_LOG_WARNING("KVCM worker generation/block count mismatch: op=%d generations=%d blocks=%d",
-                                    request.op(),
-                                    request.block_generations_size(),
-                                    request.block_ids_size());
-                return false;
+            if (host_write) {
+                // Key-resolved HOST blocks carry local STORE refs. Retain I/O
+                // serialization without recording them as TP0 mirror allocations.
+                worker_access = worker_fence_->lockCompute();
+            } else {
+                if (request.block_generations_size() != request.block_ids_size()) {
+                    RTP_LLM_LOG_WARNING("KVCM worker generation/block count mismatch: op=%d generations=%d blocks=%d",
+                                        request.op(),
+                                        request.block_generations_size(),
+                                        request.block_ids_size());
+                    return false;
+                }
+                std::vector<CacheBlockGeneration> generations;
+                for (size_t i = 0; i < tags.size(); ++i) {
+                    generations.push_back({tags[i], blocks[i], request.block_generations(i), request.host_source()});
+                }
+                worker_access = worker_fence_->lockTransfer(generations);
             }
-            std::vector<CacheBlockGeneration> generations;
-            for (size_t i = 0; i < tags.size(); ++i) {
-                generations.push_back({tags[i], blocks[i], request.block_generations(i), request.host_source()});
-            }
-            worker_access = worker_fence_->lockTransfer(generations);
         }
         setCudaDevice();
         if (worker_access.owns_lock()) {

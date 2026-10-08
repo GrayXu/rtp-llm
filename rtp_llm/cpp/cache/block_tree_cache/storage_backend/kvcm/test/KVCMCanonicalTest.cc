@@ -34,10 +34,12 @@ ParallelismConfig cpConfig(int workers) {
 BackendHandle canonicalBackend(const BackendEnvironment&                 environment,
                                const ParallelismConfig&                  parallelism,
                                const std::shared_ptr<MockClientWrapper>& client,
-                               const std::shared_ptr<BroadcastManager>&  broadcast = nullptr) {
+                               const std::shared_ptr<BroadcastManager>&  broadcast = nullptr,
+                               const std::string&                       client_config = "") {
     KVCacheConfig config;
     config.kvcm_remote_layout  = "canonical_v1";
     config.kvcm_server_address = "unused-test-address";
+    config.kvcm_client_config  = client_config;
     RuntimeConfig runtime;
     runtime.model_name = "canonical_test_model";
     return BackendHandle(std::make_unique<KVCMStorageBackend>(
@@ -50,6 +52,65 @@ kv_cache_manager::Locations canonicalLocations(size_t count) {
         result.push_back({{"v1_Fdefault_h0", "uri_" + std::to_string(i)}});
     }
     return result;
+}
+
+std::string automaticCanonicalConfig(const BackendEnvironment& environment) {
+    std::string json;
+    auto client = std::make_shared<MockClientWrapper>();
+    EXPECT_CALL(*client, initForPools(_, _, _, _))
+        .WillOnce(Invoke([&](const auto& configs, auto, const auto&, const auto&) {
+            json = autil::legacy::ToJsonString(configs);
+            return true;
+        }));
+    EXPECT_CALL(*client, shutdown()).Times(1);
+    auto backend = canonicalBackend(environment, singleRankConfig(), client);
+    EXPECT_TRUE(initSingleRank(*backend.backend, environment));
+    return json;
+}
+
+TEST(KVCMCanonicalTest, CustomConfigAcceptsReorderedSpecs) {
+    auto environment = makeMultiGroupBackendEnvironment("canonical_config_order", 2, 1);
+    kvcm::ClientWrapper::ConfigMap configs;
+    autil::legacy::FromJsonString(configs, automaticCanonicalConfig(environment));
+    auto& groups = *configs.at("")->location_spec_groups();
+    const auto original = groups;
+    for (auto& [name, specs] : groups) {
+        std::reverse(specs.begin(), specs.end());
+    }
+    ASSERT_NE(groups, original);
+
+    auto client = std::make_shared<MockClientWrapper>();
+    EXPECT_CALL(*client, initForPools(_, _, _, _))
+        .WillOnce(Invoke([&](const auto& actual, auto, const auto&, const auto&) {
+            EXPECT_EQ(*actual.at("")->location_spec_groups(), groups);
+            return true;
+        }));
+    EXPECT_CALL(*client, shutdown()).Times(1);
+    auto backend = canonicalBackend(
+        environment, singleRankConfig(), client, nullptr, autil::legacy::ToJsonString(configs));
+    EXPECT_TRUE(initSingleRank(*backend.backend, environment));
+}
+
+TEST(KVCMCanonicalTest, CustomConfigRejectsMissingOrChangedGroups) {
+    auto environment = makeBackendEnvironment("canonical_config_groups");
+    const auto original = automaticCanonicalConfig(environment);
+    for (const bool omit_groups : {false, true}) {
+        SCOPED_TRACE(omit_groups);
+        kvcm::ClientWrapper::ConfigMap configs;
+        autil::legacy::FromJsonString(configs, original);
+        auto& groups = *configs.at("")->location_spec_groups();
+        if (omit_groups) {
+            groups.clear();
+        } else {
+            groups.begin()->second.front() = "unknown_spec";
+        }
+        auto client = std::make_shared<MockClientWrapper>();
+        EXPECT_CALL(*client, initForPools(_, _, _, _)).Times(0);
+        EXPECT_CALL(*client, shutdown()).Times(1);
+        auto backend = canonicalBackend(
+            environment, singleRankConfig(), client, nullptr, autil::legacy::ToJsonString(configs));
+        EXPECT_FALSE(initSingleRank(*backend.backend, environment));
+    }
 }
 
 TEST(KVCMCanonicalTest, StorageInstanceAndRegistrationDoNotEncodeRuntimeTpOrCp) {

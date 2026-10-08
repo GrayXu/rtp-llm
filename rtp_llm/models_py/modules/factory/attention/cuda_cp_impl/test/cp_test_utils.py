@@ -216,6 +216,7 @@ def build_cp_attn_inputs(
     cp_info.prefill_actual_input_lengths_cpu = torch.tensor(
         new_lengths, dtype=torch.int32
     )
+    cp_info.prefill_prefix_lengths_cpu = inp.prefix_lengths
     cp_info.prefill_shuffle_indices = torch.tensor([], dtype=torch.int32)
     inp.context_parallel_info = cp_info
     return inp
@@ -340,6 +341,15 @@ class ShardedCPAttnTestMixin:
                     batch_size=2, new_lengths=[64, 32], prefix_lengths=[128, 0],
                     cp_size=4, cp_rank=rank, sharded=True,
                 )
+
+    def test_sharded_device_input_cold_and_prefix_cp2_cp4(self):
+        for cp_size in [2, 4]:
+            for cp_rank in range(cp_size):
+                with self.subTest(cp_size=cp_size, cp_rank=cp_rank):
+                    self.run_with_prefix(
+                        batch_size=2, new_lengths=[32, 32], prefix_lengths=[0, 64],
+                        cp_size=cp_size, cp_rank=cp_rank, sharded=True, device_input=True,
+                    )
 
     def test_sharded_physical_blocks_with_multiple_kernel_pages(self):
         for cp_size in [2, 4]:
@@ -543,6 +553,7 @@ class CPAttnTestBase(unittest.TestCase):
         sharded: bool = False,
         physical_tokens_per_block: int = 0,
         dtype: torch.dtype = torch.bfloat16,
+        device_input: bool = False,
     ):
         """Test CP attention **with** prefix cache.
 
@@ -635,6 +646,9 @@ class CPAttnTestBase(unittest.TestCase):
             prefix_lengths=prefix_lengths,
             device=self.device,
         )
+        if device_input:
+            attn_inputs.input_lengths = attn_inputs.input_lengths.to(self.device)
+            attn_inputs.prefix_lengths = attn_inputs.prefix_lengths.to(self.device)
         attn_inputs.dtype = get_typemeta(torch.zeros(1, dtype=dtype))
         attn_cfg.dtype = dtype
         all_shuffle = [torch.cat([
