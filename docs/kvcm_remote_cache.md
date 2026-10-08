@@ -101,7 +101,7 @@ When a request reaches `FINISHED` successfully and cache reuse is allowed, compl
 
 The submission includes available complete blocks, including reused prefixes; the final partial block is not published. Remote writes honor the offset/bool mask returned by `StartWrite` to skip blocks with enough replicas. Local asynchronous stores and remote tasks retain independent source references after request release, releasing them on completion or rejection.
 
-Request finish explicitly selects DEVICE sources for remote I/O. Completion of its local HOST copy does not submit a duplicate remote write, and local copy failure does not affect an already submitted remote task. Direct ready-HOST submissions and independent DEVICE-to-HOST stores retain the CPU-source path.
+Request finish explicitly selects DEVICE sources for remote I/O. Completion of its local HOST copy does not submit a duplicate remote write, and local copy failure does not affect an already submitted remote task. Direct ready-HOST submissions retain the explicit CPU-source path. Independent DEVICE-to-HOST stores only publish local cache data and do not trigger remote writes.
 
 Request finish triggers submission; it does not guarantee task admission or remote durability. DEVICE publication is synchronous, while HOST/DISK and remote writes complete independently and asynchronously. Rejection releases temporary references. Remote I/O failure follows the existing `FinishWrite` abort rules without rolling back local cache or changing request success.
 
