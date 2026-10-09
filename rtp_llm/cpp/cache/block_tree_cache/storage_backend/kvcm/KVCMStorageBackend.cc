@@ -99,12 +99,12 @@ public:
         return buffer.iovs.size() > 1 && uri.rfind("pace://", 0) == 0 && paceUriParameter(uri, "media_type") == 5;
     }
 
-    PaceSsdBuffer(const std::string& uri, const kv_cache_manager::BlockBuffer& source):
+    PaceSsdBuffer(const std::string& uri, const kv_cache_manager::BlockBuffer& source, bool snapshot = false):
         original_(source) {
         const auto type       = original_.iovs.front().type;
         size_t     bytes      = 0;
         auto       next       = reinterpret_cast<uintptr_t>(original_.iovs.front().base);
-        bool       contiguous = true;
+        bool       contiguous = !snapshot;
         for (const auto& iov : original_.iovs) {
             const auto address = reinterpret_cast<uintptr_t>(iov.base);
             RTP_LLM_CHECK_WITH_INFO(iov.base && iov.size > 0 && !iov.ignore && iov.type == type
@@ -846,20 +846,9 @@ public:
                        tags, blocks, buffers, request.host_source() ? Tier::HOST : Tier::DEVICE)) {
             return false;
         }
-        std::vector<std::vector<uint8_t>> host_payloads;
-        if (request.host_source()) {
-            for (auto& buffer : buffers) {
-                for (auto& iov : buffer.iovs) {
-                    host_payloads.emplace_back(iov.size);
-                    auto& payload = host_payloads.back();
-                    std::memcpy(payload.data(), iov.base, iov.size);
-                    iov.base = payload.data();
-                }
-            }
-        }
         return executeTagTransfers(host_write ? REMOTE_OPERATION_WRITE : request.op(),
                                    tags, blocks, uris, buffers, host_write, response,
-                                   host_write ? host_write_started : nullptr);
+                                   host_write ? host_write_started : nullptr, nullptr, request.host_source());
     }
 
     bool allocationOwner() const {
@@ -1482,7 +1471,8 @@ private:
                              bool                               host_buffers,
                              RemoteOperationResponsePB&         response,
                              bool*                              host_write_started,
-                             bool*                              host_read_in_flight = nullptr) {
+                             bool*                              host_read_in_flight = nullptr,
+                             bool                               snapshot_host = false) {
         if (operation != REMOTE_OPERATION_READ && operation != REMOTE_OPERATION_WRITE) {
             RTP_LLM_LOG_WARNING("KVCM transfer has invalid operation [%d]", operation);
             return false;
@@ -1502,11 +1492,12 @@ private:
             if (found == indices_by_tag.end()) {
                 continue;
             }
-            struct SsdBuffers {
+            struct TransferBuffers {
                 std::vector<std::unique_ptr<PaceSsdBuffer>> buffers;
-                std::shared_ptr<SsdBuffers> quarantine;
+                std::vector<std::vector<uint8_t>> host_payloads;
+                std::shared_ptr<TransferBuffers> quarantine;
             };
-            auto ssd_buffers = std::make_shared<SsdBuffers>();
+            auto transfer_buffers = std::make_shared<TransferBuffers>();
             try {
                 // Separate adapted CPU/GPU objects from the unchanged multi-IOV path.
                 std::vector<std::vector<size_t>> batches(3);
@@ -1514,13 +1505,22 @@ private:
                     auto& buffer = buffers[index];
                     size_t batch = 0;
                     if (PaceSsdBuffer::needed(uris[index], buffer)) {
-                        ssd_buffers->buffers.push_back(std::make_unique<PaceSsdBuffer>(uris[index], buffer));
-                        auto& ssd = ssd_buffers->buffers.back();
+                        // HOST snapshots use the same copy that packs the SSD object.
+                        transfer_buffers->buffers.push_back(
+                            std::make_unique<PaceSsdBuffer>(uris[index], buffer, snapshot_host));
+                        auto& ssd = transfer_buffers->buffers.back();
                         if (operation == REMOTE_OPERATION_WRITE) {
                             ssd->gather();
                         }
                         buffer = ssd->buffer();
                         batch = buffer.iovs.front().type == kv_cache_manager::MemoryType::CPU ? 1 : 2;
+                    } else if (snapshot_host) {
+                        for (auto& iov : buffer.iovs) {
+                            transfer_buffers->host_payloads.emplace_back(iov.size);
+                            auto& payload = transfer_buffers->host_payloads.back();
+                            std::memcpy(payload.data(), iov.base, iov.size);
+                            iov.base = payload.data();
+                        }
                     }
                     batches[batch].push_back(index);
                 }
@@ -1537,7 +1537,7 @@ private:
                         batch_blocks.push_back(blocks[index]);
                     }
                     auto trace_info = makeTransferTraceInfo(batch_blocks);
-                    if (host_buffers || (!ssd_buffers->buffers.empty()
+                    if (host_buffers || snapshot_host || (!transfer_buffers->buffers.empty()
                         && batch_buffers.front().iovs.front().type == kv_cache_manager::MemoryType::CPU)) {
                         if (!trace_info) {
                             trace_info = std::make_shared<kv_cache_manager::TransferTraceInfo>();
@@ -1572,15 +1572,15 @@ private:
                     }
                 }
                 if (operation == REMOTE_OPERATION_READ) {
-                    for (const auto& ssd : ssd_buffers->buffers) {
+                    for (const auto& ssd : transfer_buffers->buffers) {
                         ssd->scatter();
                     }
                 }
             } catch (...) {
                 // A stalled call keeps its stack alive. If SDK/CUDA instead reports
-                // an error, retain staging memory before unwinding: I/O may continue.
-                if (!ssd_buffers->buffers.empty()) {
-                    ssd_buffers->quarantine = ssd_buffers;
+                // an error, retain SSD staging and HOST snapshots before unwinding.
+                if (!transfer_buffers->buffers.empty() || !transfer_buffers->host_payloads.empty()) {
+                    transfer_buffers->quarantine = transfer_buffers;
                 }
                 throw UncertainTransfer("KVCM SDK transfer or SSD copy failed without confirmed I/O completion");
             }
