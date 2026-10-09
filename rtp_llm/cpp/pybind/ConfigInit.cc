@@ -559,7 +559,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def(py::pickle(
             [](const KVCacheConfig& self) {
                 return py::make_tuple(std::string("KVCacheConfig"),
-                                      10,
+                                      9,
                                       self.reuse_cache,
                                       self.multi_task_prompt,
                                       self.multi_task_prompt_str,
@@ -637,16 +637,8 @@ PYBIND11_MODULE(libth_transformer_config, m) {
             },
             [](py::tuple t) {
                 const py::tuple event_state = t;
-                const bool      has_combined_fields =
-                    t.size() == 76 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 10;
-                const bool has_finish_write_field = has_combined_fields
-                                                    || (t.size() == 75 && py::isinstance<py::int_>(t[1])
-                                                        && t[1].cast<int>() == 9 && py::isinstance<py::bool_>(t[74]));
-                const bool has_layout_field       = has_combined_fields
-                                                    || (t.size() == 75 && py::isinstance<py::int_>(t[1])
-                                                        && t[1].cast<int>() == 9 && py::isinstance<py::str>(t[74]));
-                const bool has_kvcm_fields =
-                    has_finish_write_field || has_layout_field
+                const bool has_remote_fields = t.size() == 76 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 9;
+                const bool has_kvcm_fields = has_remote_fields
                     || (t.size() == 74 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 8);
                 const bool has_event_fields = has_kvcm_fields
                     || (t.size() == 69 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 7);
@@ -764,11 +756,9 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                     c.kvcm_read_backend_type  = event_state[72].cast<int32_t>();
                     c.kvcm_min_replica_count  = event_state[73].cast<int32_t>();
                 }
-                if (has_finish_write_field) {
+                if (has_remote_fields) {
                     c.enable_remote_cache_write_on_finish = event_state[74].cast<bool>();
-                }
-                if (has_layout_field) {
-                    c.kvcm_remote_layout = event_state[has_combined_fields ? 75 : 74].cast<std::string>();
+                    c.kvcm_remote_layout = event_state[75].cast<std::string>();
                 }
                 return c;
             }));

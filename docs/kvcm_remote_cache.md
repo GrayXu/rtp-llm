@@ -82,7 +82,7 @@ Canonical Instance IDs start with `canonical_v1_` and exclude runtime TP/CP/DP p
 
 Custom canonical configuration requires a `canonical_v1_` Instance ID and matching logical specs, groups, block size, and storage `model_deployment`; mismatches fail initialization. Legacy and canonical payloads cannot be mixed. Payload RPCs carry the format and logical shard, and canonical workers reject requests missing these fields.
 
-Custom IDs must match the existing server configuration. `KVCacheConfig` uses pickle version 10 with 76 items and reads versions 1-9. Older states without the request-finish write flag default it to disabled; communicating processes must use the same build.
+Custom IDs must match the existing server configuration. `KVCacheConfig` uses pickle version 9 with 76 items and reads versions 1-8. Older states without the request-finish write flag default it to disabled; communicating processes must use the same build.
 
 ## Asymmetric TP/CP
 

@@ -379,7 +379,7 @@ class GenerateConfigTest(TestCase):
 
         state = config.__getstate__()
         self.assertEqual(len(state), 76)
-        self.assertEqual(state[:2], ("KVCacheConfig", 10))
+        self.assertEqual(state[:2], ("KVCacheConfig", 9))
 
         restored = pickle.loads(pickle.dumps(config))
         self.assertEqual(restored.disk_cache_staging_block_count, 8)
