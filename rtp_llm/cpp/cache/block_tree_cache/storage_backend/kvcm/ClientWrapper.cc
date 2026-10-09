@@ -67,6 +67,12 @@ bool ClientWrapper::initForPools(const ConfigMap&                     config_map
             RTP_LLM_LOG_ERROR("KVCM pool registration requires a valid span and location spec name");
             return false;
         }
+        if (registration.shared_memory
+            && (registration.shared_memory->fd < 0 || !registration.shared_memory->base
+                || registration.shared_memory->size == 0)) {
+            RTP_LLM_LOG_ERROR("KVCM shared memory registration requires fd, base and size");
+            return false;
+        }
     }
     auto                               first_span = registrations.front().span;
     const kv_cache_manager::InitParams params{role, &first_span, registrations.front().location_spec_name};
@@ -144,10 +150,24 @@ bool ClientWrapper::initImpl(const ConfigMap&                     config_map,
                 params.regist_span             = &pool_registrations_[index].span;
                 params.self_location_spec_name = pool_registrations_[index].location_spec_name;
             }
-            auto client = client_factory_->createTransferClient(config_json, params);
-            if (!client) {
-                RTP_LLM_LOG_ERROR("init KVCM transfer client failed for pool %zu", index);
-                return false;
+            std::unique_ptr<kv_cache_manager::TransferClient> client;
+            const auto& shared_memory = pool_registrations_[index].shared_memory;
+            if (shared_memory) {
+                try {
+                    client = client_factory_->createTransferClient(config_json, params, *shared_memory);
+                } catch (const std::exception& error) {
+                    RTP_LLM_LOG_WARNING("HOST shared registration failed for pool %zu: %s", index, error.what());
+                }
+                if (!client) {
+                    RTP_LLM_LOG_WARNING("HOST shared registration unavailable for pool %zu; retaining DEVICE transfer", index);
+                    pending_tags.erase(tags[index]);
+                }
+            } else {
+                client = client_factory_->createTransferClient(config_json, params);
+                if (!client) {
+                    RTP_LLM_LOG_ERROR("init KVCM transfer client failed for pool %zu", index);
+                    return false;
+                }
             }
             clients.push_back(std::move(client));
         }
@@ -208,6 +228,11 @@ void ClientWrapper::shutdown() noexcept {
         init_params_.regist_span = nullptr;
         pool_registrations_.clear();
     }
+}
+
+bool ClientWrapper::hasTransferClientForTag(const std::string& tag) const {
+    std::shared_lock lock(transfer_mutex_);
+    return tag_to_index_.count(tag) != 0;
 }
 
 bool ClientWrapper::initMetaClient(const std::string& unique_id, KVCMConfigPtr config) {
@@ -564,7 +589,21 @@ ClientWrapper::saveKvCachesForTag(const std::string&                            
         RTP_LLM_LOG_ERROR("kvcm client not find transfer client");
         return {false, {}};
     }
-    auto [ec, result] = transfer_clients_[slot->second]->SaveKvCaches(uri_str_vec, block_buffers, trace_info);
+    const bool has_cpu_source = std::any_of(block_buffers.begin(), block_buffers.end(), [](const auto& buffer) {
+        return std::any_of(buffer.iovs.begin(), buffer.iovs.end(), [](const auto& iov) {
+            return iov.type == kv_cache_manager::MemoryType::CPU;
+        });
+    });
+    auto* client          = transfer_clients_[slot->second].get();
+    auto  effective_trace = trace_info;
+    if (has_cpu_source) {
+        // SDK debug hashing runs a GPU kernel over raw addresses; CPU sources
+        // must not enter that path, including when KVCM_SDK_CHECK is enabled.
+        effective_trace = std::make_shared<kv_cache_manager::TransferTraceInfo>(
+            trace_info ? *trace_info : kv_cache_manager::TransferTraceInfo{});
+        effective_trace->need_print = false;
+    }
+    auto [ec, result] = client->SaveKvCaches(uri_str_vec, block_buffers, effective_trace);
     if (ec != kv_cache_manager::ClientErrorCode::ER_OK) {
         RTP_LLM_LOG_ERROR("kvcm client saveKvCaches fail, ec [%d]", ec);
         return {false, {}};

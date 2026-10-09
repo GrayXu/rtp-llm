@@ -14,6 +14,7 @@
 #include "rtp_llm/cpp/cache/BufferTypes.h"
 #include "rtp_llm/cpp/cache/CacheConfig.h"
 #include "rtp_llm/cpp/cache/AsyncContext.h"
+#include "rtp_llm/cpp/cache/WorkerCacheIOFence.h"
 #include "rtp_llm/cpp/cache/CoordinatorCacheManager.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCache.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
@@ -28,6 +29,7 @@ class CacheStore;
 class BroadcastManager;
 class PrefillCacheHitMetricsReporter;
 class KVCacheAllocationWaitState;
+struct GptModelInputs;
 
 class KVCacheManager {
 public:
@@ -135,6 +137,9 @@ public:
     // Returns whether a trustworthy mem_response was formed, not whether the transfer
     // succeeded; the transfer outcome is reported through mem_response.code.
     bool executeFunction(const FunctionRequestPB& request, FunctionResponsePB& response);
+    void                      prepareWorkerCacheIO(GptModelInputs& inputs);
+    WorkerCacheIOFence::Lease lockWorkerCacheCompute() const;
+    void                      recordWorkerCacheCompute() const;
 
     BlockTreeCachePtr blockTreeCache() const {
         return block_tree_cache_;
@@ -191,6 +196,7 @@ private:
 
     BlockTreeCachePtr                           block_tree_cache_;
     std::shared_ptr<KVCacheAllocationWaitState> allocation_wait_state_;
+    std::shared_ptr<WorkerCacheIOFence>         worker_cache_io_fence_;
 
     mutable std::mutex                 cache_status_snapshot_mutex_;
     std::shared_ptr<const KVCacheInfo> cache_status_snapshot_;

@@ -108,7 +108,8 @@ private:
     LoadCacheResult        loadCacheAsyncForTp(DecodeGenerateContext& decode_context, LoadKVCacheContext& load_context);
     BroadcastLoadRequestPB constructRemoteLoadRequest(const LoadKVCacheContext&       load_context,
                                                       int                             index,
-                                                      const std::vector<std::string>& peer_ips) const;
+                                                      const std::vector<std::string>& peer_ips,
+                                                      bool                            split_cp_heads = true) const;
     BroadcastLoadRequestPB constructRemoteLoadRequestForMla(const LoadKVCacheContext&       load_context,
                                                             int                             index,
                                                             const std::vector<std::string>& peer_ips) const;

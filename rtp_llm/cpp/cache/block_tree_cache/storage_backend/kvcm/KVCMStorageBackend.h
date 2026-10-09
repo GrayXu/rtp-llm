@@ -12,6 +12,7 @@ class RemoteOperationResponsePB;
 namespace rtp_llm {
 
 class BroadcastManager;
+class WorkerCacheIOFence;
 namespace kvcm {
 class ClientWrapper;
 }
@@ -27,8 +28,11 @@ public:
                        const ParallelismConfig&             parallelism_config,
                        const SpeculativeExecutionConfig&    sp_config,
                        std::shared_ptr<BroadcastManager>    broadcast_manager,
-                       std::shared_ptr<kvcm::ClientWrapper> client_wrapper = nullptr);
+                       std::shared_ptr<kvcm::ClientWrapper> client_wrapper = nullptr,
+                       std::shared_ptr<WorkerCacheIOFence>  worker_fence   = nullptr);
     ~KVCMStorageBackend() override;
+    bool requiresSharedHostMemory() const override;
+    bool canInitiateHostWrite() const override;
 
     bool execute(const RemoteOperationRequestPB& request, RemoteOperationResponsePB& response);
 

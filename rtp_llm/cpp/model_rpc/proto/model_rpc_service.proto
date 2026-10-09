@@ -779,6 +779,9 @@ enum RemoteOpType {
     REMOTE_OPERATION_GET_LOCATIONS_BY_BACKEND = 6;
     REMOTE_OPERATION_GET_HOST_CACHE_STATE = 7;
     REMOTE_OPERATION_MATCH_LOCATION = 8;
+    // Unknown to older RTP ranks, which must reject HOST block IDs rather than treat them as DEVICE IDs.
+    REMOTE_OPERATION_READ_HOST = 9;
+    REMOTE_OPERATION_WRITE_HOST = 10;
 }
 
 message RemoteBoolMasksTypePB { repeated bool values = 1; }
@@ -810,6 +813,17 @@ message RemoteOperationRequestPB {
     repeated string group_tags = 6;
     // Metadata operations are served by TP rank 0 for this backend's instance.
     RemoteMetadataRequestPB metadata = 7;
+    // Write-only CPU snapshot source; omission preserves DEVICE buffers.
+    bool host_source = 8;
+    repeated uint32 coordinate_ids = 9;
+    // Full key path for WRITE_HOST; each coordinate indexes this sequence.
+    repeated int64 cache_keys = 10;
+    // TP0 allocation generation for each tag/block/URI, preventing late worker I/O after reuse.
+    // WRITE_HOST resolves and pins local blocks by key instead of consulting these generations.
+    repeated uint64 block_generations = 11;
+    // canonical_v1: one logical head/state shard per tag/block/URI entry.
+    repeated int32 logical_shards = 12;
+    string storage_layout = 13;
 }
 
 message RemoteMetadataRequestPB {

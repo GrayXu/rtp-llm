@@ -73,7 +73,10 @@ cc_test_wrapper(
         "//:using_remote_kv_cache": [],
         "//conditions:default": ["@platforms//:incompatible"],
     }),
-    deps = kvcm_backend_test_deps,
+    deps = kvcm_backend_test_deps + [
+        "//rtp_llm/cpp/cache:worker_cache_io_fence",
+        "//rtp_llm/cpp/cache/block_tree_cache",
+    ],
 )
 
 cc_test_wrapper(
@@ -162,6 +165,7 @@ cc_test_wrapper(
         "KVCMIndependentPoolTest.cc",
         "KVCMMockTestBase.h",
         "MockKVCMClient.h",
+        "MultiPoolTestUtils.h",
     ],
     copts = ["-fno-access-control"] + copts(),
     tags = [
@@ -178,5 +182,100 @@ cc_test_wrapper(
         "//rtp_llm/cpp/testing:device_test_utils",
         "@local_config_cuda//cuda:cuda_headers",
         "@local_config_cuda//cuda:cudart",
+    ],
+)
+
+cc_test_wrapper(
+    name = "kvcm_multi_pool_config_test",
+    testonly = True,
+    exec_properties = {"gpu": "A10_CU13"},
+    srcs = [
+        "KVCMMultiPoolConfigTest.cc",
+        "KVCMMockTestBase.h",
+        "MockKVCMClient.h",
+        "MultiPoolTestUtils.h",
+    ],
+    copts = ["-fno-access-control"] + copts(),
+    tags = [
+        "A10_CU13",
+        "exclusive-if-local",
+    ],
+    target_compatible_with = select({
+        "//:using_remote_kv_cache": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = kvcm_backend_test_deps,
+)
+
+# Requires an explicitly supplied TCP PACE/KVCM test environment.
+cc_test_wrapper(
+    name = "kvcm_multi_pool_pace_test",
+    testonly = True,
+    exec_properties = {"gpu": "A10_CU13"},
+    srcs = [
+        "KVCMMultiPoolPaceTest.cc",
+        "KVCMMockTestBase.h",
+        "MockKVCMClient.h",
+        "MultiPoolTestUtils.h",
+    ],
+    copts = ["-fno-access-control"] + copts(),
+    tags = [
+        "A10_CU13",
+        "manual",
+        "exclusive-if-local",
+    ],
+    target_compatible_with = select({
+        "//:using_remote_kv_cache": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = kvcm_backend_test_deps + [
+        "//rtp_llm/cpp/cache/block_tree_cache",
+        "//rtp_llm/cpp/cache:coordinator_cache_manager",
+        "//rtp_llm/cpp/testing:device_test_utils",
+        "@local_config_cuda//cuda:cuda_headers",
+        "@local_config_cuda//cuda:cudart",
+    ],
+)
+
+cc_test_wrapper(
+    name = "canonical_cache_layout_test",
+    srcs = ["CanonicalCacheLayoutTest.cc"],
+    copts = copts(),
+    deps = [
+        "//rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm:canonical_cache_layout",
+        "//rtp_llm/cpp/cache:kv_cache_specs",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test_wrapper(
+    name = "kvcm_canonical_test",
+    exec_properties = {"gpu": "A10_CU13"},
+    srcs = [
+        "KVCMCanonicalTest.cc",
+        "KVCMMockTestBase.h",
+        "MockKVCMClient.h",
+    ],
+    copts = ["-fno-access-control"] + copts(),
+    tags = [
+        "A10_CU13",
+        "exclusive-if-local",
+    ],
+    target_compatible_with = select({
+        "//:using_remote_kv_cache": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = kvcm_backend_test_deps,
+)
+
+cc_test_wrapper(
+    name = "worker_cache_io_fence_test",
+    srcs = ["WorkerCacheIOFenceTest.cc"],
+    copts = copts(),
+    deps = [
+        "//rtp_llm/cpp/cache:worker_cache_io_fence",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
     ],
 )

@@ -1,0 +1,172 @@
+{
+  "model_type": "qwen_tool",
+  "model_path": "/mnt/nas1/hf/Qwen2.5-0.5B-Instruct",
+  "query_result": [
+    {
+      "endpoint": "/v1/chat/completions",
+      "query": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "请推荐一部好看的电影。"
+          },
+          {
+            "role": "assistant",
+            "content": "推荐一部好看的电影，首先需要考虑电影的类型和主题。如果您喜欢科幻、动作、冒险等类型，那么《星际穿越》可能是一个不错的选择。这部电影由克里斯托弗·诺兰执导，讲述了人类在宇宙中寻找新的居住地的故事。影片融合了科幻元素和悬疑元素，展现了人类在面对未知和挑战时的勇气和决心。\n\n如果您更喜欢剧情片或者爱情片，那么《泰坦尼克号》可能是一个不错的选择。这部电影",
+            "partial": false
+          },
+          {
+            "role": "user",
+            "content": "我喜欢喜剧类型的。"
+          }
+        ],
+        "temperature": 0.0,
+        "top_p": 0.0,
+        "max_tokens": 64,
+        "top_k": 1,
+        "response_format": {
+          "type": "json_schema",
+          "json_schema": {
+            "name": "movie_recommendation",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "recommendation": {
+                  "type": "string",
+                  "enum": [
+                    "Kung Fu Panda",
+                    "Zootopia"
+                  ]
+                }
+              },
+              "required": [
+                "recommendation"
+              ],
+              "additionalProperties": false
+            },
+            "strict": true
+          }
+        }
+      },
+      "result": {
+        "choices": [],
+        "usage": {
+          "prompt_tokens": 0,
+          "total_tokens": 0,
+          "completion_tokens": 0
+        }
+      },
+      "compare_config": {
+        "skip_choices": true,
+        "skip_usage": true,
+        "json_content": true,
+        "json_object": true,
+        "required_json_keys": [
+          "recommendation"
+        ],
+        "required_aux_info": {
+          "input_len": 149,
+          "pd_sep": true,
+          "reuse_len": 0,
+          "remote_reuse_len": 0,
+          "local_reuse_len": 0,
+          "memory_reuse_len": 0,
+          "disk_reuse_len": 0,
+          "prefill_total_reuse_len": 0,
+          "prefill_remote_reuse_len": 0,
+          "prefill_local_reuse_len": 0,
+          "prefill_memory_reuse_len": 0,
+          "prefill_disk_reuse_len": 0,
+          "decode_total_reuse_len": 0,
+          "decode_remote_reuse_len": 0,
+          "decode_local_reuse_len": 0,
+          "decode_memory_reuse_len": 0,
+          "decode_disk_reuse_len": 0
+        }
+      }
+    },
+    {
+      "endpoint": "/v1/chat/completions",
+      "query": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "请推荐一部好看的电影。"
+          },
+          {
+            "role": "assistant",
+            "content": "推荐一部好看的电影，首先需要考虑电影的类型和主题。如果您喜欢科幻、动作、冒险等类型，那么《星际穿越》可能是一个不错的选择。这部电影由克里斯托弗·诺兰执导，讲述了人类在宇宙中寻找新的居住地的故事。影片融合了科幻元素和悬疑元素，展现了人类在面对未知和挑战时的勇气和决心。\n\n如果您更喜欢剧情片或者爱情片，那么《泰坦尼克号》可能是一个不错的选择。这部电影",
+            "partial": false
+          },
+          {
+            "role": "user",
+            "content": "我喜欢喜剧类型的。"
+          }
+        ],
+        "temperature": 0.0,
+        "top_p": 0.0,
+        "max_tokens": 64,
+        "top_k": 1,
+        "response_format": {
+          "type": "json_schema",
+          "json_schema": {
+            "name": "movie_recommendation",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "recommendation": {
+                  "type": "string",
+                  "enum": [
+                    "Kung Fu Panda",
+                    "Zootopia"
+                  ]
+                }
+              },
+              "required": [
+                "recommendation"
+              ],
+              "additionalProperties": false
+            },
+            "strict": true
+          }
+        }
+      },
+      "result": {
+        "choices": [],
+        "usage": {
+          "prompt_tokens": 0,
+          "total_tokens": 0,
+          "completion_tokens": 0
+        }
+      },
+      "compare_config": {
+        "skip_choices": true,
+        "skip_usage": true,
+        "json_content": true,
+        "json_object": true,
+        "required_json_keys": [
+          "recommendation"
+        ],
+        "required_aux_info": {
+          "input_len": 149,
+          "pd_sep": true,
+          "reuse_len": 128,
+          "remote_reuse_len": 128,
+          "local_reuse_len": 0,
+          "memory_reuse_len": 0,
+          "disk_reuse_len": 0,
+          "prefill_total_reuse_len": 128,
+          "prefill_remote_reuse_len": 128,
+          "prefill_local_reuse_len": 0,
+          "prefill_memory_reuse_len": 0,
+          "prefill_disk_reuse_len": 0,
+          "decode_total_reuse_len": 144,
+          "decode_remote_reuse_len": 144,
+          "decode_local_reuse_len": 0,
+          "decode_memory_reuse_len": 0,
+          "decode_disk_reuse_len": 0
+        }
+      }
+    }
+  ]
+}

@@ -432,12 +432,19 @@ std::unique_ptr<BlockTreeCache> makeBlockTreeCacheForTest(std::vector<GroupSetPt
     std::shared_ptr<const CacheTopology> storage_topology;
     StorageBackend::PoolsByTag           storage_pools;
     StorageBackend::BufferResolver       storage_buffer_resolver;
+    StorageBackend::HostPoolsByTag               host_pools;
+    std::unordered_map<std::string, GroupSetPtr> host_groups;
     if (storage_backend != nullptr) {
         storage_topology = group_sets.front()->topologyPtr();
         for (const auto& group_set : group_sets) {
             for (size_t member = 0; member < group_set->groupTags().size(); ++member) {
                 RTP_LLM_CHECK(
                     storage_pools.emplace(group_set->groupTags()[member], group_set->devicePools()[member]).second);
+                if (group_set->hostPool()) {
+                    const auto& tag = group_set->groupTags()[member];
+                    host_pools.emplace(tag, group_set->hostPool());
+                    host_groups.emplace(tag, group_set);
+                }
             }
         }
         storage_buffer_resolver = [topology = storage_topology,
@@ -474,10 +481,16 @@ std::unique_ptr<BlockTreeCache> makeBlockTreeCacheForTest(std::vector<GroupSetPt
                                                   std::move(task_pool),
                                                   std::move(cache_metrics_reporter));
     if (cache->storageBackend()) {
-        RTP_LLM_CHECK_WITH_INFO(cache->storageBackend()->init(std::move(storage_topology),
-                                                              std::move(storage_pools),
-                                                              std::move(storage_buffer_resolver)),
-                                "StorageBackend init failed");
+        RTP_LLM_CHECK_WITH_INFO(
+            cache->storageBackend()->init(
+                std::move(storage_topology),
+                std::move(storage_pools),
+                std::move(storage_buffer_resolver),
+                std::move(host_pools),
+                [host_groups = std::move(host_groups)](int layer, const std::string& tag, int block) {
+                    return host_groups.at(tag)->convertHostIndexToBuffer(layer, tag, block);
+                }),
+            "StorageBackend init failed");
     }
     if (!cache->init()) {
         return nullptr;

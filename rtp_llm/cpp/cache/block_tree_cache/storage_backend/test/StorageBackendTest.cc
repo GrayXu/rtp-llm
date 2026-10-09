@@ -325,8 +325,9 @@ public:
         return write_handle_count_;
     }
 
-    std::vector<BlockInfo> resolve(int layer_id, const std::string& tag, int block_id) const {
-        return convertIndexToBuffer(layer_id, tag, block_id);
+    std::vector<BlockInfo>
+    resolve(int layer_id, const std::string& tag, int block_id, Tier source_tier = Tier::DEVICE) const {
+        return convertIndexToBuffer(layer_id, tag, block_id, source_tier);
     }
 
     const std::vector<std::string>& poolTags() const {
@@ -796,6 +797,76 @@ TEST(StorageBackendTest, AsyncWriteFailuresAndRejectionReleasePins) {
     EXPECT_FALSE(backend.write(backend.prepareWrite(makeRequest(block))));
     EXPECT_EQ(pool->refCount(block), 1u);
     pool->decRef(block);
+}
+
+TEST(StorageBackendTest, HostWritePinsSharedPackedBlockOnceAndReleasesOnEveryExit) {
+    for (const std::string outcome : {"success", "failure", "rejection", "shutdown", "unsubmitted"}) {
+        auto host_config                  = std::make_shared<HostBlockPoolConfig>();
+        host_config->pool_type            = BlockPoolType::HOST;
+        host_config->pool_name            = "storage_host_" + outcome;
+        host_config->physical_block_count = 4;
+        host_config->payload_bytes        = 32;
+        host_config->stride_bytes         = 4096;
+        auto host_pool                    = std::make_shared<HostBlockPool>(host_config);
+        ASSERT_TRUE(host_pool->init());
+        const auto block = host_pool->malloc().value();
+        host_pool->incTreeRef(block, BlockTreeRefType::CACHE);
+        auto        pool_a   = std::make_shared<TestBlockPool>();
+        auto        pool_b   = std::make_shared<TestBlockPool>();
+        auto        executor = std::make_shared<HoldingExecutor>();
+        TestBackend backend(true, executor);
+        ASSERT_TRUE(backend.init(
+            makeSharedPoolTopology(),
+            {{"group_0", pool_a}, {"group_1", pool_b}},
+            [](int, const std::string&, int) { return std::vector<BlockInfo>{{false, 0, 0, nullptr, 16}}; },
+            {{"group_0", host_pool}, {"group_1", host_pool}},
+            [host_pool](int, const std::string& tag, int block_id) {
+                auto* base = static_cast<uint8_t*>(host_pool->blockBuffer(block_id).addr);
+                return std::vector<BlockInfo>{{false, 0, 0, base + (tag == "group_0" ? 0 : 16), 16}};
+            }));
+        StorageRequest request{std::make_shared<const CacheKeysType>(CacheKeysType{1, 2}),
+                               {{{"group_0", block}, {"group_1", block}}, {{"group_0", block}, {"group_1", block}}}};
+        request.source_tier = Tier::HOST;
+        const auto buffers  = backend.resolve(0, "group_1", block, Tier::HOST);
+        ASSERT_EQ(buffers.size(), 1u);
+        EXPECT_FALSE(buffers[0].is_cuda);
+        EXPECT_EQ(buffers[0].addr, static_cast<uint8_t*>(host_pool->blockBuffer(block).addr) + 16);
+        auto task = backend.prepareWrite(request);
+        EXPECT_EQ(host_pool->treeRefCount(block), 2u);
+        EXPECT_EQ(pool_a->usedBlocksNum(), 0u);
+        EXPECT_EQ(pool_b->usedBlocksNum(), 0u);
+        host_pool->decTreeRef(block, BlockTreeRefType::CACHE);
+        EXPECT_EQ(host_pool->treeRefCount(block), 1u);
+        if (outcome == "unsubmitted") {
+            task = {};
+        } else {
+            if (outcome == "failure") {
+                backend.failNextWrite();
+            } else if (outcome == "rejection") {
+                executor->setReject(true);
+            } else if (outcome == "shutdown") {
+                backend.shutdown();
+            }
+            executor->setDuplicate(true);
+            EXPECT_EQ(backend.write(std::move(task)), outcome != "rejection" && outcome != "shutdown");
+            EXPECT_NO_THROW(executor->runAll());
+        }
+        EXPECT_FALSE(host_pool->isAllocated(block)) << outcome;
+        EXPECT_EQ(host_pool->referencedBlocksNum(BlockTreeRefType::STORE), 0u);
+        backend.shutdown();
+    }
+}
+
+TEST(StorageBackendTest, HostSourcesAreRejectedForReadsAndUnboundWrites) {
+    auto        pool = std::make_shared<TestBlockPool>();
+    TestBackend backend;
+    ASSERT_TRUE(initBackend(backend, pool));
+    auto request        = makeRequest(1);
+    request.source_tier = Tier::HOST;
+    EXPECT_ANY_THROW(backend.prepareWrite(request));
+    EXPECT_ANY_THROW(backend.read(request, nullptr, {}));
+    EXPECT_ANY_THROW(backend.match(request, {}));
+    backend.shutdown();
 }
 
 TEST(StorageBackendTest, AsyncWriteDuringStoppingIsRejectedAndReleasesPins) {

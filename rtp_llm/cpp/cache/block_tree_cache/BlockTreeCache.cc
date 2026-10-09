@@ -1,6 +1,7 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCache.h"
 
 #include <algorithm>
+#include <chrono>
 #include <utility>
 
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeTaskPool.h"
@@ -144,11 +145,63 @@ bool BlockTreeCache::executeTransfer(TransferTask task) {
     return true;
 }
 
-BlockTreeMatchResult BlockTreeCache::match(const CacheKeysType& cache_keys) {
+StorageBackend::HostWriteResolution BlockTreeCache::resolveHostWrite(const CacheKeysType&            keys,
+                                                                     const std::vector<std::string>& tags,
+                                                                     const std::vector<uint32_t>&    coordinates,
+                                                                     int                             timeout_ms) {
+    if (!storage_backend_ || keys.empty() || tags.empty() || tags.size() != coordinates.size()) {
+        return {};
+    }
+    std::unique_lock<std::mutex> lock(mutex_);
+    auto resolve = [&]() -> std::vector<BlockIdxType> {
+        const auto path = tree_->findNode(keys);
+        std::vector<BlockIdxType> blocks;
+        blocks.reserve(tags.size());
+        for (size_t i = 0; i < tags.size(); ++i) {
+            if (coordinates[i] >= path.size()) {
+                return {};
+            }
+            const auto* location = tree_->reusableGroupLocation(tags[i]);
+            if (!location) {
+                return {};
+            }
+            const auto& host_pool = tree_->groupSets()[location->group_set_id]->hostPool();
+            if (!host_pool || host_pool->hasUncertainRemoteIo()) {
+                return {};
+            }
+            const auto& resource = path[coordinates[i]]->group_set_resources[location->group_set_id];
+            if (resource.transfer_state != GroupSetTransferState::IDLE || isNullBlockIdx(resource.host_block)) {
+                return {};
+            }
+            blocks.push_back(resource.host_block);
+        }
+        return blocks;
+    };
+    auto blocks = resolve();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(0, timeout_ms));
+    while (blocks.empty() && host_publication_cv_.wait_until(lock, deadline) != std::cv_status::timeout) {
+        blocks = resolve();
+    }
+    if (blocks.empty()) {
+        return {};
+    }
+    auto key_copy = std::make_shared<CacheKeysType>();
+    StorageRequest request{key_copy, {}};
+    key_copy->reserve(tags.size());
+    request.handles.reserve(tags.size());
+    for (size_t i = 0; i < tags.size(); ++i) {
+        key_copy->push_back(keys[coordinates[i]]);
+        request.handles.push_back({StorageBlockHandle{tags[i], blocks[i], Tier::HOST}});
+    }
+    return {storage_backend_->prepareWrite(std::move(request)), std::move(blocks)};
+}
+
+BlockTreeMatchResult BlockTreeCache::match(const CacheKeysType&                 cache_keys,
+                                           std::shared_ptr<const CacheKeysType> remote_keys) {
     BlockTreeMatchResult result;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        result = loader_.matchLocked(cache_keys);
+        result = loader_.matchLocked(cache_keys, std::move(remote_keys));
     }
     metrics_reporter_->reportCacheReuseTimeMetrics(result.reuse_time_metrics_snapshots);
     return result;
@@ -156,19 +209,28 @@ BlockTreeMatchResult BlockTreeCache::match(const CacheKeysType& cache_keys) {
 
 void BlockTreeCache::insert(const CacheKeysType&                              cache_keys,
                             const std::vector<std::vector<GroupSetResource>>& resources,
-                            Tier                                              target_tier) {
-    (void)insert(cache_keys, resources, target_tier, false);
+                            Tier                                              target_tier,
+                            std::shared_ptr<const StorageRequest>             remote_write) {
+    (void)insert(cache_keys, resources, target_tier, false, false, std::move(remote_write));
 }
 
 size_t BlockTreeCache::insert(const CacheKeysType&                              cache_keys,
                               const std::vector<std::vector<GroupSetResource>>& resources,
                               Tier                                              target_tier,
-                              bool                                              is_resident) {
+                              bool                                              is_resident,
+                              bool                                              write_remote_from_device,
+                              std::shared_ptr<const StorageRequest>             remote_write) {
     size_t           resident_prefix_length = 0;
     StorageWriteTask storage_write;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        storage_write = storer_.storeLocked(cache_keys, resources, target_tier, is_resident, resident_prefix_length);
+        storage_write = storer_.storeLocked(cache_keys,
+                                            resources,
+                                            target_tier,
+                                            is_resident,
+                                            resident_prefix_length,
+                                            write_remote_from_device,
+                                            std::move(remote_write));
     }
     if (storage_write) {
         storage_backend_->write(std::move(storage_write));
@@ -298,6 +360,7 @@ bool BlockTreeCache::abortPendingLoad(const std::shared_ptr<AsyncContext>& conte
 void BlockTreeCache::onWorkflowSettledLocked(bool tree_data_mutated, bool check_watermark) {
     if (tree_data_mutated) {
         ++mutation_version_;
+        host_publication_cv_.notify_all();
     }
     if (check_watermark) {
         checkWatermark();

@@ -235,6 +235,7 @@ struct KVCacheConfig {
     std::string kvcm_server_address                  = "";
     std::string kvcm_instance_group                  = "default";
     int32_t     kvcm_default_query_type              = 2;
+    std::string kvcm_remote_layout                   = "legacy";  // legacy | canonical_v1
     int32_t     kvcm_query_type                      = 0;  // 0 uses the instance default
     int32_t     kvcm_sw_size                         = 0;  // window size in cache keys
     int32_t     kvcm_read_backend_type               = 0;  // 0 uses MatchLocation

@@ -1070,7 +1070,7 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         RTP_LLM_PROFILE_SCOPE("executor.mtp.prefill_step(tp_sync_input)");
         int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
         model_input.skip_run  = streams.empty() && !enable_ffn_disaggregate_;
-        tpSyncModelInputs(model_input, parallelism_config_);
+        tpSyncModelInputs(model_input, parallelism_config_, cache_manager_.get());
         if (model_input.skip_run) {
             return absl::OkStatus();
         }
@@ -1183,7 +1183,7 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         if (cp_enabled || is_dspark_) {
             model_input.last_hidden_states = torch::Tensor();
         }
-        tpSyncModelInputs(model_input, parallelism_config_);
+        tpSyncModelInputs(model_input, parallelism_config_, cache_manager_.get());
         maybePrintModelInput(model_input, "prefill post draft model");
         int64_t     start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
         const auto& mtp_cache_cfg = cache_manager_->getMTPModuleCacheConfig(0);
@@ -1494,7 +1494,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
         model_input.skip_run  = streams.empty() && !enable_ffn_disaggregate_;
         if (model_input.skip_run) {
-            tpSyncModelInputs(model_input, parallelism_config_);
+            tpSyncModelInputs(model_input, parallelism_config_, cache_manager_.get());
             return absl::OkStatus();
         }
         executor_collector.tp_sync_input_us += autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
@@ -1522,7 +1522,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                     dspark_round_state, proposal_input, buffer_holder_);
                 ensureModelInputsOnCuda(proposal_input, "decode.prepare_dspark_proposal");
             }
-            tpSyncModelInputs(proposal_input, parallelism_config_);
+            tpSyncModelInputs(proposal_input, parallelism_config_, cache_manager_.get());
             if (proposal_input.skip_run) {
                 return absl::OkStatus();
             }
@@ -1547,7 +1547,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                 ensureModelInputsOnCuda(model_input, "decode.prepare_dspark_target_verify");
             }
             applyCacheStrideToModelInput(model_input, cache_manager_->cacheConfig());
-            tpSyncModelInputs(model_input, parallelism_config_);
+            tpSyncModelInputs(model_input, parallelism_config_, cache_manager_.get());
             ensureModelInputsOnCuda(model_input, "decode.dspark_target_verify_after_tp_sync");
         }
     } else {
@@ -1563,7 +1563,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                 }
                 ensureModelInputsOnCuda(model_input, "decode.prepare_decode_input");
             }
-            tpSyncModelInputs(model_input, parallelism_config_);
+            tpSyncModelInputs(model_input, parallelism_config_, cache_manager_.get());
             if (model_input.skip_run) {
                 return absl::OkStatus();
             }
@@ -2164,7 +2164,7 @@ void MtpExecutor::broadcastPostRejectionInputs(GptModelInputs& model_input) {
             // target-verify layout and raw NCCL broadcasts would mismatch
             // element counts (hang/corruption). Use the shape-hinted full sync,
             // matching main's post-rejection tpSyncModelInputs.
-            tpSyncModelInputs(model_input, parallelism_config_);
+            tpSyncModelInputs(model_input, parallelism_config_, cache_manager_.get());
         }
     }
     applyCacheStrideToModelInput(model_input, mtp_cache_cfg);

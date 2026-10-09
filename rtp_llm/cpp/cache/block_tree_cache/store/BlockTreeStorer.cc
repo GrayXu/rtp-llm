@@ -1,6 +1,7 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/store/BlockTreeStorer.h"
 
 #include <chrono>
+#include <algorithm>
 #include <cassert>
 #include <exception>
 #include <utility>
@@ -43,20 +44,63 @@ StorageWriteTask BlockTreeStorer::storeLocked(const CacheKeysType&              
                                               const std::vector<std::vector<GroupSetResource>>& resources,
                                               Tier                                              target_tier,
                                               bool                                              is_resident,
-                                              size_t& resident_prefix_length) {
+                                              size_t&                                           resident_prefix_length,
+                                              bool                                  write_remote_from_device,
+                                              std::shared_ptr<const StorageRequest> remote_write) {
     resident_prefix_length = 0;
     assert(!is_resident || target_tier == Tier::DEVICE);
-    RTP_LLM_CHECK_WITH_INFO(target_tier == Tier::DEVICE || target_tier == Tier::HOST || target_tier == Tier::DISK,
+    RTP_LLM_CHECK_WITH_INFO(target_tier == Tier::DEVICE || target_tier == Tier::HOST || target_tier == Tier::DISK
+                                || target_tier == Tier::REMOTE,
                             "unsupported store target tier: %s",
                             tierName(target_tier));
     if (target_tier == Tier::DEVICE) {
         publishDeviceLocked(cache_keys, resources, is_resident, resident_prefix_length);
-    } else {
-        submitLowerTierLocked(cache_keys, resources, target_tier);
-        return {};
+    } else if (target_tier == Tier::HOST || target_tier == Tier::DISK) {
+        const bool host_source =
+            target_tier == Tier::HOST && std::any_of(resources.begin(), resources.end(), [](const auto& key_resources) {
+                return std::any_of(key_resources.begin(), key_resources.end(), [](const auto& resource) {
+                    return resource.hasTier(Tier::HOST);
+                });
+            });
+        if (host_source) {
+            if (stopping_.load()) {
+                return {};
+            }
+            for (const auto& key_resources : resources) {
+                for (const auto& resource : key_resources) {
+                    RTP_LLM_CHECK_WITH_INFO(!resource.hasTier(Tier::DEVICE) && !resource.hasTier(Tier::DISK),
+                                            "ready HOST store requires HOST-only source resources");
+                }
+            }
+            auto storage_write =
+                storage_backend_ ?
+                    storage_backend_->prepareWrite(
+                        remote_write ? *remote_write : makeStorageRequest(cache_keys, resources, Tier::HOST)) :
+                    StorageWriteTask{};
+            const auto insert_result = tree_->insertNode(cache_keys, resources, true, false);
+            if (insert_result.accepted_resource_count > 0) {
+                evictor_.onInserted(insert_result);
+                settled_(true, true);
+            }
+            return storage_write;
+        }
+        // Retain a DEVICE fallback before releasing the request's sources.
+        const bool submit_device_write = write_remote_from_device || remote_write != nullptr;
+        auto       storage_write       = submit_device_write && storage_backend_ ?
+                                             storage_backend_->prepareWrite(
+                                                 remote_write ? *remote_write : makeStorageRequest(cache_keys, resources)) :
+                                             StorageWriteTask{};
+        const bool reuse_host = target_tier == Tier::HOST && storage_write
+                                && storage_backend_->canInitiateHostWrite();
+        submitLowerTierLocked(cache_keys, resources, target_tier, reuse_host ? &storage_write : nullptr);
+        return storage_write;
     }
-    return storage_backend_ ? storage_backend_->prepareWrite(makeStorageRequest(cache_keys, resources)) :
-                              StorageWriteTask{};
+    // Pin the complete device sources before request release, independently of
+    // the local store. BlockTreeCache submits remote I/O after unlocking.
+    return storage_backend_ ?
+               storage_backend_->prepareWrite(remote_write ? *remote_write :
+                                                             makeStorageRequest(cache_keys, resources)) :
+               StorageWriteTask{};
 }
 
 void BlockTreeStorer::publishDeviceLocked(const CacheKeysType&                              cache_keys,
@@ -75,28 +119,62 @@ void BlockTreeStorer::publishDeviceLocked(const CacheKeysType&                  
 }
 
 StorageRequest BlockTreeStorer::makeStorageRequest(const CacheKeysType&                              cache_keys,
-                                                   const std::vector<std::vector<GroupSetResource>>& resources) const {
+                                                   const std::vector<std::vector<GroupSetResource>>& resources,
+                                                   Tier source_tier) const {
+    RTP_LLM_CHECK_WITH_INFO(resources.size() == cache_keys.size(), "storage source key/resource count mismatch");
+    for (const auto& key_resources : resources) {
+        RTP_LLM_CHECK_WITH_INFO(key_resources.size() == tree_->groupSets().size(),
+                                "storage source GroupSetResource count mismatch");
+    }
     StorageRequest request{std::make_shared<CacheKeysType>(cache_keys),
                            std::vector<std::vector<StorageBlockHandle>>(cache_keys.size())};
+    const bool shared_host = source_tier == Tier::HOST && storage_backend_
+                             && storage_backend_->requiresSharedHostMemory();
+    request.source_tier = shared_host ? Tier::DEVICE : source_tier;
+    if (shared_host) {
+        request.host_payload_dispatched = std::make_shared<std::atomic<bool>>(false);
+    }
     for (size_t key_index = 0; key_index < resources.size(); ++key_index) {
         auto& key_handles = request.handles[key_index];
         for (size_t group_set = 0; group_set < tree_->groupSets().size(); ++group_set) {
             const auto& resource = resources[key_index][group_set];
-            if (!resource.hasCompleteDeviceValue()) {
+            if (source_tier == Tier::HOST ? !resource.hasTier(Tier::HOST) : !resource.hasCompleteDeviceValue()) {
                 continue;
             }
             const auto& group = *tree_->groupSets()[group_set];
             for (size_t member = 0; member < group.groupTags().size(); ++member) {
-                key_handles.push_back({group.groupTags()[member], resource.device_blocks[member]});
+                const auto block = source_tier == Tier::HOST ? resource.host_block : resource.device_blocks[member];
+                key_handles.push_back({group.groupTags()[member], block, shared_host ? Tier::HOST : Tier::DEVICE});
             }
         }
     }
     return request;
 }
 
+StorageRequest BlockTreeStorer::makeHostStorageRequest(const StoreTask& task) const {
+    const auto path = tree_->findNode(task.cache_keys);
+    if (path.size() != task.cache_keys.size()) {
+        return {};
+    }
+    std::vector<std::vector<GroupSetResource>> resources(
+        task.cache_keys.size(), std::vector<GroupSetResource>(tree_->groupSets().size()));
+    for (const auto& descriptor : task.descriptors()) {
+        const auto& group_set = tree_->groupSets()[descriptor.group_set_id];
+        const auto& resource = path[descriptor.path_index]->group_set_resources[descriptor.group_set_id];
+        if (!group_set->hostPool() || group_set->hostPool()->hasUncertainRemoteIo()
+            || resource.transfer_state != GroupSetTransferState::IDLE || !resource.hasTier(Tier::HOST)) {
+            return {};
+        }
+        // A duplicate store can retain the tree's old HOST block instead of this task's target.
+        resources[descriptor.path_index][descriptor.group_set_id].host_block = resource.host_block;
+    }
+    return makeStorageRequest(task.cache_keys, resources, Tier::HOST);
+}
+
 void BlockTreeStorer::submitLowerTierLocked(const CacheKeysType&                              cache_keys,
                                             const std::vector<std::vector<GroupSetResource>>& resources,
-                                            Tier                                              target_tier) {
+                                            Tier                                              target_tier,
+                                            StorageWriteTask*                                 device_write) {
     if (stopping_.load()) {
         return;
     }
@@ -110,6 +188,9 @@ void BlockTreeStorer::submitLowerTierLocked(const CacheKeysType&                
 
     if (!store_task_runner_.prepareTask(*task, resources)) {
         return;
+    }
+    if (device_write) {
+        task->device_write = std::move(*device_write);
     }
     const int64_t queue_begin = currentTimeUs();
     auto          on_timeout  = [this, task, queue_begin]() {
@@ -141,6 +222,9 @@ void BlockTreeStorer::submitLowerTierLocked(const CacheKeysType&                
         RTP_LLM_LOG_WARNING("store aborted: business task submission rejected, target=%s blocks=%zu",
                             tierName(target_tier),
                             task->descriptors().size());
+        if (device_write) {
+            *device_write = std::move(task->device_write);
+        }
         return;
     }
     prepare_guard.dismiss();
@@ -182,13 +266,21 @@ void BlockTreeStorer::scheduleStoreSettlement(const StoreTaskPtr& task, ErrorInf
     }
 }
 
-void BlockTreeStorer::settleTask(const StoreTask& task, bool copy_success) {
+void BlockTreeStorer::settleTask(StoreTask& task, bool copy_success) {
     bool   stopping = false;
     size_t accepted = 0;
+    StorageWriteTask storage_write;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         stopping = stopping_.load();
-        accepted = settleLocked(task, copy_success && !stopping);
+        accepted = settleLocked(task, copy_success && !stopping, task.device_write ? &storage_write : nullptr);
+        if (!stopping && !storage_write) {
+            storage_write = std::move(task.device_write);
+        }
+        task.device_write = {};
+    }
+    if (storage_write) {
+        storage_backend_->write(std::move(storage_write));
     }
 
     if (stopping) {
@@ -208,7 +300,7 @@ void BlockTreeStorer::settleTask(const StoreTask& task, bool copy_success) {
     }
 }
 
-size_t BlockTreeStorer::settleLocked(const StoreTask& task, bool publish) {
+size_t BlockTreeStorer::settleLocked(const StoreTask& task, bool publish, StorageWriteTask* host_write) {
     BlockTreeInsertResult insert_result;
     if (publish) {
         std::vector<std::vector<GroupSetResource>> resources(task.cache_keys.size(),
@@ -218,6 +310,16 @@ size_t BlockTreeStorer::settleLocked(const StoreTask& task, bool publish) {
                 task.target_tier, {descriptor.singleBlockAt(task.target_tier)});
         }
         insert_result = tree_->insertNode(task.cache_keys, resources, true, false);
+        if (host_write) {
+            try {
+                // Pin published HOST data before releasing task refs or checking watermarks.
+                *host_write = storage_backend_->prepareWrite(makeHostStorageRequest(task));
+            } catch (const std::exception& error) {
+                RTP_LLM_LOG_WARNING("prepare reused HOST remote write failed: %s", error.what());
+            } catch (...) {
+                RTP_LLM_LOG_WARNING("prepare reused HOST remote write failed with an unknown exception");
+            }
+        }
     }
 
     store_task_runner_.releaseTaskResources(task);

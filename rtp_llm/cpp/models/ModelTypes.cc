@@ -1,4 +1,5 @@
 #include "rtp_llm/cpp/models/ModelTypes.h"
+#include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/models_py/bindings/core/torch_utils/TypeConvert.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
@@ -179,6 +180,8 @@ GptModelInputShapeHints getModelInputShapeHints(const GptModelInputs& inputs) {
     shape_hints[GptModelInputIndex::kvScaleStrideBytes]    = static_cast<int64_t>(inputs.kv_scale_stride_bytes);
     shape_hints[GptModelInputIndex::seqSizePerBlock]       = static_cast<int64_t>(inputs.seq_size_per_block);
     shape_hints[GptModelInputIndex::kernelSeqSizePerBlock] = static_cast<int64_t>(inputs.kernel_seq_size_per_block);
+    shape_hints[GptModelInputIndex::workerCacheGenerationRows] =
+        inputs.worker_cache_block_generations.defined() ? inputs.worker_cache_block_generations.size(0) : 0;
 
     // Encode the root-side placement of every tensor that may enter the packed
     // broadcast.  Some tensors (notably DSpARK MRoPE position ids) are created
@@ -250,7 +253,12 @@ std::vector<int64_t> decodeKvBlockTableShape(int64_t rank, int64_t group_num, in
     return {group_num, batch_size, max_blocks};
 }
 
-void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallelism_config) {
+void tpSyncModelInputs(GptModelInputs&          inputs,
+                       const ParallelismConfig& parallelism_config,
+                       KVCacheManager*          cache_manager) {
+    if (parallelism_config.tp_rank == 0 && cache_manager) {
+        cache_manager->prepareWorkerCacheIO(inputs);
+    }
     if (parallelism_config.tp_size <= 1) {
         return;
     }
@@ -336,6 +344,7 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
         inputs.kv_cache_kernel_block_id = torch::Tensor();
         inputs.kv_cache_group_types     = torch::Tensor();
         inputs.kv_cache_update_mapping  = torch::Tensor();
+        inputs.worker_cache_block_generations = torch::Tensor();
         return;
     }
 
@@ -374,6 +383,8 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
         checkedHint(GptModelInputIndex::kvCacheKernelBlockIdRank, "kvCacheKernelBlockIdRank");
     const auto block_table_rank        = checkedHint(GptModelInputIndex::kvCacheBlockIdRank, "kvCacheBlockIdRank");
     const auto group_types_len         = checkedHint(GptModelInputIndex::kvCacheGroupTypesLen, "kvCacheGroupTypesLen");
+    const auto worker_generation_rows =
+        checkedHint(GptModelInputIndex::workerCacheGenerationRows, "workerCacheGenerationRows");
     const auto combo_position_ids_size = checkedHint(GptModelInputIndex::comboPositionIds, "comboPositionIds");
     const auto text_tokens_mask_size   = checkedHint(GptModelInputIndex::textTokensMask, "textTokensMask");
     const auto mm_features_locs_size   = checkedHint(GptModelInputIndex::mmFeaturesLocs, "mmFeaturesLocs");
@@ -413,6 +424,10 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
 
     bool is_non_root = parallelism_config.tp_rank != 0;
     if (is_non_root) {
+        inputs.worker_cache_block_generations =
+            worker_generation_rows ?
+                allocBuf(rtp_llm::DataType::TYPE_INT64, {worker_generation_rows, 3}, rtp_llm::AllocationType::HOST) :
+                torch::Tensor();
         const auto context_batch_size = checkedHint(GptModelInputIndex::prefixLengths, "prefixLengths");
 
         // Respect the root-side device bitmap so all ranks classify tensors the
@@ -574,6 +589,7 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
         collect(wire_group_types);
     }
     collect(wire_copy_mapping);
+    collect(inputs.worker_cache_block_generations);
     collect(inputs.request_id);
     collect(inputs.request_pd_separation);
     collect(inputs.lm_output_indexes);
@@ -748,6 +764,9 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
             inputs.kv_cache_group_types     = reorderCacheRows(wire_group_types, local_rows, false);
             inputs.kv_cache_update_mapping = reorderCacheCopyRows(wire_copy_mapping, sorted_rows);
         }
+    }
+    if (is_non_root && cache_manager) {
+        cache_manager->prepareWorkerCacheIO(inputs);
     }
 }
 

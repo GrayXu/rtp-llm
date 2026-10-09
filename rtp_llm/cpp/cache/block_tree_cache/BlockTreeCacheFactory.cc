@@ -176,7 +176,8 @@ std::vector<SingleTypeCacheManagerPtr> alignCoordinatorGroups(const CacheConfig&
     return aligned;
 }
 
-std::shared_ptr<HostBlockPool> createHostPool(const std::string& name, size_t payload_bytes, size_t usable_blocks) {
+std::shared_ptr<HostBlockPool>
+createHostPool(const std::string& name, size_t payload_bytes, size_t usable_blocks, bool shared_memory_for_remote) {
     if (payload_bytes == 0 || usable_blocks == 0) {
         return nullptr;
     }
@@ -187,6 +188,7 @@ std::shared_ptr<HostBlockPool> createHostPool(const std::string& name, size_t pa
     config->payload_bytes        = payload_bytes;
     config->stride_bytes         = alignUp(payload_bytes, kPoolAlignment);
     config->alignment            = kPoolAlignment;
+    config->shared_memory_for_remote = shared_memory_for_remote;
     auto pool                    = std::make_shared<HostBlockPool>(config);
     return pool->init() ? pool : nullptr;
 }
@@ -456,6 +458,7 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
     }
 
     std::vector<std::shared_ptr<HostBlockPool>> host_pools(group_members.size());
+    std::vector<std::shared_ptr<HostBlockPool>> remote_read_pools(group_members.size());
     if (host_enabled && !group_members.empty()) {
         const size_t bytes  = static_cast<size_t>(kv_cache_config.memory_cache_size_mb) * 1024UL * 1024UL;
         const size_t usable = computeHostUsableBlockCount(bytes, combined_stride);
@@ -463,14 +466,32 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
             RTP_LLM_LOG_ERROR("host budget is too small for one complete tree coordinate");
             return nullptr;
         }
+        const bool shared_remote = storage_backend && storage_backend->requiresSharedHostMemory();
+        // The second pool has its own sentinel. Subtract its entire physical
+        // footprint from the existing HOST budget so rank-local remote reads
+        // cannot perturb the cache pool's cross-rank block numbering.
+        const size_t read_usable = shared_remote && usable >= 3 ? std::min<size_t>(8, (usable - 1) / 2) : 0;
+        const size_t cache_usable = usable - (read_usable ? read_usable + 1 : 0);
         for (size_t group_set_id = 0; group_set_id < group_members.size(); ++group_set_id) {
             const std::vector<std::string>& members = group_members[group_set_id];
             const GroupBase&                first   = cache_config.topology().group(members.front());
             const std::string               pool_name =
                 "block_tree_host_" + std::string(metricCacheGroupTypeName(first.policy.group_type));
-            host_pools[group_set_id] = createHostPool(pool_name, group_set_payload_bytes[group_set_id], usable);
+            host_pools[group_set_id] = createHostPool(pool_name,
+                                                      group_set_payload_bytes[group_set_id],
+                                                      cache_usable,
+                                                      shared_remote);
             if (!host_pools[group_set_id]) {
                 return nullptr;
+            }
+            if (read_usable) {
+                remote_read_pools[group_set_id] = createHostPool(pool_name + "_remote_read",
+                                                                  group_set_payload_bytes[group_set_id],
+                                                                  read_usable,
+                                                                  true);
+                if (!remote_read_pools[group_set_id]) {
+                    return nullptr;
+                }
             }
         }
     }
@@ -630,6 +651,7 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
                                                                         config.transfer_worker_count,
                                                                         config.transfer_queue_max_size,
                                                                         cache_metrics_reporter);
+    std::weak_ptr<PerRankBlockTransferEngine> weak_per_rank_engine = per_rank_engine;
     std::shared_ptr<MultiRankBlockTransferEngine> multi_rank_engine;
     if (broadcast_manager != nullptr) {
         multi_rank_engine = std::make_shared<MultiRankBlockTransferEngine>(group_sets, std::move(broadcast_manager));
@@ -642,6 +664,18 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
     auto         task_pool           = std::make_unique<BlockTreeTaskPool>(
         static_cast<size_t>(config.task_pool_size), business_queue_size, "BlockTreeCacheTaskPool");
 
+    StorageBackend::HostPoolsByTag               storage_host_pools;
+    std::unordered_map<std::string, GroupSetPtr> storage_host_groups;
+    if (storage_backend) {
+        for (const auto& group_set : group_sets) {
+            if (group_set->hostPool()) {
+                for (const auto& tag : group_set->groupTags()) {
+                    storage_host_pools.emplace(tag, group_set->hostPool());
+                    storage_host_groups.emplace(tag, group_set);
+                }
+            }
+        }
+    }
     auto tree = std::make_unique<BlockTree>(std::move(group_sets));
 
     auto result = std::make_shared<BlockTreeCache>(std::move(tree),
@@ -654,6 +688,7 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
         const std::shared_ptr<const CacheTopology> storage_topology = cache_topology;
         const CacheConfig                          storage_config   = cache_config;
         StorageBackend::PoolsByTag                 resolver_pools;
+        StorageBackend::HostBindingsByTag          host_bindings;
         const auto&                                tags = storage_topology->groupTags();
         RTP_LLM_CHECK(tags.size() == group_pools.size());
         for (size_t i = 0; i < tags.size(); ++i) {
@@ -661,12 +696,63 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
                                     "duplicate storage pool tag=%s",
                                     tags[i].c_str());
         }
+        for (const auto& group_set : result->groupSets()) {
+            const auto& host_pool = group_set->hostPool();
+            if (!host_pool) {
+                continue;
+            }
+            size_t offset = 0;
+            for (size_t member = 0; member < group_set->groupTags().size(); ++member) {
+                const auto& tag = group_set->groupTags()[member];
+                const size_t bytes = storage_config.blockSizeBytesForGroup(tag);
+                RTP_LLM_CHECK_WITH_INFO(host_bindings.emplace(
+                                            tag,
+                                            StorageBackend::HostPoolBinding{host_pool,
+                                                                            remote_read_pools[group_set->groupSetId()],
+                                                                            group_set->groupSetId(),
+                                                                            member,
+                                                                            group_set->groupTags().size(),
+                                                                            offset,
+                                                                            bytes})
+                                            .second,
+                                        "duplicate host storage tag=%s", tag.c_str());
+                offset += bytes;
+            }
+            RTP_LLM_CHECK_WITH_INFO(offset == host_pool->payloadBytes(),
+                                    "host storage layout differs from group set payload");
+        }
+        std::weak_ptr<BlockTreeCache> weak_cache = result;
         RTP_LLM_CHECK_WITH_INFO(
             result->storageBackend()->init(
                 storage_topology,
                 resolver_pools,
                 [storage_config, resolver_pools](int layer_id, const std::string& tag, int block_id) {
                     return resolveStorageBuffers(storage_config, resolver_pools, layer_id, tag, block_id);
+                },
+                std::move(storage_host_pools),
+                [host_groups = std::move(storage_host_groups)](int layer_id, const std::string& tag, int block_id) {
+                    return host_groups.at(tag)->convertHostIndexToBuffer(layer_id, tag, block_id);
+                },
+                std::move(host_bindings),
+                [weak_per_rank_engine](std::vector<TransferDescriptor> descriptors,
+                                       std::vector<HostBufferView> views,
+                                       int timeout_ms) {
+                    auto engine = weak_per_rank_engine.lock();
+                    if (!engine) {
+                        return false;
+                    }
+                    auto context = engine->executeHostToDeviceFromViews(
+                        TransferTask(std::move(descriptors), std::chrono::milliseconds(timeout_ms)), std::move(views));
+                    context->waitDone();
+                    return context->success();
+                },
+                [weak_cache](const CacheKeysType& keys,
+                             const std::vector<std::string>& tags,
+                             const std::vector<uint32_t>& coordinates,
+                             int timeout_ms) {
+                    auto cache = weak_cache.lock();
+                    return cache ? cache->resolveHostWrite(keys, tags, coordinates, timeout_ms) :
+                                   StorageBackend::HostWriteResolution{};
                 }),
             "StorageBackend init failed");
     }

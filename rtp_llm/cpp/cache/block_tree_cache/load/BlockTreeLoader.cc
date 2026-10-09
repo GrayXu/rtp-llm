@@ -45,14 +45,15 @@ BlockTreeLoader::BlockTreeLoader(BlockTree*                      tree,
                 context.loadDescs(), context.joinedLoads(), 0, context.contextId(), /*release_transferred_refs=*/false);
         })) {}
 
-BlockTreeMatchResult BlockTreeLoader::matchLocked(const CacheKeysType& cache_keys) {
+BlockTreeMatchResult BlockTreeLoader::matchLocked(const CacheKeysType&                 cache_keys,
+                                                  std::shared_ptr<const CacheKeysType> remote_keys) {
     if (cache_keys.empty()) {
         RTP_LLM_LOG_DEBUG("empty cache_keys, returning empty result");
         return {};
     }
 
     std::vector<TreeNode*> path   = tree_->findNode(cache_keys);
-    BlockTreeMatchResult   result = createMatchResult(path, cache_keys);
+    BlockTreeMatchResult   result = createMatchResult(path, cache_keys, std::move(remote_keys));
     RTP_LLM_LOG_DEBUG("matched %zu device blocks, cache_keys=%zu, tree_nodes=%zu",
                       result.matched_device_blocks,
                       cache_keys.size(),
@@ -72,7 +73,17 @@ bool BlockTreeLoader::validMatch(std::vector<TreeNode*>& path, std::vector<bool>
         TreeNode* node             = path[i];
         bool      all_groups_valid = true;
         for (size_t group_set_id = 0; group_set_id < tree_->groupSets().size(); ++group_set_id) {
-            if (!match_validators[group_set_id]->validate(node->group_set_resources[group_set_id])) {
+            const auto&             host_pool = tree_->groupSets()[group_set_id]->hostPool();
+            const GroupSetResource* resource  = &node->group_set_resources[group_set_id];
+            GroupSetResource        available;
+            if (resource->hasTier(Tier::HOST) && host_pool && host_pool->hasUncertainRemoteIo()) {
+                // Treat quarantined HOST data as a hole in the match, while
+                // leaving the tree and outstanding I/O references intact.
+                available            = *resource;
+                available.host_block = NULL_BLOCK_IDX;
+                resource             = &available;
+            }
+            if (!match_validators[group_set_id]->validate(*resource)) {
                 all_groups_valid = false;
             }
         }
@@ -139,7 +150,9 @@ std::vector<BlockTreeCacheReuseTimeMetricsSnapshot> BlockTreeLoader::collectReus
     return metrics_reporter_.collectCacheReuseTimeMetrics(reuse_time_samples);
 }
 
-BlockTreeMatchResult BlockTreeLoader::createMatchResult(std::vector<TreeNode*>& path, const CacheKeysType& cache_keys) {
+BlockTreeMatchResult BlockTreeLoader::createMatchResult(std::vector<TreeNode*>&              path,
+                                                        const CacheKeysType&                 cache_keys,
+                                                        std::shared_ptr<const CacheKeysType> remote_keys) {
     BlockTreeMatchResult result;
     std::vector<bool>    candidate_valid;
     if (!path.empty() && !validMatch(path, candidate_valid) && !storage_backend_) {
@@ -216,6 +229,7 @@ BlockTreeMatchResult BlockTreeLoader::createMatchResult(std::vector<TreeNode*>& 
     StorageRequest storage_request;
     if (storage_backend_ && path.size() < cache_keys.size()) {
         storage_request = makeStorageRequest(cache_keys, path.size());
+        storage_request.remote_keys = std::move(remote_keys);
     }
     const bool use_storage = !storage_request.empty();
     if (!pending_load_descs.empty() || use_storage) {

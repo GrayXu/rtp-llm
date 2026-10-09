@@ -163,6 +163,7 @@ std::string KVCacheConfig::to_string() const {
         << "kv_cache_event_instance_id: " << kv_cache_event_instance_id << "\n"
         << "kv_cache_event_host_ip_port: " << kv_cache_event_host_ip_port << "\n"
         << "kvcm_default_query_type: " << kvcm_default_query_type << "\n"
+        << "kvcm_remote_layout: " << kvcm_remote_layout << "\n"
         << "kvcm_query_type: " << kvcm_query_type << "\n"
         << "kvcm_sw_size: " << kvcm_sw_size << "\n"
         << "kvcm_read_backend_type: " << kvcm_read_backend_type << "\n"

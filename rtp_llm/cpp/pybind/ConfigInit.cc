@@ -504,6 +504,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("kvcm_server_address", &KVCacheConfig::kvcm_server_address)
         .def_readwrite("kvcm_instance_group", &KVCacheConfig::kvcm_instance_group)
         .def_readwrite("kvcm_default_query_type", &KVCacheConfig::kvcm_default_query_type)
+        .def_readwrite("kvcm_remote_layout", &KVCacheConfig::kvcm_remote_layout)
         .def_readwrite("kvcm_query_type", &KVCacheConfig::kvcm_query_type)
         .def_readwrite("kvcm_sw_size", &KVCacheConfig::kvcm_sw_size)
         .def_readwrite("kvcm_read_backend_type", &KVCacheConfig::kvcm_read_backend_type)
@@ -557,7 +558,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def(py::pickle(
             [](const KVCacheConfig& self) {
                 return py::make_tuple(std::string("KVCacheConfig"),
-                                      8,
+                                      9,
                                       self.reuse_cache,
                                       self.multi_task_prompt,
                                       self.multi_task_prompt_str,
@@ -629,11 +630,14 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                                       self.kvcm_query_type,
                                       self.kvcm_sw_size,
                                       self.kvcm_read_backend_type,
-                                      self.kvcm_min_replica_count);
+                                      self.kvcm_min_replica_count,
+                                      self.kvcm_remote_layout);
             },
             [](py::tuple t) {
                 const py::tuple event_state = t;
-                const bool has_kvcm_fields = t.size() == 74 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 8;
+                const bool has_remote_fields = t.size() == 75 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 9;
+                const bool has_kvcm_fields = has_remote_fields
+                    || (t.size() == 74 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 8);
                 const bool has_event_fields = has_kvcm_fields
                     || (t.size() == 69 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 7);
                 if (has_event_fields) {
@@ -749,6 +753,9 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                     c.kvcm_sw_size            = event_state[71].cast<int32_t>();
                     c.kvcm_read_backend_type  = event_state[72].cast<int32_t>();
                     c.kvcm_min_replica_count  = event_state[73].cast<int32_t>();
+                }
+                if (has_remote_fields) {
+                    c.kvcm_remote_layout = event_state[74].cast<std::string>();
                 }
                 return c;
             }));

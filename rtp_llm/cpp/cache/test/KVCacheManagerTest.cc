@@ -34,6 +34,7 @@
 #include "rtp_llm/cpp/model_rpc/BroadcastManager.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
+#include "rtp_llm/models_py/bindings/core/OpData.h"
 
 namespace rtp_llm {
 namespace test {
@@ -544,6 +545,73 @@ TEST_F(KVCacheManagerTest, AvailableBlocksUsesCanonicalPoolCount) {
     pool->decTreeRef(*block, BlockTreeRefType::CACHE);
     EXPECT_EQ(manager->freeBlocksNum(), total_blocks);
     EXPECT_EQ(manager->availableBlocksNum(), total_blocks);
+}
+
+TEST_F(KVCacheManagerTest, WorkerGenerationsUseCanonicalTagsAcrossDifferentPoolOrders) {
+    auto config = makeSimpleMhaCacheConfig(3, 2, 2, DataType::TYPE_FP16);
+    const std::vector<std::string> tags{"b", "c", "a"};
+    std::vector<KVCacheSpecPtr>    specs;
+    for (const auto& tag : tags) {
+        specs.push_back(makeResolvedMhaSpec(config.dtype, 1, 2, 2, tag));
+    }
+    config.fromGroupedSpecs(specs, {{0}, {1}, {2}},
+                            {CacheGroupType::FULL, CacheGroupType::FULL, CacheGroupType::FULL}, tags);
+    setGroupBlockNumsForTest(config, tags, {2, 2, 2});
+    KVCacheConfig options;
+    options.enable_remote_cache = true;
+    ParallelismConfig parallelism;
+    parallelism.tp_size = 2;
+    parallelism.tp_rank = 0;
+    KVCacheManager root(config, false, nullptr, options, parallelism);
+    // Initialize real allocator pools without a remote backend or collectives.
+    root.coordinator_manager_ = std::make_shared<CoordinatorCacheManager>(config);
+    ASSERT_TRUE(root.coordinator_manager_->init());
+    const auto& pools = root.coordinator_manager_->groupBlockPools();
+    ASSERT_EQ(pools.size(), 3u);
+    const std::vector<uint64_t> expected_generations{3, 5, 7};
+    for (size_t group = 0; group < pools.size(); ++group) {
+        for (uint64_t generation = 1; generation <= expected_generations[group]; ++generation) {
+            const auto block = pools[group]->malloc();
+            ASSERT_TRUE(block.has_value());
+            ASSERT_EQ(*block, 1);
+            pools[group]->incRef(*block);
+            ASSERT_EQ(pools[group]->blockAllocationGeneration(*block), generation);
+            if (generation != expected_generations[group]) {
+                pools[group]->decRef(*block);
+            }
+        }
+    }
+
+    auto groups = config.topology().groups();
+    std::rotate(groups.begin(), groups.begin() + 1, groups.end());
+    config.setTopology(std::move(groups), config.topology().layers());
+    parallelism.tp_rank = 1;
+    KVCacheManager worker(config, false, nullptr, options, parallelism);
+    ASSERT_EQ(worker.cacheConfig().groupTags(), (std::vector<std::string>{"c", "a", "b"}));
+
+    for (const bool copy_only : {false, true}) {
+        GptModelInputs inputs;
+        inputs.kv_cache_group_tags = {"a", "b", "c"};
+        if (copy_only) {
+            inputs.kv_cache_update_mapping =
+                torch::tensor({0, 1, 1, 1, 1, 1, 2, 1, 1}, torch::kInt32).reshape({3, 3});
+        } else {
+            inputs.kv_cache_block_id = torch::ones({3, 1, 1}, torch::kInt32);
+        }
+        root.prepareWorkerCacheIO(inputs);
+        const auto expected = torch::tensor({0, 1, 7, 1, 1, 3, 2, 1, 5}, torch::kInt64).reshape({3, 3});
+        ASSERT_TRUE(torch::equal(inputs.worker_cache_block_generations, expected));
+        ASSERT_NO_THROW(worker.prepareWorkerCacheIO(inputs));
+        for (size_t group = 0; group < tags.size(); ++group) {
+            const auto generation = expected_generations[group];
+            EXPECT_NO_THROW(worker.worker_cache_io_fence_->lockTransfer({{tags[group], 1, generation}}));
+            EXPECT_THROW(worker.worker_cache_io_fence_->lockTransfer({{tags[group], 1, generation - 1}}),
+                         std::runtime_error);
+        }
+    }
+    for (const auto& pool : pools) {
+        pool->decRef(1);
+    }
 }
 
 TEST_F(KVCacheManagerTest, WarmupPreservesExplicitChargedIndependentPoolPolicy) {

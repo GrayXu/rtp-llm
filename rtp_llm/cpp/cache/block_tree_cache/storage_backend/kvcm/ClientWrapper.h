@@ -10,6 +10,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <thread>
+#include <optional>
 #include "kvcm_client/meta_client.h"
 #include "kvcm_client/transfer_client.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/ClientFactory.h"
@@ -29,12 +30,14 @@ public:
     struct PoolRegistration {
         kv_cache_manager::RegistSpan span;
         std::string                  location_spec_name;
+        std::optional<kv_cache_manager::SharedMemoryRegistration> shared_memory;
     };
     virtual bool initForPools(const ConfigMap&                     config_map,
                               kv_cache_manager::RoleType           role,
                               const std::vector<PoolRegistration>& registrations,
                               const std::vector<std::string>&      tags);
     virtual void shutdown() noexcept;
+    virtual bool hasTransferClientForTag(const std::string& tag) const;
     // for meta client
     virtual std::pair<bool, kv_cache_manager::Locations> match(const std::string&                      unique_id,
                                                                const std::string&                      trace_id,
@@ -132,7 +135,7 @@ private:
     std::shared_mutex rr_mutex_;
     // Transfer I/O remains available while metadata clients are re-registering.
     // Shutdown takes this lock exclusively before destroying the pool transfer clients.
-    std::shared_mutex transfer_mutex_;
+    mutable std::shared_mutex transfer_mutex_;
 
     // when slaver reaches 3, need reinitAllMetaClients
     std::atomic<int> grpc_error_count_{0};

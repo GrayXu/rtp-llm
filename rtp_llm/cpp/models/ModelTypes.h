@@ -122,6 +122,7 @@ enum GptModelInputIndex : size_t {
     // [group, batch, blocks].
     kvCacheKernelBlockIdRank,
     kvCacheBlockIdRank,
+    workerCacheGenerationRows,
     gptModelInputLength,
 };
 
@@ -169,7 +170,9 @@ torch::Tensor           makeModelInputShapeHintsTensor(const GptModelInputs& inp
 std::array<int64_t, 2>  decodeMtpHiddenStatesShape(int64_t total_numel, int64_t rows);
 std::vector<int64_t> decodeKvBlockTableShape(int64_t rank, int64_t group_num, int64_t batch_size, int64_t max_blocks);
 
-void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallelism_config);
+void tpSyncModelInputs(GptModelInputs&          inputs,
+                       const ParallelismConfig& parallelism_config,
+                       KVCacheManager*          cache_manager = nullptr);
 
 struct MicroBatchInfo {
     size_t prefill_num;

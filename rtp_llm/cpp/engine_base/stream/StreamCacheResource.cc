@@ -123,6 +123,7 @@ int StreamCacheResource::tryReleaseKVBlock(size_t nums) {
                               tierName(target_tier));
             if (target_tier != Tier::NONE) {
                 InsertInfo insert_info{batch_kv_cache_resource_, stream_->completeTokenIdsPtr(), false, target_tier};
+                insert_info.write_remote_from_device = true;
                 size_t     resident_prefix_length = 0;
                 resource_context_.cache_manager->insertIntoCache(insert_info, resident_prefix_length);
             }
@@ -540,6 +541,9 @@ Tier StreamCacheResource::storeTarget() const {
     }
     if (enableDiskCache()) {
         return Tier::DISK;
+    }
+    if (resource_context_.enable_remote_cache) {
+        return Tier::REMOTE;
     }
     return Tier::NONE;
 }

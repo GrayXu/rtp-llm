@@ -10,6 +10,7 @@ IBlockPool::IBlockPool(std::shared_ptr<const BlockPoolConfigBase> config): confi
     RTP_LLM_CHECK(config_ != nullptr);
     RTP_LLM_CHECK(config_->physical_block_count > 1);
     allocated_.assign(config_->physical_block_count, 0);
+    allocation_generations_.assign(config_->physical_block_count, 0);
     tree_refcounts_.assign(config_->physical_block_count, 0);
     for (std::vector<uint32_t>& typed_refcounts : tree_refcounts_by_type_) {
         typed_refcounts.assign(config_->physical_block_count, 0);
@@ -80,6 +81,7 @@ std::optional<BlockIdList> IBlockPool::mallocNoLock(size_t n) {
         const bool was_available = isAvailableNoLock(block);
         assert(was_available);
         allocated_[block]      = 1;
+        ++allocation_generations_[block];
         tree_refcounts_[block] = 0;
         for (std::vector<uint32_t>& typed_refcounts : tree_refcounts_by_type_) {
             typed_refcounts[block] = 0;
@@ -180,6 +182,12 @@ bool IBlockPool::isAllocated(BlockIdxType block) const {
         return false;
     }
     return allocated_[block] != 0;
+}
+
+uint64_t IBlockPool::blockAllocationGeneration(BlockIdxType block) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    checkAllocatedNoLock(block);
+    return allocation_generations_[block];
 }
 
 size_t IBlockPool::totalBlocksNum() const {

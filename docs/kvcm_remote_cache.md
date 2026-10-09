@@ -36,7 +36,7 @@ To override the published artifacts, pass `--repo_env=KVCM_ARTIFACT_MANIFEST=/ab
 
 Bazel validates the source IDs and download hashes. The server archive must also contain the matching `KVCM_SOURCE_ID` marker. Override manifests are tracked as Bazel file inputs, so in-place edits invalidate the affected artifact repositories, including on Bazel 6.4.
 
-The `remote_cache_pace_contract` and `remote_cache_pace_ssd_contract` targets exercise CPU buffers using the selected SDK; their `smoke_kvcm_p1_cpu*` suite names describe the buffer type, not a CPU-only SDK requirement. With the published SDKs, the matching CUDA runtime must be available. Model smoke tests still require a CUDA SDK. CUDA 13 keeps remote cache opt-in: place `--config=remote_kv_cache` after `--config=cuda13` or `--config=cuda13_arm`. An external `KVCM_PACE_FIXTURE` must carry the updated source ID; the PACE provider and consumer revision remains unchanged.
+The `remote_cache_pace_contract` and `remote_cache_pace_ssd_contract` targets exercise CPU buffers using the selected SDK; their `smoke_kvcm_p1_cpu*` suite names describe the buffer type, not a CPU-only SDK requirement. With the published SDKs, the matching CUDA runtime must be available. Model smoke tests still require a CUDA SDK. CUDA 13 keeps remote cache opt-in: place `--config=remote_kv_cache` after `--config=cuda13` or `--config=cuda13_arm`. An external `KVCM_PACE_FIXTURE` must carry a source ID matching `KVCM_SOURCE_ID`. Both PACE provider and consumer must use the PACE revision pinned in `deps/kvcm.bzl`.
 
 SDK packaging must isolate its internal autil/gRPC symbols from RTP to avoid symbol interposition and duplicate destruction. Link with `-Wl,-Bsymbolic` and a version script exporting only the KVCM API (`_ZN16kv_cache_manager*`, `_ZNK16kv_cache_manager*`, `_ZTVN16kv_cache_manager*`, `_ZTIN16kv_cache_manager*`, and `_ZTSN16kv_cache_manager*`), with all other symbols local. Update the RPM hash in the manifest after relinking.
 
@@ -44,6 +44,7 @@ SDK packaging must isolate its internal autil/gRPC symbols from RTP to avoid sym
 
 | Argument / environment variable | Default | Meaning |
 |---|---:|---|
+| `kvcm_remote_layout` / `KVCM_REMOTE_LAYOUT` | `legacy` | Use `canonical_v1` on both ends for asymmetric TP/CP; see [layout and topology requirements](#asymmetric-tpcp) |
 | `kvcm_default_query_type` / `KVCM_DEFAULT_QUERY_TYPE` | 2 | Instance default: 1=batch, 2=prefix, 3=SWA, 4=Mamba |
 | `kvcm_query_type` / `KVCM_QUERY_TYPE` | 0 | Request mode; 0 uses the Instance default |
 | `kvcm_sw_size` / `KVCM_SW_SIZE` | 0 | SWA window in cache keys/blocks; must be positive for SWA |
@@ -51,6 +52,8 @@ SDK packaging must isolate its internal autil/gRPC symbols from RTP to avoid sym
 | `kvcm_min_replica_count` / `KVCM_MIN_REPLICA_COUNT` | 0 | Minimum readable replicas for StartWrite; the server treats 0 as 1 |
 
 Explicit `KVCM_CLIENT_CONFIG` JSON takes precedence over the generated Instance configuration; an omitted `default_query_type` defaults to 2. Requests can override it with `kvcm_query_type`. Each backend binds to one default Instance. Backend-specific queries use batch mode and accept only `kvcm_query_type=0` or `1`; use `kvcm_read_backend_type=0` for regular Mamba/SWA queries.
+
+Custom `block_size`, `location_spec_infos`, and `location_spec_groups` must match the local key token stride, group payload sizes, and group/TP rank mapping. Spec lists within a group may be reordered; a single group may omit the explicit group map.
 
 Set `--kvcm_model_sdk_config` (environment variable `RECO_MODEL_SDK_CONFIG`) for one data backend:
 
@@ -70,7 +73,39 @@ TENT uses an RDMA device slot, so `--no_rdma` disables it. Updating the SDK depe
 
 Batch/SWA misses preserve their original key positions. For layouts containing SWA groups, internal payload matching translates SWA queries to batch queries so FULL locations outside the window remain available; explicit metadata queries retain the requested mode. Reuse requires a complete FULL prefix, final LINEAR state, and complete SWA window across every TP rank; missing URIs do not count as hits. Mixed LINEAR+SWA writes may store the FULL+LINEAR portion first, but reads still require the complete SWA window. Existing IOV, pool/group, FULL+LINEAR, and same-layout TP support is retained.
 
-Generated Instance identities include the default query mode and registered group configuration, so an upgrade may select a new cache namespace. Custom IDs must match the existing server configuration. `KVCacheConfig` uses pickle version 8 with 74 items and reads versions 1-7; communicating processes must use the same build.
+Groups in one Instance must share `cacheKeyTokenStride()`, used as the registered token `block_size`; mismatches reject initialization. Each location spec describes its group's fixed KV/scale payload bytes, which may differ between groups. Multiple standard FULL MHA/MLA groups remain subject to model-layout validation.
+
+In `legacy` mode, generated Instance identities include the default query mode and registered group configuration. Multi-group identities also include tag-sorted per-layer physical layouts and layer ownership, creating a new cache namespace. `canonical_v1` uses a topology-independent namespace and the base token block size; sharded CP requires this format. Single-group identities remain unchanged when their registered token stride is unchanged.
+
+Canonical Instance IDs start with `canonical_v1_` and exclude runtime TP/CP/DP partition sizes. Both ends must agree on model weights, KV dtype, block size, layer/group layout, draft configuration, `CHECKPOINT_PATH`, `BIZ_NAME`, `kvcm_model_extra_info`, and salt. Use distinct `kvcm_model_extra_info` values for different weight quantization or other KV-affecting settings, including weights changed in place: the checkpoint path hash does not verify weight contents.
+
+Custom canonical configuration requires a `canonical_v1_` Instance ID and matching logical specs, groups, block size, and storage `model_deployment`; mismatches fail initialization. Legacy and canonical payloads cannot be mixed. Payload RPCs carry the format and logical shard, and canonical workers reject requests missing these fields.
+
+Custom IDs must match the existing server configuration. `KVCacheConfig` uses pickle version 9 with 75 items and reads versions 1-8. Communicating processes must use the same build.
+
+## Asymmetric TP/CP
+
+Set `--kvcm_remote_layout canonical_v1` on both producer and consumer. It stores logical KV components independently of runtime partitions; the default `legacy` format retains rank-based TP storage. Sharded CP requires `canonical_v1`.
+
+| Layout | Logical storage and topology support |
+|---|---|
+| Typed MHA/GQA/MQA FULL, including INT8/FP8 scales | One spec per global KV head per group, named `v1_F<tag>_h<head>`. Each layer stores K, V, K-scale, then V-scale; kernel pages may span multiple IOVs. Supports TP head conversion and CP round-robin blocks. |
+| Typed MLA FULL | One complete latent/rope record with embedded scales, with one designated writer. Supports replicated components across TP and round-robin CP blocks. |
+| Typed FULL+LINEAR | One state group per global key head, including its value-head SSM state and Q/K/V convolution history. Supports TP state conversion and replicated LINEAR checkpoints with round-robin FULL blocks under CP. |
+| Typed MHA SWA | Converts heads while retaining the window policy. Compact CP SWA rings are rejected at initialization. |
+| Opaque KV/state and DSV4 compressed or fixed-ring components | Rejected at initialization. |
+
+Storage registration uses `model_deployment.tp_size=dp_size=pp_size=1`; RTP assigns payload work to physical workers. Each pool registers its complete span. The SDK self-spec identifies one logical spec readable by the worker; transfers use the pool's logical specs, URIs, and IOVs. This identifier does not establish cross-topology CP host-state/P2P ownership.
+
+Ordinary TP partitions heads by `gcd(global_kv_heads, attention_tp)`, matching weight loading. Contiguous ranks may replicate the same heads: the first replica writes each head and reads populate every replica. CP uses the existing TP worker group with attention TP size 1; arbitrary orthogonal TP×CP execution is unsupported.
+
+FULL sharded CP assigns global block `i` to owner `i % CP` and local slot `i / CP`. The local tree retains virtual blocks covering `block_size * CP` tokens; remote metadata uses fixed token-block keys. Read hits are rounded down to complete consumer CP rounds. Request-finish writes construct global keys before local-tree projection, retaining complete token blocks in a partial CP round and excluding incomplete token blocks.
+
+In the Qwen CP path, rank 0 writes the replicated LINEAR state and every reader replica receives the final checkpoint. Decode's `PREFILL_CP` setting describes the producer topology; Decode uses its own attention TP for FULL/LINEAR storage. P/D transfer partitions independent MHA K/V records by `gcd(global_kv_heads, decode_workers)` and shares partitions across GQA replicas.
+
+`CPKVCachePlan` maps sharded pages for ALL_GATHER, ALL_GATHER_WITH_OVERLAP, and ALLTOALL. Prefix collection precedes asynchronous new-KV communication; only owned pages are written back to persistent sharded pools. This requires temporary buffers and prefix communication.
+
+Canonical layout rejects non-DEVICE groups, incompatible key/physical-block coverage, and PP. Request-finish remote writes use DEVICE sources; shared HOST remote I/O remains a `legacy` path. MTP resolves child-owned physical specs; layers sharing a tag must agree on logical shard count and partition semantics. Existing [HBM event publisher topology restrictions](backend/kv_cache_event_publisher.md) continue to apply.
 
 ## RPC interface
 
@@ -95,13 +130,37 @@ Example protobuf JSON:
 
 With `kvcm_read_backend_type` set, locations are mapped by group/rank into TP payload requests, and their URIs are passed to `TransferClient::LoadKvCaches`. Event URIs describe locations and are not used as payload backends by this integration.
 
+## Request-finish writes
+
+After a request completes successfully, complete KV blocks are stored in the [selected local tier](backend/reuse_kv_cache.md#lookup-and-store-targets). With `ENABLE_REMOTE_CACHE=1` and a successfully initialized backend, remote writes are submitted automatically, including in remote-only deployments. Cache reuse switches still apply. Submitted blocks include the reused prefix but exclude the incomplete tail block; the `StartWrite` mask skips blocks that already have enough replicas.
+
+With HOST selected locally, single-rank KVCM waits for and reuses the completed HOST copy for remote I/O. HOST allocation, queue, or copy failure falls back to DEVICE sources pinned before request release. TP greater than one, other local targets, and backends without HOST reuse use DEVICE sources. Ordinary local DEVICE-to-HOST stores do not trigger remote writes.
+
+Local stores and remote tasks retain their source references until completion or rejection. DEVICE publication is synchronous; HOST/DISK copies and remote writes complete asynchronously. Remote failure does not roll back local cache or change request success. Request completion does not guarantee write admission or remote durability.
+
+## HOST-source writes
+
+`BlockTreeCache::insert(..., Tier::HOST)` accepts populated HOST-only resources for explicit CPU-source writes. The caller must hold a valid pool reference during the call. Direct `StorageBackend` callers initialize tag-bound HOST pools and a HOST buffer resolver, set `StorageRequest::source_tier = Tier::HOST`, then call `prepareWrite` and `write`. Each request uses one source tier; match/read requests still require DEVICE handles.
+
+With KVCM remote cache and HOST cache capacity enabled, HOST pools use fd-backed CUDA-pinned shared memory. A separate bounded pool serves remote reads before HOST-to-DEVICE copying. Its blocks, including reserved block 0, count against the existing HOST budget without changing main-pool allocation order. Missing registration, insufficient read capacity, or incomplete group members fall back to DEVICE reads. HOST cache remains disabled by default; GPU-only configurations allocate no shared HOST regions.
+
+Packed HOST payloads preserve layer and KV/scale order and heterogeneous group/MTP sizes, excluding alignment padding. Shared HOST writes use completed, tree-admitted blocks: each rank resolves the full key path and pins its own block rather than interpreting rank 0's block index locally. Callers must ensure corresponding payloads are ready on every rank, and peers must use the same protocol implementation. Only rank 0 initiates metadata writes.
+
+HOST writes target PACE/TairMempool and reuse persistent clients registered by tag. If HOST registration fails, writes try CPU IOVs through the original client and fail if unsupported by the backend. Registration alone does not guarantee a direct transfer; PACE capability, tiering, cache state, and fallback determine the path. This does not remove GPU-to-DRAM transfers or reduce the PACE consumer's reserved pools.
+
 ## I/O lifetime
+
+HOST writes acquire STORE references before local publication or eviction. Shared writes use pool-backed CPU IOVs; the compatibility HOST path copies IOVs into a transfer-owned snapshot. Both reuse persistent clients and require the SDK completion guarantees below before releasing buffers.
+
+Uncertain local HOST payload completion retains block references within the pool budget. Pre-submission failure or known local success releases local pins even if another rank fails. An uncertain main pool rejects subsequent HOST transfers and writes; an uncertain read pool falls back to DEVICE reads. Uncertain mappings and file descriptors remain alive until process exit.
 
 RTP requires `sdk_config.drain_on_timeout=true`. Caller waits are bounded by `kvcm_get_broadcast_timeout` (read/metadata) and `kvcm_put_broadcast_timeout` (write), including single-rank calls and shutdown. Both must be positive and default to 15s. Allow room above the SDK budgets (12s by default) for metadata and TP dispatch. Timeout returns failure without waiting for submitted I/O; failed reads are not published as reusable cache entries.
 
 On timeout or uncertain completion (SDK transfer errors or failed TP payload RPCs), RTP retains the operation's resources for the process lifetime: controller allocation pins prevent block reuse, and followers retain the backing pools. The affected backend rejects new operations, and shutdown does not wait for retained work. Even transient transfer errors are treated conservatively; restoring remote-cache capacity requires replacing the instance. All TP ranks must run the same version. This bounds caller waits without cancelling backend I/O or releasing memory it may still access.
 
-Writes map offset/bool masks back to the original keys and fill actual URIs into specs in the same order. Writes known to have failed abort through FinishWrite; uncertain writes leave their sessions for server expiry rather than immediately recycling destinations; empty sessions are closed on a best-effort basis, with server expiry as a fallback. PACE fallback preserves the hostname. DRAM uses `PREFER_LOCAL` (0) to avoid colliding with the legacy `ONLY_REMOTE` value 2; SSD uses `LOC_DEFAULT | MEDIA_TYPE_LOCALSSD` (5).
+Worker mirror pools use `WorkerCacheIOFence` to serialize payload access with computation and block copies. GPU completion events order producers before SDK access, allocation generations reject delayed RPCs for recycled block IDs, and payload RPCs participate in backend shutdown accounting. The fence wait budget is the greater of 30 seconds and twice the maximum SDK/RPC timeout (60 seconds with defaults). A timeout fails the operation without bypassing outstanding I/O drain.
+
+Each StartWrite location must contain exactly the selected group's specs (logical shards in `canonical_v1`), all with nonempty URIs. FinishWrite commits only after every worker succeeds and all actual URIs are present. Writes map offset/bool masks back to the original keys and fill actual URIs into specs in the same order. Writes known to have failed abort through FinishWrite; uncertain writes leave their sessions for server expiry rather than immediately recycling destinations; empty sessions are closed on a best-effort basis, with server expiry as a fallback. PACE fallback preserves the hostname. DRAM uses `PREFER_LOCAL` (0) to avoid colliding with the legacy `ONLY_REMOTE` value 2; SSD uses `LOC_DEFAULT | MEDIA_TYPE_LOCALSSD` (5).
 
 ## Server event configuration
 
@@ -113,6 +172,14 @@ See [KV cache event publisher](backend/kv_cache_event_publisher.md) for publishe
 
 ## Supported scope
 
-The integration supports SDK query/management interfaces, backend-specific reads, replica controls, same-layout TP payload routing, and cache event reporting. It uses the existing DEVICE block IOV/group layout. RTP CPU/HOST-source writes, zero-copy, asymmetric TP/CP, and GDR are outside this integration.
+The integration supports SDK query/management interfaces, backend-specific reads, replica controls, same-layout TP payload routing, cache event reporting, explicit CPU/HOST-source writes, and request-finish local/remote writes. Shared HOST registration is supported; actual zero-copy transfer depends on the backend. Asymmetric TP/CP requires opt-in `canonical_v1`; see [supported layouts and restrictions](#asymmetric-tpcp). Shared HOST I/O uses `legacy`. GDR is outside this integration.
 
 Models require matching client/server artifacts and an attention backend and page size supported by the target GPU. Publisher topology limits are documented in [KV cache event publisher](backend/kv_cache_event_publisher.md).
+
+## Test entry points
+
+The component suite is `//rtp_llm/test/smoke:smoke_kvcm_p2_multi_pool`. The manual `//rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/test:kvcm_multi_pool_pace_test` target requires `KVCM_P2_SERVER_ADDRESS` and `KVCM_P2_INSTANCE_GROUP` for a configured KVCM/PACE environment; it verifies payloads through matching and byte-for-byte readback.
+
+Canonical component targets under `//rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/test` are `canonical_cache_layout_test` (logical layout and namespace compatibility), `kvcm_canonical_test` (registration, CP ownership, partial rounds, missing shards, and RPC validation), and `worker_cache_io_fence_test` (access serialization, generations, and producer completion).
+
+`//rtp_llm/test/smoke:smoke_kvcm_p2_gpu` uses the PACE fixture and P/D runner for TP1→TP2, TP2→TP1, and CP2/4→TP1/2. Assertions check structured JSON output and cold/warm cache attribution; they do not measure cross-topology model-quality tolerance. Use the artifact and fixture configuration described above.

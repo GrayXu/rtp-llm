@@ -43,6 +43,7 @@ struct KVCMBroadcastState {
     std::vector<RemoteOperationRequestPB> requests;
     bool                                  fail{false};
     std::function<void()>                 before_reply;
+    std::function<bool(const RemoteOperationRequestPB&, RemoteOperationResponsePB&)> execute;
 };
 
 class KVCMBroadcastRpcService final: public RpcService::Service {
@@ -59,6 +60,10 @@ public:
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
             state_->requests.push_back(remote_request);
+        }
+        if (state_->execute) {
+            const bool success = state_->execute(remote_request, *response->mutable_remote_response());
+            return success ? grpc::Status::OK : grpc::Status(grpc::StatusCode::INTERNAL, "worker backend failed");
         }
         if (state_->fail) {
             return grpc::Status(grpc::StatusCode::INTERNAL, "injected KVCM broadcast failure");

@@ -64,7 +64,10 @@ class PaceFixture:
             raise ValueError("PACE SSD smoke requires an SSD-enabled external Provider")
         self.backend = backend
         self.storage_type = 3 if backend == "pace" else 9
-        self.media_type = 2 if backend == "pace" else 5
+        self.media_type = self.config.get("media_type", 2 if backend == "pace" else 5)
+        allowed_media_types = (0, 2) if backend == "pace" else (5,)
+        if type(self.media_type) is not int or self.media_type not in allowed_media_types:
+            raise ValueError(f"Unsupported media_type for {backend}: {self.media_type}")
         self.instance_group = ""
 
     def check_services(self):

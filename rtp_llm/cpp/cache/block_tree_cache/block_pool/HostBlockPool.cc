@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <sstream>
+#include <limits>
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -77,7 +78,17 @@ HostBlockPool::HostBlockPool(std::shared_ptr<const HostBlockPoolConfig> config):
     RTP_LLM_CHECK(config->pool_type == BlockPoolType::HOST);
 }
 
-HostBlockPool::~HostBlockPool() = default;
+HostBlockPool::~HostBlockPool() {
+    if (backing_ && backing_->fd() >= 0 && initialized()) {
+        const size_t quarantined = referencedBlocksNum(BlockTreeRefType::STORE)
+                                   + referencedBlocksNum(BlockTreeRefType::LOAD);
+        if (quarantined != 0) {
+            RTP_LLM_LOG_WARNING("HOST pool [%s] retains %zu uncertain I/O blocks and %zu pinned bytes until process exit",
+                                poolName().c_str(), quarantined, backing_->size());
+            backing_->preserveUntilProcessExit();
+        }
+    }
+}
 
 const HostBlockPoolConfig& HostBlockPool::config() const {
     return configAs<HostBlockPoolConfig>(BlockPoolType::HOST);
@@ -100,8 +111,10 @@ bool HostBlockPool::init() {
                             cfg.alignment);
 
     // block 0's slot is allocated as backing but is never handed out by malloc().
+    RTP_LLM_CHECK_WITH_INFO(cfg.physical_block_count <= std::numeric_limits<size_t>::max() / cfg.stride_bytes,
+                            "host block pool [%s] backing size overflow", cfg.pool_name.c_str());
     const size_t total_bytes = cfg.physical_block_count * cfg.stride_bytes;
-    backing_.emplace(total_bytes, cfg.alignment, cfg.pool_name);
+    backing_.emplace(total_bytes, cfg.alignment, cfg.pool_name, cfg.shared_memory_for_remote);
     markHostBlockPoolDontDump(cfg.pool_name.c_str(), backing_->data(), total_bytes);
     static constexpr double kBytesPerMB = 1024.0 * 1024.0;
     RTP_LLM_LOG_INFO("backing selected: pool_name=%s payload_bytes=%zu stride_bytes=%zu "
@@ -136,6 +149,26 @@ size_t HostBlockPool::strideBytes() const {
 
 size_t HostBlockPool::blockSizeBytes() const {
     return payloadBytes();
+}
+
+int HostBlockPool::sharedMemoryFd() const {
+    return backing_ ? backing_->fd() : -1;
+}
+
+void* HostBlockPool::sharedMemoryBase() const {
+    return backing_ ? backing_->data() : nullptr;
+}
+
+size_t HostBlockPool::sharedMemorySize() const {
+    return backing_ ? backing_->size() : 0;
+}
+
+void HostBlockPool::markUncertainRemoteIo() {
+    uncertain_remote_io_.store(true, std::memory_order_release);
+}
+
+bool HostBlockPool::hasUncertainRemoteIo() const {
+    return uncertain_remote_io_.load(std::memory_order_acquire);
 }
 
 std::string HostBlockPool::debugString() const {

@@ -266,6 +266,94 @@ TEST(BlockTreeLoaderTest, MatchRefreshesOnlyReusedSuffixForEachGroup) {
     load_context.reset();
 }
 
+TEST(BlockTreeLoaderTest, QuarantinedHostMatchesBecomeMissesWithoutReleasingIoPins) {
+    auto host_pool = makeHostPool(1, 4);
+    auto full     = std::make_shared<FullGroupSet>(
+        std::vector<DeviceBlockPoolPtr>{makeStructuralDevicePool(0)}, host_pool, nullptr);
+    BlockTreeCacheConfig config;
+    config.enable_device_cache = false;
+    config.enable_host_cache   = true;
+    auto cache = block_tree_cache_test::makeBlockTreeCacheForTest({full}, config);
+    ASSERT_NE(cache, nullptr);
+
+    const CacheKeysType keys = {100, 200};
+    std::vector<std::vector<GroupSetResource>> resources(keys.size(), std::vector<GroupSetResource>(1));
+    for (auto& row : resources) {
+        row[0].host_block = full->allocateSingleBlock(Tier::HOST, BlockTreeRefType::CACHE);
+        ASSERT_NE(row[0].host_block, NULL_BLOCK_IDX);
+    }
+    ASSERT_TRUE(insertGroupSetResources(*cache, keys, resources));
+    auto initial = cache->match(keys);
+    ASSERT_NE(initial.async_context, nullptr);
+    EXPECT_EQ(initial.async_context->matchedBlocks(Tier::HOST), keys.size());
+    ASSERT_TRUE(initial.async_context->abortPending());
+    initial.async_context.reset();
+
+    const auto pinned_block = resources.front()[0].host_block;
+    host_pool->incTreeRef(pinned_block, BlockTreeRefType::STORE);
+    host_pool->markUncertainRemoteIo();
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const auto result = cache->match(keys);
+        EXPECT_EQ(result.matched_device_blocks, 0u);
+        EXPECT_TRUE(result.matched_device_resources.empty());
+        EXPECT_EQ(result.async_context, nullptr);
+        EXPECT_EQ(host_pool->referencedBlocksNum(BlockTreeRefType::LOAD), 0u);
+        EXPECT_EQ(host_pool->referencedBlocksNum(BlockTreeRefType::STORE), 1u);
+        EXPECT_EQ(host_pool->treeRefCount(pinned_block), 2u);
+        const auto path = cache->tree()->findNode(keys);
+        ASSERT_EQ(path.size(), keys.size());
+        EXPECT_EQ(path.front()->group_set_resources[0].host_block, pinned_block);
+        EXPECT_EQ(path.front()->group_set_resources[0].transfer_state, GroupSetTransferState::IDLE);
+    }
+    cache.reset();
+    EXPECT_EQ(host_pool->treeRefCount(pinned_block), 1u);
+    // This test owns the simulated I/O; release it only after checking teardown.
+    host_pool->decTreeRef(pinned_block, BlockTreeRefType::STORE);
+}
+
+TEST(BlockTreeLoaderTest, QuarantinedHostHolesPreserveFullSwaAndLinearMatchRules) {
+    for (const auto type : {CacheGroupType::FULL, CacheGroupType::SWA, CacheGroupType::LINEAR}) {
+        SCOPED_TRACE(static_cast<int>(type));
+        auto host_pool   = makeHostPool(1, 4);
+        auto device_pool = makeStructuralDevicePool(0);
+        const std::vector<DeviceBlockPoolPtr> pools{device_pool};
+        GroupSetPtr group;
+        if (type == CacheGroupType::FULL) {
+            group = std::make_shared<FullGroupSet>(pools, host_pool, nullptr);
+        } else if (type == CacheGroupType::SWA) {
+            group = std::make_shared<SWAGroupSet>(2, 1, pools, host_pool, nullptr);
+        } else {
+            group = std::make_shared<LinearGroupSet>(pools, host_pool, nullptr);
+        }
+        BlockTreeCacheConfig config;
+        config.enable_device_cache = true;
+        config.enable_host_cache   = true;
+        auto cache = block_tree_cache_test::makeBlockTreeCacheForTest({group}, config);
+        ASSERT_NE(cache, nullptr);
+
+        const CacheKeysType keys = {100, 200, 300};
+        std::vector<std::vector<GroupSetResource>> resources(keys.size(), std::vector<GroupSetResource>(1));
+        resources[0][0].host_block = group->allocateSingleBlock(Tier::HOST, BlockTreeRefType::CACHE);
+        ASSERT_NE(resources[0][0].host_block, NULL_BLOCK_IDX);
+        // Structural device pools already reserve their logical block IDs.
+        resources[1][0].device_blocks = {1};
+        resources[2][0].device_blocks = {2};
+        ASSERT_TRUE(insertGroupSetResources(*cache, keys, resources));
+        host_pool->markUncertainRemoteIo();
+
+        for (const size_t count : {size_t{2}, size_t{3}}) {
+            auto result = cache->match(CacheKeysType(keys.begin(), keys.begin() + count));
+            const size_t expected = type == CacheGroupType::LINEAR || (type == CacheGroupType::SWA && count == 3) ?
+                                        count : 0;
+            EXPECT_EQ(result.matched_device_blocks, expected);
+            EXPECT_EQ(result.async_context, nullptr);
+            for (const auto& resource : result.matched_device_resources) {
+                group->unreferenceBlocks(resource);
+            }
+        }
+    }
+}
+
 TEST(BlockTreeLoaderTest, DiskTransferFailureInstallsNoLoadTargets) {
     if (!cudaAvailable()) {
         GTEST_SKIP() << "CUDA not available";

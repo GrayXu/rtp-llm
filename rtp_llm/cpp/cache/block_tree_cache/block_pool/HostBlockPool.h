@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <string>
@@ -14,6 +15,7 @@ struct HostBlockPoolConfig: public BlockPoolConfigBase {
     size_t payload_bytes{0};
     size_t stride_bytes{0};
     size_t alignment{4096};
+    bool   shared_memory_for_remote{false};
 };
 
 struct HostBlockBuffer {
@@ -43,6 +45,11 @@ public:
     size_t payloadBytes() const;
     size_t strideBytes() const;
     size_t blockSizeBytes() const override;
+    int    sharedMemoryFd() const;
+    void*  sharedMemoryBase() const;
+    size_t sharedMemorySize() const;
+    void markUncertainRemoteIo();
+    bool hasUncertainRemoteIo() const;
 
     std::string debugString() const override;
 
@@ -51,6 +58,7 @@ private:
 
 private:
     std::optional<AlignedHostMemory> backing_;
+    std::atomic<bool> uncertain_remote_io_{false};
 };
 
 }  // namespace rtp_llm

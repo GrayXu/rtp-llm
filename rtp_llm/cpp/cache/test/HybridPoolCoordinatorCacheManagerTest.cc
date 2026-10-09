@@ -690,7 +690,14 @@ TEST_F(HybridPoolCoordinatorCacheManagerTest, StorageRoundTripMapsCpCanonicalFul
                         request_keys,
                         /*reader_seq_len=*/41,
                         cp_mapper,
-                        {{"linear", "full"}, {"linear", "full"}, {"linear", "full"}, {"linear", "full"}},
+                        {{"full"},
+                         {"linear", "full"},
+                         {"full"},
+                         {"linear", "full"},
+                         {"full"},
+                         {"linear", "full"},
+                         {"full"},
+                         {"linear", "full"}},
                         {{"full"}, {"full"}, {"full"}, {"linear", "full"}});
 }
 
@@ -1718,6 +1725,9 @@ TEST_F(HybridPoolCoordinatorCacheManagerTest, InitMallocRollbackReleasesLowerTie
         }
     }
     cache->insert(cached_keys, slots, Tier::HOST);
+    for (const auto& [group_set, source_block] : host_sources) {
+        group_set->releaseSingleBlock(Tier::HOST, source_block, BlockTreeRefType::CACHE);
+    }
 
     const auto counters_before = snapshotPoolCounters(allocator);
     for (const auto& [group_set, source_block] : host_sources) {

@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <cstring>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 #include "gtest/gtest.h"
 
@@ -113,6 +115,34 @@ TEST(HostBlockPoolTest, InitAllocatesPinnedMemory) {
     auto buffer = pool.blockBuffer(*block);
     EXPECT_NE(buffer.addr, nullptr);
 }
+
+#if USING_CUDA
+TEST(HostBlockPoolTest, SharedBackingUsesThePinnedBlockBytes) {
+    auto config = makeConfig();
+    config->shared_memory_for_remote = true;
+    HostBlockPool pool(config);
+    ASSERT_TRUE(pool.init());
+    ASSERT_GE(pool.sharedMemoryFd(), 0);
+    ASSERT_NE(pool.sharedMemoryBase(), nullptr);
+    EXPECT_EQ(pool.sharedMemorySize(), config->physical_block_count * config->stride_bytes);
+    struct stat info {};
+    ASSERT_EQ(fstat(pool.sharedMemoryFd(), &info), 0);
+    EXPECT_EQ(static_cast<size_t>(info.st_size), pool.sharedMemorySize());
+    auto* alias = static_cast<uint8_t*>(mmap(nullptr,
+                                             pool.sharedMemorySize(),
+                                             PROT_READ | PROT_WRITE,
+                                             MAP_SHARED,
+                                             pool.sharedMemoryFd(),
+                                             0));
+    ASSERT_NE(alias, MAP_FAILED);
+    const auto block = pool.malloc();
+    ASSERT_TRUE(block.has_value());
+    auto* payload = static_cast<uint8_t*>(pool.blockBuffer(*block).addr);
+    payload[0] = 0x5a;
+    EXPECT_EQ(alias[static_cast<size_t>(*block) * config->stride_bytes], 0x5a);
+    EXPECT_EQ(munmap(alias, pool.sharedMemorySize()), 0);
+}
+#endif
 
 TEST(HostBlockPoolTest, HostBufferMemoryIsUsableAndDistinct) {
     auto          config = makeConfig(/*physical_block_count=*/4,

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -120,15 +121,19 @@ public:
     ~BlockTreeCache();
     bool init();
 
-    BlockTreeMatchResult match(const CacheKeysType& cache_keys);
+    BlockTreeMatchResult match(const CacheKeysType&                 cache_keys,
+                               std::shared_ptr<const CacheKeysType> remote_keys = nullptr);
     void                 insert(const CacheKeysType&                              cache_keys,
                                 const std::vector<std::vector<GroupSetResource>>& resources,
-                                Tier                                              target_tier);
+                                Tier                                              target_tier,
+                                std::shared_ptr<const StorageRequest>             remote_write = nullptr);
     // Returns the resident key-prefix count, including nodes that were already resident.
     size_t insert(const CacheKeysType&                              cache_keys,
                   const std::vector<std::vector<GroupSetResource>>& resources,
                   Tier                                              target_tier,
-                  bool                                              is_resident);
+                  bool                                              is_resident,
+                  bool                                              write_remote_from_device = false,
+                  std::shared_ptr<const StorageRequest>             remote_write             = nullptr);
     // Directly reclaim up to num_blocks device blocks belonging to one group set
     // (target_tier = NONE, content dropped). Returns the number actually freed.
     int evictForGroup(std::string_view group_tag, size_t num_blocks);
@@ -145,6 +150,10 @@ public:
                                            const std::vector<MultiNodeResource>& matched_resources) const;
 
     bool executeTransfer(TransferTask task);
+    StorageBackend::HostWriteResolution resolveHostWrite(const CacheKeysType&            keys,
+                                                         const std::vector<std::string>& tags,
+                                                         const std::vector<uint32_t>&    coordinates,
+                                                         int                             timeout_ms);
 
     // Accessors
     BlockTree* tree() const {
@@ -190,6 +199,7 @@ private:
     std::unique_ptr<BlockTreeTaskPool>             task_pool_;
     std::shared_ptr<BlockTreeCacheMetricsReporter> metrics_reporter_;
     mutable std::mutex                             mutex_;
+    std::condition_variable                        host_publication_cv_;
     BlockTreeEvictor                               evictor_;
     bool                                           initialized_{false};
     // Preserve the historical empty-cache wire value. The first successful

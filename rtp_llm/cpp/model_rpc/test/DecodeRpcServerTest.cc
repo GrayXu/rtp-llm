@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
 
@@ -235,6 +236,7 @@ TEST(DecodeRpcServerTest, FailedOrSingleGroupHandoffDoesNotPublishReuse) {
 TEST(DecodeRpcServerTest, CPShardedLoadRequestReadsFromEveryPrefillPeer) {
     DecodeRpcServer server;
     server.resource_.workers = {"decode-0", "decode-1"};
+    server.maga_init_params_.model_config_.attn_config.kv_head_num = 2;
 
     const std::string                                   request_key = "request";
     const std::vector<std::string>                      peer_addrs  = {"prefill-0", "prefill-1"};
@@ -250,7 +252,7 @@ TEST(DecodeRpcServerTest, CPShardedLoadRequestReadsFromEveryPrefillPeer) {
     const auto request = server.constructRemoteLoadRequest(load_context, /*index=*/0, peer_addrs);
 
     EXPECT_EQ(request.prefill_cp_size(), 2);
-    EXPECT_EQ(request.partition_count(), 1);
+    EXPECT_EQ(request.partition_count(), 2);
     EXPECT_EQ(request.partition_id(), 0);
     EXPECT_EQ(request.reuse_block_size(), 3);
     ASSERT_EQ(request.peer_addrs_size(), 2);
@@ -259,6 +261,35 @@ TEST(DecodeRpcServerTest, CPShardedLoadRequestReadsFromEveryPrefillPeer) {
     ASSERT_EQ(request.cache_keys_size(), 2);
     EXPECT_EQ(request.cache_keys(0), 101);
     EXPECT_EQ(request.cache_keys(1), 102);
+}
+
+TEST(DecodeRpcServerTest, CPPageOwnersAndDecodeHeadPartitionsAreIndependent) {
+    for (int cp : {2, 4}) {
+        std::vector<std::string> peers;
+        for (int rank = 0; rank < cp; ++rank) {
+            peers.push_back("prefill-" + std::to_string(rank));
+        }
+        for (int heads : {1, 2, 8}) {
+            for (int workers : {1, 2, 4}) {
+                DecodeRpcServer server;
+                server.maga_init_params_.model_config_.attn_config.kv_head_num = heads;
+                for (int rank = 0; rank < workers; ++rank) {
+                    server.resource_.workers.push_back("decode-" + std::to_string(rank));
+                }
+                const auto context    = makeLoadContext("request", peers, {101, 102}, {}, cp);
+                const int  partitions = std::min(heads, workers);
+                for (int rank = 0; rank < workers; ++rank) {
+                    const auto request = server.constructRemoteLoadRequest(context, rank, peers);
+                    EXPECT_EQ(request.partition_count(), partitions);
+                    EXPECT_EQ(request.partition_id(), rank / (workers / partitions));
+                    ASSERT_EQ(request.peer_addrs_size(), cp);
+                    for (int peer = 0; peer < cp; ++peer) {
+                        EXPECT_EQ(request.peer_addrs(peer), peers[peer]);
+                    }
+                }
+            }
+        }
+    }
 }
 
 TEST(DecodeRpcServerTest, CPShardedMlaLoadRequestReadsFromEveryPrefillPeer) {
@@ -285,6 +316,17 @@ TEST(DecodeRpcServerTest, CPShardedMlaLoadRequestReadsFromEveryPrefillPeer) {
     ASSERT_EQ(request.peer_addrs_size(), 2);
     EXPECT_EQ(request.peer_addrs(0), "prefill-0");
     EXPECT_EQ(request.peer_addrs(1), "prefill-1");
+}
+
+TEST(DecodeRpcServerTest, CPShardedOpaqueLoadRequestKeepsWholeComponents) {
+    DecodeRpcServer server;
+    server.resource_.workers = {"decode-0", "decode-1"};
+    const std::vector<std::string> peers{"prefill-0", "prefill-1"};
+    const auto                     context = makeLoadContext("request", peers, {101}, {}, 2);
+    const auto                     request = server.constructRemoteLoadRequest(context, 1, peers, false);
+    EXPECT_EQ(request.partition_count(), 1);
+    EXPECT_EQ(request.partition_id(), 0);
+    EXPECT_EQ(request.peer_addrs_size(), 2);
 }
 
 TEST(DecodeRpcServerTest, TaggedBlockRowsPreserveReceivedOrderAcrossTopologies) {

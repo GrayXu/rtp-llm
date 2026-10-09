@@ -389,7 +389,8 @@ CoordinatorCacheManager::prepareKVCache(const CacheKeysType&                 cac
         return nullptr;
     }
     const int                         cp_scale     = (cp_mapper && cp_mapper->isSharded()) ? cp_mapper->cpSize() : 1;
-    BlockTreeMatchResult              match_result = block_tree_cache_->match(cache_keys);
+    auto remote_keys = cp_scale > 1 ? std::make_shared<const CacheKeysType>(kv_resource.cacheKeys(0)) : nullptr;
+    BlockTreeMatchResult              match_result = block_tree_cache_->match(cache_keys, std::move(remote_keys));
     std::shared_ptr<LoadAsyncContext> load_context = std::move(match_result.async_context);
     prepared.matched_device_blocks                 = match_result.matched_device_blocks;
     prepared.total_logical_blocks =
@@ -780,8 +781,43 @@ void CoordinatorCacheManager::insertIntoCache(const InsertInfo& insert_info, siz
         if (full_keys.empty()) {
             continue;
         }
+        std::shared_ptr<StorageRequest> remote_write;
+        if (cp_active && block_tree_cache_->isRemoteCacheEnabled()
+            && (insert_info.target_tier == Tier::DEVICE || insert_info.target_tier == Tier::REMOTE
+                || insert_info.write_remote_from_device)) {
+            remote_write                  = std::make_shared<StorageRequest>();
+            remote_write->keys_are_global = true;
+            remote_write->handles.resize(full_keys.size());
+            size_t complete = 0;
+            for (size_t key = 0; key < full_keys.size(); ++key) {
+                bool full_available = true;
+                for (const auto& group_set : block_tree_cache_->groupSets()) {
+                    for (const auto& tag : group_set->groupTags()) {
+                        const auto&  group  = config_.group(tag);
+                        const auto&  blocks = kv_cache_resource->blocks(batch_id, tag);
+                        const size_t position =
+                            group.policy.group_type == CacheGroupType::FULL ? key / cp_mapper->cpSize() : key;
+                        const bool available = position < blocks.size() && !isNullBlockIdx(blocks[position]);
+                        if (available) {
+                            remote_write->handles[key].push_back({tag, blocks[position]});
+                        } else if (group.policy.group_type == CacheGroupType::FULL) {
+                            full_available = false;
+                        }
+                    }
+                }
+                if (!full_available) {
+                    break;
+                }
+                complete = key + 1;
+            }
+            remote_write->keys = std::make_shared<const CacheKeysType>(full_keys.begin(), full_keys.begin() + complete);
+            remote_write->handles.resize(complete);
+        }
         CacheKeysType insert_keys = cp_active ? cpCanonicalCacheKeys(cp_mapper, full_keys) : full_keys;
         if (insert_keys.empty()) {
+            if (remote_write) {
+                block_tree_cache_->insert({}, {}, insert_info.target_tier, remote_write);
+            }
             continue;
         }
         const auto&                                group_sets = block_tree_cache_->groupSets();
@@ -856,16 +892,28 @@ void CoordinatorCacheManager::insertIntoCache(const InsertInfo& insert_info, siz
             }
         }
         if (publish_prefix == 0) {
+            if (remote_write) {
+                block_tree_cache_->insert({}, {}, insert_info.target_tier, remote_write);
+            }
             continue;
         }
         insert_keys.resize(publish_prefix);
         resources.resize(publish_prefix);
         if (insert_info.is_resident) {
-            const size_t batch_resident_prefix_length =
-                block_tree_cache_->insert(insert_keys, resources, insert_info.target_tier, true);
+            const size_t batch_resident_prefix_length = block_tree_cache_->insert(insert_keys,
+                                                                                  resources,
+                                                                                  insert_info.target_tier,
+                                                                                  true,
+                                                                                  insert_info.write_remote_from_device,
+                                                                                  remote_write);
             resident_prefix_length += batch_resident_prefix_length;
         } else {
-            block_tree_cache_->insert(insert_keys, resources, insert_info.target_tier);
+            block_tree_cache_->insert(insert_keys,
+                                      resources,
+                                      insert_info.target_tier,
+                                      false,
+                                      insert_info.write_remote_from_device,
+                                      remote_write);
         }
     }
 }

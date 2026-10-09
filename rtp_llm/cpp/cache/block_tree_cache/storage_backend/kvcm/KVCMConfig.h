@@ -218,11 +218,26 @@ public:
     inline const auto& sdk_wrapper_config() const {
         return sdk_wrapper_config_;
     }
+    int32_t block_size() const {
+        return block_size_;
+    }
+    const auto& location_spec_infos() const {
+        return location_spec_info_map_;
+    }
+    const auto& location_spec_groups() const {
+        return location_spec_groups_;
+    }
     int32_t default_query_type() const {
         return default_query_type_;
     }
     void set_default_query_type(int32_t query_type) {
         default_query_type_ = query_type;
+    }
+    const std::string& instance_id() const {
+        return instance_id_;
+    }
+    const ModelDeployment& model_deployment() const {
+        return model_deployment_;
     }
 
 private:

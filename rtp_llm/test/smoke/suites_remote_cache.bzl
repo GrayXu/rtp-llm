@@ -3,7 +3,7 @@ load("@rtp_deps//:kvcm.bzl", "KVCM_SOURCE_ID")
 
 def _pace_smoke(name, task_info, smoke_args, gpu_type="L20_CU13", backend="pace",
                 kvcm_envs=[], kill_remote=False, metadata_check=True, sleep_time_qr=10,
-                model_events_check=False):
+                model_events_check=False, test_env={}):
     return smoke_test(
         name = name,
         task_info = task_info,
@@ -21,7 +21,7 @@ def _pace_smoke(name, task_info, smoke_args, gpu_type="L20_CU13", backend="pace"
         kill_remote = kill_remote,
         sleep_time_qr = sleep_time_qr,
         # These model smoke targets use L20_CU13 or H20_CU13 (CUDA 13 x86).
-        test_env = {"KVCM_EXPECTED_SOURCE_ID": KVCM_SOURCE_ID, "KVCM_SMOKE_CLIENT_VARIANT": "cuda130_x86"},
+        test_env = dict(test_env, KVCM_EXPECTED_SOURCE_ID = KVCM_SOURCE_ID, KVCM_SMOKE_CLIENT_VARIANT = "cuda130_x86"),
         env_inherit = ["KVCM_PACE_FIXTURE"],
         deps = ["//rtp_llm/cpp/model_rpc/proto:model_rpc_service_py_proto", "//rtp_llm/cpp/model_rpc:grpcio"],
     )
@@ -56,8 +56,9 @@ def _pace_suites():
     tests.append(_pace_smoke(
         "remote_cache_pace_pd", "data/model/qwen25/q_r_l20_remote_cache_pd_sep.json",
         {
-            "prefill": base + " --role_type PREFILL",
-            "decode": base + " --role_type DECODE",
+            # The first P/D request can include cold attention-kernel JIT.
+            "prefill": base + " --role_type PREFILL --load_cache_timeout_ms 120000",
+            "decode": base + " --role_type DECODE --load_cache_timeout_ms 120000",
         }, metadata_check = False, sleep_time_qr = 20,
     ))
     tests.append(_pace_smoke(
@@ -78,12 +79,53 @@ def _pace_suites():
     native.test_suite(name = "smoke_kvcm_p1_cpu", tests = [":remote_cache_pace_contract"])
     native.test_suite(name = "smoke_kvcm_p1_cpu_ssd", tests = [":remote_cache_pace_ssd_contract"])
     native.test_suite(
+        name = "smoke_kvcm_p2_multi_pool",
+        tests = [
+            "//rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/test:" + name
+            for name in ["kvcm_multi_pool_config_test", "kvcm_independent_pool_test", "kvcm_internal_test",
+                         "kvcm_mock_only_full_test", "kvcm_mock_full_linear_test", "client_wrapper_test"]
+        ],
+    )
+    native.test_suite(
         name = "smoke_kvcm_p1_gpu_ssd",
         tests = [_pace_smoke(
             "remote_cache_pace_ssd", "data/model/qwen25/q_r_l20_remote_cache.json",
             base + " --kvcm_read_backend_type 9", backend = "pace_ssd",
         )],
     )
+
+def _pace_asymmetric_suites():
+    base = (
+        "--warm_up 0 --reuse_cache 1 --act_type FP16 --seq_size_per_block 16" +
+        " --enable_remote_cache true --kvcm_remote_layout canonical_v1" +
+        " --enable_cuda_graph 0 --load_cache_timeout_ms 120000" +
+        REMOTE_CACHE_DEVICE_STORE_ARGS
+    )
+    tests = []
+    # Reuse the P/D runner and the structured-output comparison used by the
+    # existing asymmetric CP smoke. Do not compare two sampled generations.
+    for suffix, prefill_args, decode_args, task in [
+        ("tp1_tp2", " --tp_size 1", " --tp_size 2", "tp"),
+        ("tp2_tp1", " --tp_size 2", " --tp_size 1", "tp"),
+        ("cp2_tp1", " --tp_size 2 --cp_rotate_method ALL_GATHER --prefill_cp_kv_cache_sharded 1", " --tp_size 1 --cp_rotate_method PREFILL_CP --prefill_cp_size 2 --prefill_cp_kv_cache_sharded 1", "cp"),
+        ("cp2_tp2", " --tp_size 2 --cp_rotate_method ALL_GATHER --prefill_cp_kv_cache_sharded 1", " --tp_size 2 --cp_rotate_method PREFILL_CP --prefill_cp_size 2 --prefill_cp_kv_cache_sharded 1", "cp"),
+        ("cp4_tp1", " --tp_size 4 --cp_rotate_method ALL_GATHER --prefill_cp_kv_cache_sharded 1", " --tp_size 1 --cp_rotate_method PREFILL_CP --prefill_cp_size 4 --prefill_cp_kv_cache_sharded 1", "cp"),
+        ("cp4_tp2", " --tp_size 4 --cp_rotate_method ALL_GATHER --prefill_cp_kv_cache_sharded 1", " --tp_size 2 --cp_rotate_method PREFILL_CP --prefill_cp_size 4 --prefill_cp_kv_cache_sharded 1", "cp"),
+    ]:
+        tests.append(_pace_smoke(
+            "remote_cache_pace_pd_" + suffix + "_canonical",
+            "data/model/qwen25/q_r_l20_remote_cache_pd_asymmetric_" + task + ".json",
+            {
+                "prefill": base + " --role_type PREFILL" + prefill_args,
+                "decode": base + " --role_type DECODE" + decode_args,
+            },
+            kvcm_envs = ["SEQ_SIZE_PER_BLOCK=16"],
+            metadata_check = False,
+            sleep_time_qr = 20,
+            # A retry could warm the prefix before the cold assertion runs.
+            test_env = {"VISIT_RETRY_TIME": "1"},
+        ))
+    native.test_suite(name = "smoke_kvcm_p2_gpu", tests = tests)
 
 # Remote uploads originate from DEVICE inserts. With no lower local tier, drop
 # every DEVICE tree entry after insertion so later queries must read the backend.
@@ -99,6 +141,7 @@ REMOTE_CACHE_DEVICE_STORE_ARGS = (
 
 def remote_cache_suites():
     _pace_suites()
+    _pace_asymmetric_suites()
 
     # PPU Remote Cache (with KVCM server)
     native.test_suite(

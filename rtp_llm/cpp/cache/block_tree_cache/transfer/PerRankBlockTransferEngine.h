@@ -28,6 +28,8 @@ public:
     virtual ~PerRankBlockTransferEngine();
 
     virtual std::shared_ptr<AsyncContext> execute(TransferTask task);
+    std::shared_ptr<AsyncContext> executeHostToDeviceFromViews(TransferTask                task,
+                                                               std::vector<HostBufferView> hosts);
     void                                  cancelPendingStagingTransfers();
     BlockTreeQueueSizes                   queueSizes() const;
 
