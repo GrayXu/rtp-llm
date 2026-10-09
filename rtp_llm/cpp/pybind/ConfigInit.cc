@@ -453,7 +453,6 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def(py::init<>())
         .def_readwrite("reuse_cache", &KVCacheConfig::reuse_cache)
         .def_readwrite("enable_remote_cache", &KVCacheConfig::enable_remote_cache)
-        .def_readwrite("enable_remote_cache_write_on_finish", &KVCacheConfig::enable_remote_cache_write_on_finish)
         .def_readwrite("enable_device_cache", &KVCacheConfig::enable_device_cache)
         .def_readwrite("multi_task_prompt", &KVCacheConfig::multi_task_prompt)
         .def_readwrite("multi_task_prompt_str", &KVCacheConfig::multi_task_prompt_str)
@@ -632,12 +631,11 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                                       self.kvcm_sw_size,
                                       self.kvcm_read_backend_type,
                                       self.kvcm_min_replica_count,
-                                      self.enable_remote_cache_write_on_finish,
                                       self.kvcm_remote_layout);
             },
             [](py::tuple t) {
                 const py::tuple event_state = t;
-                const bool has_remote_fields = t.size() == 76 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 9;
+                const bool has_remote_fields = t.size() == 75 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 9;
                 const bool has_kvcm_fields = has_remote_fields
                     || (t.size() == 74 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 8);
                 const bool has_event_fields = has_kvcm_fields
@@ -757,8 +755,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                     c.kvcm_min_replica_count  = event_state[73].cast<int32_t>();
                 }
                 if (has_remote_fields) {
-                    c.enable_remote_cache_write_on_finish = event_state[74].cast<bool>();
-                    c.kvcm_remote_layout = event_state[75].cast<std::string>();
+                    c.kvcm_remote_layout = event_state[74].cast<std::string>();
                 }
                 return c;
             }));

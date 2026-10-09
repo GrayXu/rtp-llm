@@ -605,7 +605,6 @@ static void runStorageRoundTrip(const CacheConfig&                           con
     auto          writer         = makeAllocator(config);
     KVCacheConfig remote_config;
     remote_config.enable_remote_cache = true;
-    remote_config.enable_remote_cache_write_on_finish = true;
     writer->setBlockTreeCacheConfigForTest(remote_config);
     writer->setStorageBackendForTest(writer_backend);
     ASSERT_TRUE(writer->init());

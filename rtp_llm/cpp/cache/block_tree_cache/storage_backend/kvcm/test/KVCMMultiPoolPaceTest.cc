@@ -170,7 +170,6 @@ TEST_F(KVCMMultiPoolPaceTest, RequestFinishHostCopyPublishesRemotePayloadWithout
     options.enable_memory_cache = true;
     options.memory_cache_size_mb = 1;
     options.enable_remote_cache = true;
-    options.enable_remote_cache_write_on_finish = true;
     options.kvcm_server_address = address;
     options.kvcm_instance_group = group;
     options.kvcm_instance_id_salt = "finish_host_reuse_" + std::to_string(nonce);

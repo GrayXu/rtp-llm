@@ -39,7 +39,6 @@ struct BlockTreeCacheConfig {
     bool enable_host_cache{false};
     bool enable_disk_cache{false};
     bool enable_remote_cache{false};
-    bool enable_remote_cache_write_on_finish{false};
 
     // ---- Per-tier watermark ----
     using TierWatermark = rtp_llm::TierWatermark;

@@ -50,7 +50,6 @@ SDK packaging must isolate its internal autil/gRPC symbols from RTP to avoid sym
 | `kvcm_sw_size` / `KVCM_SW_SIZE` | 0 | SWA window in cache keys/blocks; must be positive for SWA |
 | `kvcm_read_backend_type` / `KVCM_READ_BACKEND_TYPE` | 0 | 0=regular query; 1=3fs, 2=mooncake, 3=PACE DRAM, 4=NFS, 5=VCNS 3fs, 9=PACE SSD |
 | `kvcm_min_replica_count` / `KVCM_MIN_REPLICA_COUNT` | 0 | Minimum readable replicas for StartWrite; the server treats 0 as 1 |
-| `enable_remote_cache_write_on_finish` / `ENABLE_REMOTE_CACHE_WRITE_ON_FINISH` | false | Submit remote writes on successful request completion; also requires remote cache and reuse enabled |
 
 Explicit `KVCM_CLIENT_CONFIG` JSON takes precedence over the generated Instance configuration; an omitted `default_query_type` defaults to 2. Requests can override it with `kvcm_query_type`. Each backend binds to one default Instance. Backend-specific queries use batch mode and accept only `kvcm_query_type=0` or `1`; use `kvcm_read_backend_type=0` for regular Mamba/SWA queries.
 
@@ -82,7 +81,7 @@ Canonical Instance IDs start with `canonical_v1_` and exclude runtime TP/CP/DP p
 
 Custom canonical configuration requires a `canonical_v1_` Instance ID and matching logical specs, groups, block size, and storage `model_deployment`; mismatches fail initialization. Legacy and canonical payloads cannot be mixed. Payload RPCs carry the format and logical shard, and canonical workers reject requests missing these fields.
 
-Custom IDs must match the existing server configuration. `KVCacheConfig` uses pickle version 9 with 76 items and reads versions 1-8. Older states without the request-finish write flag default it to disabled; communicating processes must use the same build.
+Custom IDs must match the existing server configuration. `KVCacheConfig` uses pickle version 9 with 75 items and reads versions 1-8. Communicating processes must use the same build.
 
 ## Asymmetric TP/CP
 
@@ -100,7 +99,7 @@ Storage registration uses `model_deployment.tp_size=dp_size=pp_size=1`; RTP assi
 
 Ordinary TP partitions heads by `gcd(global_kv_heads, attention_tp)`, matching weight loading. Contiguous ranks may replicate the same heads: the first replica writes each head and reads populate every replica. CP uses the existing TP worker group with attention TP size 1; arbitrary orthogonal TP×CP execution is unsupported.
 
-FULL sharded CP assigns global block `i` to owner `i % CP` and local slot `i / CP`. The local tree retains virtual blocks covering `block_size * CP` tokens; remote metadata uses fixed token-block keys. Read hits are rounded down to complete consumer CP rounds. Request-finish writes construct global keys before local-tree projection, retaining complete token blocks in a partial CP round and excluding incomplete token blocks. The request-finish write gate also applies to canonical writes.
+FULL sharded CP assigns global block `i` to owner `i % CP` and local slot `i / CP`. The local tree retains virtual blocks covering `block_size * CP` tokens; remote metadata uses fixed token-block keys. Read hits are rounded down to complete consumer CP rounds. Request-finish writes construct global keys before local-tree projection, retaining complete token blocks in a partial CP round and excluding incomplete token blocks.
 
 In the Qwen CP path, rank 0 writes the replicated LINEAR state and every reader replica receives the final checkpoint. Decode's `PREFILL_CP` setting describes the producer topology; Decode uses its own attention TP for FULL/LINEAR storage. P/D transfer partitions independent MHA K/V records by `gcd(global_kv_heads, decode_workers)` and shares partitions across GQA replicas.
 
@@ -133,7 +132,7 @@ With `kvcm_read_backend_type` set, locations are mapped by group/rank into TP pa
 
 ## Request-finish writes
 
-Successful request completion stores complete KV blocks in the [selected local tier](backend/reuse_kv_cache.md#lookup-and-store-targets). Remote writes additionally require `ENABLE_REMOTE_CACHE=1` and `ENABLE_REMOTE_CACHE_WRITE_ON_FINISH=1`; the latter defaults to false and can also be enabled with `--enable_remote_cache_write_on_finish true`. Remote-only deployments use the same gate. Disabling it preserves remote lookup/read and explicit writes. Cache reuse controls still apply. Submitted blocks include reused prefixes but exclude the final partial block; the `StartWrite` mask skips blocks with enough replicas.
+请求成功完成后，完整 KV block 会存入[选定的本地层级](backend/reuse_kv_cache.md#lookup-and-store-targets)。设置 `ENABLE_REMOTE_CACHE=1` 并成功初始化后端后，会自动提交远端写入；remote-only 部署也遵循这一行为。缓存复用开关仍然生效。提交范围包含复用前缀，但不包含末尾不完整的 block；`StartWrite` mask 会跳过已有足够副本的 block。
 
 With HOST selected locally, single-rank KVCM waits for and reuses the completed HOST copy for remote I/O. HOST allocation, queue, or copy failure falls back to DEVICE sources pinned before request release. TP greater than one, other local targets, and backends without HOST reuse use DEVICE sources. Ordinary local DEVICE-to-HOST stores do not trigger remote writes.
 

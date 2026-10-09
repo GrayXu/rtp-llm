@@ -308,7 +308,6 @@ protected:
                                    const std::vector<int>& input_tokens = {1, 2, 3, 4, 5, 6}) {
         KVCacheConfig kv_cache_config;
         kv_cache_config.enable_remote_cache   = true;
-        kv_cache_config.enable_remote_cache_write_on_finish = true;
         kv_cache_config.enable_device_cache   = store_target == Tier::DEVICE;
         kv_cache_config.enable_memory_cache   = seed_host || store_target == Tier::HOST;
         kv_cache_config.memory_cache_size_mb  = kv_cache_config.enable_memory_cache ? 1 : 0;

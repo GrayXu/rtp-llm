@@ -224,17 +224,13 @@ size_t BlockTreeCache::insert(const CacheKeysType&                              
     StorageWriteTask storage_write;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        // Both DEVICE and global-key writes initiated at request finish use the opt-in gate.
-        const bool finish_write       = write_remote_from_device || remote_write != nullptr;
-        const bool allow_remote_write = !finish_write || config_.enable_remote_cache_write_on_finish;
-        storage_write                 = storer_.storeLocked(cache_keys,
-                                                            resources,
-                                                            target_tier,
-                                                            is_resident,
-                                                            resident_prefix_length,
-                                                            write_remote_from_device,
-                                                            allow_remote_write,
-                                                            std::move(remote_write));
+        storage_write = storer_.storeLocked(cache_keys,
+                                            resources,
+                                            target_tier,
+                                            is_resident,
+                                            resident_prefix_length,
+                                            write_remote_from_device,
+                                            std::move(remote_write));
     }
     if (storage_write) {
         storage_backend_->write(std::move(storage_write));

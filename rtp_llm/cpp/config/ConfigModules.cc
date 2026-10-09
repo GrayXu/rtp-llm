@@ -151,7 +151,6 @@ std::string KVCacheConfig::to_string() const {
         << "enable_memory_cache: " << enable_memory_cache << "\n"
         << "enable_disk_cache: " << enable_disk_cache << "\n"
         << "enable_remote_cache: " << enable_remote_cache << "\n"
-        << "enable_remote_cache_write_on_finish: " << enable_remote_cache_write_on_finish << "\n"
         << "device_eviction_policy: " << device_eviction_policy << "\n"
         << "memory_eviction_policy: " << memory_eviction_policy << "\n"
         << "disk_eviction_policy: " << disk_eviction_policy << "\n"

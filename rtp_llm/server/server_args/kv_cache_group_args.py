@@ -39,14 +39,6 @@ def init_kv_cache_group_args(parser, kv_cache_config):
         help="控制是否启用Remote Cache的机制。设置为 True 启用 , False 关闭",
     )
     kv_cache_group.add_argument(
-        "--enable_remote_cache_write_on_finish",
-        env_name="ENABLE_REMOTE_CACHE_WRITE_ON_FINISH",
-        bind_to=(kv_cache_config, "enable_remote_cache_write_on_finish"),
-        type=str2bool,
-        default=False,
-        help="Submit remote cache writes when a reusable request finishes successfully; requires remote cache.",
-    )
-    kv_cache_group.add_argument(
         "--kv_cache_event_publisher_type",
         env_name="KV_CACHE_EVENT_PUBLISHER_TYPE",
         bind_to=(kv_cache_config, "kv_cache_event_publisher_type"),

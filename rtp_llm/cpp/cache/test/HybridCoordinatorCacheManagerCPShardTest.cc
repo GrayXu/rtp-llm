@@ -264,7 +264,6 @@ TEST_F(HybridCoordinatorCacheManagerCPShardTest, RemoteWritePreservesGlobalFullK
         auto allocator = std::make_shared<TestHybridTypeCoordinatorCacheManager>(config, AllocationType::DEVICE);
         KVCacheConfig options;
         options.enable_remote_cache                 = true;
-        options.enable_remote_cache_write_on_finish = true;
         allocator->setBlockTreeCacheConfigForTest(options);
         allocator->setStorageBackendForTest(storage);
         allocator->setCPSlotMapper(std::make_shared<CPSlotMapper>(0, 4, 4));
