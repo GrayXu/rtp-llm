@@ -132,7 +132,7 @@ With `kvcm_read_backend_type` set, locations are mapped by group/rank into TP pa
 
 ## Request-finish writes
 
-请求成功完成后，完整 KV block 会存入[选定的本地层级](backend/reuse_kv_cache.md#lookup-and-store-targets)。设置 `ENABLE_REMOTE_CACHE=1` 并成功初始化后端后，会自动提交远端写入；remote-only 部署也遵循这一行为。缓存复用开关仍然生效。提交范围包含复用前缀，但不包含末尾不完整的 block；`StartWrite` mask 会跳过已有足够副本的 block。
+After a request completes successfully, complete KV blocks are stored in the [selected local tier](backend/reuse_kv_cache.md#lookup-and-store-targets). With `ENABLE_REMOTE_CACHE=1` and a successfully initialized backend, remote writes are submitted automatically, including in remote-only deployments. Cache reuse switches still apply. Submitted blocks include the reused prefix but exclude the incomplete tail block; the `StartWrite` mask skips blocks that already have enough replicas.
 
 With HOST selected locally, single-rank KVCM waits for and reuses the completed HOST copy for remote I/O. HOST allocation, queue, or copy failure falls back to DEVICE sources pinned before request release. TP greater than one, other local targets, and backends without HOST reuse use DEVICE sources. Ordinary local DEVICE-to-HOST stores do not trigger remote writes.
 

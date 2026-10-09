@@ -66,8 +66,9 @@ The deployment switches select the local tiers used for lookup and storage. The 
 protocol compatibility, but do not change this local-tier policy.
 
 - **Lookup** may use any enabled local tier, plus the configured remote backend.
-- **请求成功完成后的存储**按 L1 (DEVICE)、L2 (HOST)、L3 (DISK) 的顺序选择一个本地目标。
-  设置 `ENABLE_REMOTE_CACHE=1` 并成功初始化后端后，同时自动提交远端写入。向低层级降级是单独的操作。
+- **Storage after successful completion** selects one local target: L1 (DEVICE), then L2
+  (HOST), then L3 (DISK). With `ENABLE_REMOTE_CACHE=1` and a successfully initialized
+  backend, it also submits remote writes automatically. Lower-tier demotion is a separate operation.
 
 With cache reuse enabled, the local-tier rules are:
 
@@ -82,9 +83,11 @@ With cache reuse enabled, the local-tier rules are:
 | L2, L3 | L2, L3 | L2 |
 | L1, L2, L3 | L1, L2, L3 | L1 |
 
-远端缓存要求部署配置启用并成功初始化后端。remote-only 部署同样支持缓存查询和请求完成后的自动上传。
-上传使用 DEVICE 数据源，或复用满足条件且已完成的 HOST 副本。远端写入是异步的，请求完成不保证远端持久化；
-上传失败不会回滚本地缓存，也不会改变请求的成功状态。
+Remote caching requires a backend enabled and successfully initialized by the deployment
+configuration. Remote-only deployments also support cache lookup and automatic uploads
+after request completion. Uploads use DEVICE sources or reuse eligible, completed HOST
+copies. Remote writes are asynchronous, and request completion does not guarantee remote
+durability. Upload failure does not roll back local cache or change request success.
 
 With the backend available, DEVICE inserts outside request completion also prepare remote
 uploads, including resident system-prompt inserts and duplicate keys.
