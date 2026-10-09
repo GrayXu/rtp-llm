@@ -115,9 +115,9 @@ public:
         std::vector<BlockIdxType>    local_blocks;
     };
     using HostWriteResolver = std::function<HostWriteResolution(const CacheKeysType&,
-                                                                 const std::vector<std::string>&,
-                                                                 const std::vector<uint32_t>&,
-                                                                 int timeout_ms)>;
+                                                                const std::vector<std::string>&,
+                                                                const std::vector<uint32_t>&,
+                                                                int timeout_ms)>;
 
     // An injected executor may be observed by its owner but belongs to only
     // one backend; init rejects binding the same instance a second time.
@@ -126,14 +126,14 @@ public:
 
     // Initialization is single-attempt. A failed start may permanently stop
     // an injected executor; create a fresh backend/executor to retry.
-    bool init(std::shared_ptr<const CacheTopology> topology,
-              PoolsByTag pools_by_tag,
-              BufferResolver buffer_resolver,
-              HostPoolsByTag host_pools_by_tag = {},
-              BufferResolver host_buffer_resolver = {},
-              HostBindingsByTag host_bindings_by_tag = {},
-              HostToDevice host_to_device = {},
-              HostWriteResolver host_write_resolver = {});
+    bool             init(std::shared_ptr<const CacheTopology> topology,
+                          PoolsByTag                           pools_by_tag,
+                          BufferResolver                       buffer_resolver,
+                          HostPoolsByTag                       host_pools_by_tag    = {},
+                          BufferResolver                       host_buffer_resolver = {},
+                          HostBindingsByTag                    host_bindings_by_tag = {},
+                          HostToDevice                         host_to_device       = {},
+                          HostWriteResolver                    host_write_resolver  = {});
     virtual bool requiresSharedHostMemory() const { return false; }
     virtual bool canInitiateHostWrite() const { return false; }
     void match(StorageRequest request, MatchDone done);

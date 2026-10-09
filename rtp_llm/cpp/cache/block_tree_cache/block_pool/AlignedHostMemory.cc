@@ -22,10 +22,10 @@
 
 namespace rtp_llm {
 
-AlignedHostMemory::AlignedHostMemory(size_t usable_bytes,
-                                     size_t alignment,
+AlignedHostMemory::AlignedHostMemory(size_t             usable_bytes,
+                                     size_t             alignment,
                                      const std::string& allocation_name,
-                                     bool shared_memory): size_(usable_bytes) {
+                                     bool               shared_memory): size_(usable_bytes) {
     RTP_LLM_CHECK_WITH_INFO(usable_bytes > 0 && alignment > 0, "invalid host allocation size or alignment");
     if (shared_memory) {
 #if USING_CUDA && defined(__linux__)

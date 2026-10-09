@@ -757,8 +757,8 @@ public:
     }
 
     bool execute(const RemoteOperationRequestPB& request,
-                 RemoteOperationResponsePB& response,
-                 bool* host_write_started = nullptr) {
+                 RemoteOperationResponsePB&      response,
+                 bool*                           host_write_started = nullptr) {
         const bool host_read = request.op() == REMOTE_OPERATION_READ_HOST;
         const bool host_write = request.op() == REMOTE_OPERATION_WRITE_HOST;
         if (request.op() != REMOTE_OPERATION_READ && request.op() != REMOTE_OPERATION_WRITE
@@ -890,7 +890,7 @@ private:
     bool genHostBlockBuffers(const std::vector<std::string>& tags,
                              const std::vector<int32_t>&     blocks,
                              kv_cache_manager::BlockBuffers& buffers,
-                             bool read_pool) const {
+                             bool                            read_pool) const {
         RTP_LLM_CHECK(tags.size() == blocks.size());
         buffers.reserve(blocks.size());
         for (size_t i = 0; i < blocks.size(); ++i) {
@@ -918,11 +918,11 @@ private:
         return true;
     }
 
-    bool executeHostRead(const RemoteOperationRequestPB&       request,
-                         const std::vector<std::string>&       tags,
-                         const std::vector<int32_t>&           device_blocks,
-                         const kv_cache_manager::UriStrVec&    uris,
-                         RemoteOperationResponsePB&           response) {
+    bool executeHostRead(const RemoteOperationRequestPB&    request,
+                         const std::vector<std::string>&    tags,
+                         const std::vector<int32_t>&        device_blocks,
+                         const kv_cache_manager::UriStrVec& uris,
+                         RemoteOperationResponsePB&         response) {
         using TargetKey = std::pair<uint32_t, size_t>;
         struct Target {
             std::shared_ptr<HostBlockPool> pool;
@@ -1626,9 +1626,10 @@ private:
         return result;
     }
 
-    std::vector<FunctionResponsePB> dispatchRequests(const std::vector<FunctionRequestPB>& requests,
-                                                     int timeout_ms,
-                                                     std::atomic<bool>* local_host_payload_dispatched) {
+    std::vector<FunctionResponsePB>
+    dispatchRequests(const std::vector<FunctionRequestPB>& requests,
+                     int                                   timeout_ms,
+                     std::atomic<bool>*                    local_host_payload_dispatched) {
         if (!broadcast_manager_
             || (requests.size() == 1 && requests.front().remote_request().op() == REMOTE_OPERATION_WRITE_HOST)) {
             RTP_LLM_CHECK_WITH_INFO(

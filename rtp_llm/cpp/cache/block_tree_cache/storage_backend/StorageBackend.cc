@@ -113,11 +113,11 @@ StorageBackend::~StorageBackend() {
 bool StorageBackend::init(std::shared_ptr<const CacheTopology> topology,
                           PoolsByTag                           pools_by_tag,
                           BufferResolver                       buffer_resolver,
-                          HostPoolsByTag host_pools_by_tag,
-                          BufferResolver host_buffer_resolver,
-                          HostBindingsByTag host_bindings_by_tag,
-                          HostToDevice host_to_device,
-                          HostWriteResolver host_write_resolver) {
+                          HostPoolsByTag                       host_pools_by_tag,
+                          BufferResolver                       host_buffer_resolver,
+                          HostBindingsByTag                    host_bindings_by_tag,
+                          HostToDevice                         host_to_device,
+                          HostWriteResolver                    host_write_resolver) {
     if (init_attempted_) {
         RTP_LLM_LOG_ERROR("StorageBackend initialization has already been attempted");
         return false;

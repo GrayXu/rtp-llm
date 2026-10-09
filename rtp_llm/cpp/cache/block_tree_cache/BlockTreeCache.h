@@ -151,10 +151,10 @@ public:
                                            const std::vector<MultiNodeResource>& matched_resources) const;
 
     bool executeTransfer(TransferTask task);
-    StorageBackend::HostWriteResolution resolveHostWrite(const CacheKeysType& keys,
+    StorageBackend::HostWriteResolution resolveHostWrite(const CacheKeysType&            keys,
                                                          const std::vector<std::string>& tags,
-                                                         const std::vector<uint32_t>& coordinates,
-                                                         int timeout_ms);
+                                                         const std::vector<uint32_t>&    coordinates,
+                                                         int                             timeout_ms);
 
     // Accessors
     BlockTree* tree() const {

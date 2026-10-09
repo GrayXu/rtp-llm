@@ -36,7 +36,7 @@ To override the published artifacts, pass `--repo_env=KVCM_ARTIFACT_MANIFEST=/ab
 
 Bazel validates the source IDs and download hashes. The server archive must also contain the matching `KVCM_SOURCE_ID` marker. Override manifests are tracked as Bazel file inputs, so in-place edits invalidate the affected artifact repositories, including on Bazel 6.4.
 
-The `remote_cache_pace_contract` and `remote_cache_pace_ssd_contract` targets exercise CPU buffers using the selected SDK; their `smoke_kvcm_p1_cpu*` suite names describe the buffer type, not a CPU-only SDK requirement. With the published SDKs, the matching CUDA runtime must be available. Model smoke tests still require a CUDA SDK. CUDA 13 keeps remote cache opt-in: place `--config=remote_kv_cache` after `--config=cuda13` or `--config=cuda13_arm`. An external `KVCM_PACE_FIXTURE` must carry the updated source ID; the PACE provider and consumer revision remains unchanged.
+The `remote_cache_pace_contract` and `remote_cache_pace_ssd_contract` targets exercise CPU buffers using the selected SDK; their `smoke_kvcm_p1_cpu*` suite names describe the buffer type, not a CPU-only SDK requirement. With the published SDKs, the matching CUDA runtime must be available. Model smoke tests still require a CUDA SDK. CUDA 13 keeps remote cache opt-in: place `--config=remote_kv_cache` after `--config=cuda13` or `--config=cuda13_arm`. An external `KVCM_PACE_FIXTURE` must carry a source ID matching `KVCM_SOURCE_ID`. Both PACE provider and consumer must use the PACE revision pinned in `deps/kvcm.bzl`.
 
 SDK packaging must isolate its internal autil/gRPC symbols from RTP to avoid symbol interposition and duplicate destruction. Link with `-Wl,-Bsymbolic` and a version script exporting only the KVCM API (`_ZN16kv_cache_manager*`, `_ZNK16kv_cache_manager*`, `_ZTVN16kv_cache_manager*`, `_ZTIN16kv_cache_manager*`, and `_ZTSN16kv_cache_manager*`), with all other symbols local. Update the RPM hash in the manifest after relinking.
 
@@ -50,6 +50,7 @@ SDK packaging must isolate its internal autil/gRPC symbols from RTP to avoid sym
 | `kvcm_sw_size` / `KVCM_SW_SIZE` | 0 | SWA window in cache keys/blocks; must be positive for SWA |
 | `kvcm_read_backend_type` / `KVCM_READ_BACKEND_TYPE` | 0 | 0=regular query; 1=3fs, 2=mooncake, 3=PACE DRAM, 4=NFS, 5=VCNS 3fs, 9=PACE SSD |
 | `kvcm_min_replica_count` / `KVCM_MIN_REPLICA_COUNT` | 0 | Minimum readable replicas for StartWrite; the server treats 0 as 1 |
+| `enable_remote_cache_write_on_finish` / `ENABLE_REMOTE_CACHE_WRITE_ON_FINISH` | false | Submit remote writes on successful request completion; also requires remote cache and reuse enabled |
 
 Explicit `KVCM_CLIENT_CONFIG` JSON takes precedence over the generated Instance configuration; an omitted `default_query_type` defaults to 2. Requests can override it with `kvcm_query_type`. Each backend binds to one default Instance. Backend-specific queries use batch mode and accept only `kvcm_query_type=0` or `1`; use `kvcm_read_backend_type=0` for regular Mamba/SWA queries.
 
@@ -130,25 +131,29 @@ Example protobuf JSON:
 
 With `kvcm_read_backend_type` set, locations are mapped by group/rank into TP payload requests, and their URIs are passed to `TransferClient::LoadKvCaches`. Event URIs describe locations and are not used as payload backends by this integration.
 
-## HOST shared-memory I/O
+## Request-finish writes
 
-With KVCM remote cache and HOST cache capacity enabled, HOST pools use fd-backed CUDA-pinned shared memory. Each group set registers its main cache region. A separate bounded region serves remote reads; its blocks, including reserved block 0, count against the existing HOST budget. Temporary reads therefore do not change main-pool block allocation order. HOST cache remains disabled by default, and GPU-only configurations allocate no shared HOST regions.
+Successful request completion stores complete KV blocks in the [selected local tier](backend/reuse_kv_cache.md#lookup-and-store-targets). Remote writes additionally require `ENABLE_REMOTE_CACHE=1` and `ENABLE_REMOTE_CACHE_WRITE_ON_FINISH=1`; the latter defaults to false and can also be enabled with `--enable_remote_cache_write_on_finish true`. Remote-only deployments use the same gate. Disabling it preserves remote lookup/read and explicit writes. Cache reuse controls still apply. Submitted blocks include reused prefixes but exclude the final partial block; the `StartWrite` mask skips blocks with enough replicas.
 
-Shared HOST writes use completed, tree-admitted blocks. Each rank resolves the full key path and pins its own HOST block; rank 0 block indices are not identities on other ranks. Only rank 0 initiates metadata writes. Remote reads enter the separate HOST region and then use the existing HOST-to-DEVICE transfer. Missing registration, insufficient read capacity, or incomplete group members fall back to DEVICE reads. If HOST registration fails, writes try CPU IOVs through the original client and fail if the backend does not support them.
+With HOST selected locally, single-rank KVCM waits for and reuses the completed HOST copy for remote I/O. HOST allocation, queue, or copy failure falls back to DEVICE sources pinned before request release. TP greater than one, other local targets, and backends without HOST reuse use DEVICE sources. Ordinary local DEVICE-to-HOST stores do not trigger remote writes.
 
-Tags map to contiguous portions of packed HOST blocks in group-set member order. CPU writes reuse registered clients; registration alone does not guarantee a direct transfer. PACE capability, tiering, cache state, and fallback still determine the actual path. This does not remove GPU-to-DRAM transfers or reduce the PACE consumer's reserved pools.
+Local stores and remote tasks retain their source references until completion or rejection. DEVICE publication is synchronous; HOST/DISK copies and remote writes complete asynchronously. Remote failure does not roll back local cache or change request success. Request completion does not guarantee write admission or remote durability.
 
-When local HOST payload completion is uncertain, its block references remain charged to the pool. Pre-submission failures and known local success release local pins even if another rank fails. An uncertain main pool rejects subsequent HOST transfers and writes; an uncertain read pool falls back to DEVICE reads. Uncertain mappings and file descriptors remain alive until process exit. The shared read region is part of the existing budget, not a reduction in physical memory usage.
+## HOST-source writes
+
+`BlockTreeCache::insert(..., Tier::HOST)` accepts populated HOST-only resources for explicit CPU-source writes. The caller must hold a valid pool reference during the call. Direct `StorageBackend` callers initialize tag-bound HOST pools and a HOST buffer resolver, set `StorageRequest::source_tier = Tier::HOST`, then call `prepareWrite` and `write`. Each request uses one source tier; match/read requests still require DEVICE handles.
+
+With KVCM remote cache and HOST cache capacity enabled, HOST pools use fd-backed CUDA-pinned shared memory. A separate bounded pool serves remote reads before HOST-to-DEVICE copying. Its blocks, including reserved block 0, count against the existing HOST budget without changing main-pool allocation order. Missing registration, insufficient read capacity, or incomplete group members fall back to DEVICE reads. HOST cache remains disabled by default; GPU-only configurations allocate no shared HOST regions.
+
+Packed HOST payloads preserve layer and KV/scale order and heterogeneous group/MTP sizes, excluding alignment padding. Shared HOST writes use completed, tree-admitted blocks: each rank resolves the full key path and pins its own block rather than interpreting rank 0's block index locally. Callers must ensure corresponding payloads are ready on every rank, and peers must use the same protocol implementation. Only rank 0 initiates metadata writes.
+
+HOST writes target PACE/TairMempool and reuse persistent clients registered by tag. If HOST registration fails, writes try CPU IOVs through the original client and fail if unsupported by the backend. Registration alone does not guarantee a direct transfer; PACE capability, tiering, cache state, and fallback determine the path. This does not remove GPU-to-DRAM transfers or reduce the PACE consumer's reserved pools.
 
 ## I/O lifetime
 
-When a request reaches `FINISHED` successfully and cache reuse is allowed, complete KV blocks are stored in the highest enabled local tier (DEVICE, then HOST, then DISK). Request-finish remote writes require both `ENABLE_REMOTE_CACHE=1` and `ENABLE_REMOTE_CACHE_WRITE_ON_FINISH=1`; the latter defaults to false and can also be set with `--enable_remote_cache_write_on_finish true`. Remote-only deployments use the same write gate. Disabling it preserves remote lookup/read and explicit writes. Per-request `reuse_cache` and `RTP_LLM_IGNORE_REQUEST_CACHE_SWITCHES` retain their existing behavior.
+HOST writes acquire STORE references before local publication or eviction. Shared writes use pool-backed CPU IOVs; the compatibility HOST path copies IOVs into a transfer-owned snapshot. Both reuse persistent clients and require the SDK completion guarantees below before releasing buffers.
 
-The submission includes available complete blocks, including reused prefixes; the final partial block is not published. Remote writes honor the offset/bool mask returned by `StartWrite` to skip blocks with enough replicas. Local asynchronous stores and remote tasks retain independent source references after request release, releasing them on completion or rejection.
-
-When request-finish remote writes are enabled and the local target is HOST, single-rank KVCM reuses the completed HOST copy for remote I/O. HOST allocation, queue, or copy failure falls back to DEVICE sources pinned before request release. Remote failure does not roll back published HOST cache. TP greater than one, other local tiers, and backends without HOST reuse retain DEVICE writes. Ordinary local DEVICE-to-HOST stores do not trigger remote writes.
-
-Request finish triggers submission; it does not guarantee task admission or remote durability. DEVICE publication is synchronous, while HOST/DISK and remote writes complete independently and asynchronously. Rejection releases temporary references. Remote I/O failure follows the existing `FinishWrite` abort rules without rolling back local cache or changing request success.
+Uncertain local HOST payload completion retains block references within the pool budget. Pre-submission failure or known local success releases local pins even if another rank fails. An uncertain main pool rejects subsequent HOST transfers and writes; an uncertain read pool falls back to DEVICE reads. Uncertain mappings and file descriptors remain alive until process exit.
 
 RTP requires `sdk_config.drain_on_timeout=true`. Caller waits are bounded by `kvcm_get_broadcast_timeout` (read/metadata) and `kvcm_put_broadcast_timeout` (write), including single-rank calls and shutdown. Both must be positive and default to 15s. Allow room above the SDK budgets (12s by default) for metadata and TP dispatch. Timeout returns failure without waiting for submitted I/O; failed reads are not published as reusable cache entries.
 
@@ -168,19 +173,9 @@ See [KV cache event publisher](backend/kv_cache_event_publisher.md) for publishe
 
 ## Supported scope
 
-The integration supports SDK query/management interfaces, backend-specific reads, replica controls, same-layout TP payload routing, cache event reporting, explicit CPU/HOST-source writes, and request-finish local/remote writes. Asymmetric TP/CP requires opt-in `canonical_v1`; see [supported layouts and restrictions](#asymmetric-tpcp). Shared HOST I/O uses `legacy`; direct transfer depends on backend support. GDR is outside this integration. See [HOST-source writes](backend/remote_cache_host_write.md) for the CPU IOV and lifetime contract.
+The integration supports SDK query/management interfaces, backend-specific reads, replica controls, same-layout TP payload routing, cache event reporting, explicit CPU/HOST-source writes, and request-finish local/remote writes. Shared HOST registration is supported; actual zero-copy transfer depends on the backend. Asymmetric TP/CP requires opt-in `canonical_v1`; see [supported layouts and restrictions](#asymmetric-tpcp). Shared HOST I/O uses `legacy`. GDR is outside this integration.
 
 Models require matching client/server artifacts and an attention backend and page size supported by the target GPU. Publisher topology limits are documented in [KV cache event publisher](backend/kv_cache_event_publisher.md).
-
-## Historical acceptance
-
-The source record dated 2026-09-29 describes request-finish commit `0d388aca33`, integrated into the former P1/HOST branch as `4fd756e7bb`. Under CUDA 13.2/SM103, seven component targets reported 209 passing cases with no failures, errors, or skips and with test-result caching disabled: `block_tree_storer_test` (28), `stream_cache_resource_test` (42), `storage_backend_test` (35), `kvcm_mock_only_full_test` (26), `client_wrapper_test` (19), `kvcm_internal_test` (30), and `multi_rank_block_transfer_engine_test` (29).
-
-Those cases covered DEVICE/HOST/DISK/remote-only finish paths, complete blocks and reused prefixes, masks, asynchronous failures, and independent reference release. The historical tree also covered ready HOST and automatic CPU writes after independent DEVICE-to-HOST stores; that automatic trigger was subsequently removed by `a388bc6605`. Request-finish cases checked that HOST completion did not duplicate the remote submission.
-
-The source record also reports an incremental model-library build and ten Qwen2.5-0.5B requests across remote-only, HOST, HOST TP2, DISK, and DEVICE scenarios using the former P1 source lock and paired KVCM/PACE artifacts. HOST/DISK logs confirmed local publication. After watermark eviction removed local reuse, warm requests reused 640 remote tokens; cold reuse and warm local/memory/disk reuse were zero, and outputs matched the strict cold-start baseline.
-
-DISK in that record means the RTP local disk tier; remote storage used PACE/DRAM. Remote SSD, real SDK slow I/O/queue saturation, P/D, cross-layout TP/CP, performance, and full CI were outside that acceptance. These historical results do not validate this transplant or its current V2 artifacts. No compilation or tests have been run for this transplant. See [P1 smoke](kvcm_remote_cache_smoke.md) for smoke entry points and artifact requirements.
 
 ## Test entry points
 

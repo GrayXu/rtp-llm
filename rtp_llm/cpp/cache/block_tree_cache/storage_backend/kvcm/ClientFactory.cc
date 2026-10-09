@@ -23,8 +23,8 @@ ClientFactory::createTransferClient(const std::string& config, const kv_cache_ma
 }
 
 std::unique_ptr<kv_cache_manager::TransferClient>
-ClientFactory::createTransferClient(const std::string& config,
-                                    const kv_cache_manager::InitParams& init_params,
+ClientFactory::createTransferClient(const std::string&                                config,
+                                    const kv_cache_manager::InitParams&               init_params,
                                     const kv_cache_manager::SharedMemoryRegistration& shared_memory) const {
     std::lock_guard<std::mutex> lock(transfer_client_init_mutex);
     return kv_cache_manager::TransferClient::Create(config, init_params, shared_memory);

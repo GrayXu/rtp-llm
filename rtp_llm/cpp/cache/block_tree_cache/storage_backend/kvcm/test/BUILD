@@ -189,9 +189,17 @@ cc_test_wrapper(
     name = "kvcm_multi_pool_config_test",
     testonly = True,
     exec_properties = {"gpu": "A10_CU13"},
-    srcs = ["KVCMMultiPoolConfigTest.cc", "KVCMMockTestBase.h", "MockKVCMClient.h", "MultiPoolTestUtils.h"],
+    srcs = [
+        "KVCMMultiPoolConfigTest.cc",
+        "KVCMMockTestBase.h",
+        "MockKVCMClient.h",
+        "MultiPoolTestUtils.h",
+    ],
     copts = ["-fno-access-control"] + copts(),
-    tags = ["exclusive-if-local"],
+    tags = [
+        "A10_CU13",
+        "exclusive-if-local",
+    ],
     target_compatible_with = select({
         "//:using_remote_kv_cache": [],
         "//conditions:default": ["@platforms//:incompatible"],
@@ -204,9 +212,18 @@ cc_test_wrapper(
     name = "kvcm_multi_pool_pace_test",
     testonly = True,
     exec_properties = {"gpu": "A10_CU13"},
-    srcs = ["KVCMMultiPoolPaceTest.cc", "KVCMMockTestBase.h", "MockKVCMClient.h", "MultiPoolTestUtils.h"],
+    srcs = [
+        "KVCMMultiPoolPaceTest.cc",
+        "KVCMMockTestBase.h",
+        "MockKVCMClient.h",
+        "MultiPoolTestUtils.h",
+    ],
     copts = ["-fno-access-control"] + copts(),
-    tags = ["manual", "exclusive-if-local"],
+    tags = [
+        "A10_CU13",
+        "manual",
+        "exclusive-if-local",
+    ],
     target_compatible_with = select({
         "//:using_remote_kv_cache": [],
         "//conditions:default": ["@platforms//:incompatible"],

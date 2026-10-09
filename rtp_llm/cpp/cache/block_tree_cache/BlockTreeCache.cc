@@ -145,10 +145,10 @@ bool BlockTreeCache::executeTransfer(TransferTask task) {
     return true;
 }
 
-StorageBackend::HostWriteResolution BlockTreeCache::resolveHostWrite(const CacheKeysType& keys,
+StorageBackend::HostWriteResolution BlockTreeCache::resolveHostWrite(const CacheKeysType&            keys,
                                                                      const std::vector<std::string>& tags,
-                                                                     const std::vector<uint32_t>& coordinates,
-                                                                     int timeout_ms) {
+                                                                     const std::vector<uint32_t>&    coordinates,
+                                                                     int                             timeout_ms) {
     if (!storage_backend_ || keys.empty() || tags.empty() || tags.size() != coordinates.size()) {
         return {};
     }

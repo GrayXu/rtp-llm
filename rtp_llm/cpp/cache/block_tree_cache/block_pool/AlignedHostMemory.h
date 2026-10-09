@@ -10,10 +10,10 @@ namespace rtp_llm {
 
 class AlignedHostMemory {
 public:
-    AlignedHostMemory(size_t usable_bytes,
-                      size_t alignment,
+    AlignedHostMemory(size_t             usable_bytes,
+                      size_t             alignment,
                       const std::string& allocation_name,
-                      bool shared_memory = false);
+                      bool               shared_memory = false);
     ~AlignedHostMemory();
 
     AlignedHostMemory(const AlignedHostMemory&) = delete;
