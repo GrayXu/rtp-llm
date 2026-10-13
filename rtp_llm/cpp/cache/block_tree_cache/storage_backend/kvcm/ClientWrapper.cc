@@ -135,8 +135,21 @@ bool ClientWrapper::initImpl(const ConfigMap&                     config_map,
             init_params_.role_type = kv_cache_manager::RoleType::WORKER;
         }
         const auto config_json = autil::legacy::ToJsonString(config_map_.begin()->second);
-        std::vector<std::unique_ptr<kv_cache_manager::TransferClient>> clients;
-        clients.reserve(pool_registrations_.size());
+        // PACE publishes external regions during its first initialization.
+        // The first transfer client owns all GPU registrations.
+        for (size_t index = 1; index < pool_registrations_.size(); ++index) {
+            auto& memory = pool_registrations_[index].memory_registrations;
+            if (!memory) {
+                continue;
+            }
+            auto& first_memory = pool_registrations_.front().memory_registrations;
+            if (!first_memory) {
+                first_memory.emplace();
+            }
+            first_memory->gpu.insert(first_memory->gpu.end(), memory->gpu.begin(), memory->gpu.end());
+            memory.reset();
+        }
+        transfer_clients_.reserve(pool_registrations_.size());
         for (size_t index = 0; index < pool_registrations_.size(); ++index) {
             auto params = init_params_;
             if (index != 0) {
@@ -144,30 +157,29 @@ bool ClientWrapper::initImpl(const ConfigMap&                     config_map,
                 params.regist_span             = &pool_registrations_[index].span;
                 params.self_location_spec_name = pool_registrations_[index].location_spec_name;
             }
-            auto client = pool_registrations_[index].memory_registrations.has_value()
-                              ? client_factory_->createTransferClientWithMemory(
-                                    config_json, params, *pool_registrations_[index].memory_registrations)
-                              : client_factory_->createTransferClient(config_json, params);
+            const auto& memory_registrations = pool_registrations_[index].memory_registrations;
+            auto client = index == 0 && memory_registrations ?
+                          client_factory_->createTransferClientWithMemory(config_json, params, *memory_registrations) :
+                          client_factory_->createTransferClient(config_json, params);
             if (!client) {
                 RTP_LLM_LOG_ERROR("init KVCM transfer client failed for pool %zu", index);
                 return false;
             }
-            clients.push_back(std::move(client));
+            transfer_clients_.push_back(std::move(client));
         }
-        transfer_clients_ = std::move(clients);
-        tag_to_index_     = std::move(pending_tags);
         try {
             reinit_worker_ = std::thread([this] { reinitWorkerLoop(); });
         } catch (const std::exception& error) {
             RTP_LLM_LOG_ERROR("start KVCM re-registration worker failed: %s", error.what());
-            transfer_clients_.clear();
-            tag_to_index_.clear();
             return false;
         }
+        tag_to_index_ = std::move(pending_tags);
         return true;
     };
     const auto clear_failed_init = [&] {
-        transfer_clients_.clear();
+        while (!transfer_clients_.empty()) {
+            transfer_clients_.pop_back();
+        }
         tag_to_index_.clear();
         meta_client_map_.clear();
         subscriber_.reset();
@@ -200,7 +212,10 @@ void ClientWrapper::shutdown() noexcept {
     }
     {
         std::unique_lock<std::shared_mutex> transfer_guard(transfer_mutex_);
-        transfer_clients_.clear();
+        // Drain clients borrowing external regions before destroying their owner.
+        while (!transfer_clients_.empty()) {
+            transfer_clients_.pop_back();
+        }
         tag_to_index_.clear();
     }
     {
@@ -564,7 +579,19 @@ ClientWrapper::saveKvCachesForTagWithStatus(
         RTP_LLM_LOG_ERROR("kvcm client not find transfer client");
         return {kv_cache_manager::ClientErrorCode::ER_CLIENT_NOT_EXISTS, {}};
     }
-    auto [ec, result] = transfer_clients_[slot->second]->SaveKvCaches(uri_str_vec, block_buffers, trace_info);
+    const bool has_cpu_source = std::any_of(block_buffers.begin(), block_buffers.end(), [](const auto& buffer) {
+        return std::any_of(buffer.iovs.begin(), buffer.iovs.end(), [](const auto& iov) {
+            return iov.type == kv_cache_manager::MemoryType::CPU;
+        });
+    });
+    auto* client = transfer_clients_[slot->second].get();
+    auto effective_trace = trace_info;
+    if (has_cpu_source) {
+        effective_trace = std::make_shared<kv_cache_manager::TransferTraceInfo>(
+            trace_info ? *trace_info : kv_cache_manager::TransferTraceInfo{});
+        effective_trace->need_print = false;
+    }
+    auto [ec, result] = client->SaveKvCaches(uri_str_vec, block_buffers, effective_trace);
     if (ec != kv_cache_manager::ClientErrorCode::ER_OK) {
         RTP_LLM_LOG_ERROR("kvcm client saveKvCaches fail, ec [%d]", ec);
     }

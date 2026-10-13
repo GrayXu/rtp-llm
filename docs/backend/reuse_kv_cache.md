@@ -108,6 +108,10 @@ The following arguments have equivalent upper-case environment variables:
 | `--kvcm_min_replica_count` | 0 | Minimum readable replicas for StartWrite; the server treats 0 as 1 |
 
 See [KV cache event publisher](kv_cache_event_publisher.md) for HBM reporting.
+Remote reads always target GPU IOVs. SDK/PACE selects direct, landing or staging; RTP does not
+allocate a separate HOST read pool. The first transfer client registers all required GPU spans
+before the first PACE INIT, and subsequent clients borrow those registrations. Shutdown drains
+borrowers before closing the registration owner.
 
 ### Ignoring request cache switches
 

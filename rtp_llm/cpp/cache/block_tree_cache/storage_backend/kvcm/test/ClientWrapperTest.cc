@@ -6,6 +6,7 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -51,6 +52,37 @@ KVCMConfigPtr makeConfig(bool enable_vipserver, const std::string& endpoint, uin
                                         location_groups,
                                         ModelDeployment());
 }
+
+struct GpuPoolClientTestState {
+    std::unique_ptr<MockClientFactory> factory = std::make_unique<MockClientFactory>();
+    std::unique_ptr<MockSubscriber> subscriber = std::make_unique<MockSubscriber>();
+    std::unique_ptr<kv_cache_manager::MockMetaClient> meta = std::make_unique<kv_cache_manager::MockMetaClient>();
+    std::shared_ptr<int> destroyed = std::make_shared<int>(0);
+    std::array<char, 64> device{};
+    kv_cache_manager::GpuMemorySpan gpu_span{reinterpret_cast<void*>(0x100000), 4096, 3};
+
+    GpuPoolClientTestState() {
+        static const std::string storage_config = "{}";
+        EXPECT_CALL(*meta, GetStorageConfig()).WillOnce(ReturnRef(storage_config));
+        EXPECT_CALL(*subscriber, init(std::vector<std::string>{"direct"})).WillOnce(Return(true));
+        EXPECT_CALL(*subscriber, getAddresses(_)).Times(0);
+        EXPECT_CALL(*factory, createSubscriber(false)).WillOnce(Invoke([this](bool) { return std::move(subscriber); }));
+        EXPECT_CALL(*factory, createMetaClient(_, _)).WillOnce(Invoke([this](const auto&, const auto&) {
+            return std::move(meta);
+        }));
+    }
+
+    bool init(ClientWrapper& wrapper) {
+        kv_cache_manager::ClientMemoryRegistrations memory;
+        memory.gpu.push_back(gpu_span);
+        const std::vector<ClientWrapper::PoolRegistration> registrations{
+            {{device.data(), device.size()}, "tp0_Fgroup", std::move(memory)}};
+        return wrapper.initForPools({{"", makeConfig(false, "direct")}},
+                                     kv_cache_manager::RoleType::HYBRID,
+                                     registrations,
+                                     {"group"});
+    }
+};
 
 std::shared_ptr<ClientWrapper> initializeClient(bool                                   enable_vipserver,
                                                 const std::string&                     endpoint,
@@ -213,6 +245,196 @@ TEST(ClientWrapperTest, TagRoutingUsesRegistrationOrderAndFailedInitPublishesNoR
     }
 }
 
+TEST(ClientWrapperTest, CpuWriteUsesGroupClientAndPreservesTrace) {
+    auto                     factory        = std::make_unique<MockClientFactory>();
+    auto                     subscriber     = std::make_unique<MockSubscriber>();
+    auto                     meta           = std::make_unique<kv_cache_manager::MockMetaClient>();
+    static const std::string storage_config = "{}";
+    EXPECT_CALL(*meta, GetStorageConfig()).WillOnce(ReturnRef(storage_config));
+    EXPECT_CALL(*subscriber, init(std::vector<std::string>{"direct"})).WillOnce(Return(true));
+    EXPECT_CALL(*factory, createSubscriber(false)).WillOnce(Invoke([&](bool) { return std::move(subscriber); }));
+    EXPECT_CALL(*factory, createMetaClient(_, _)).WillOnce(Invoke([&](const auto&, const auto&) {
+        return std::move(meta);
+    }));
+    auto               destroyed = std::make_shared<int>(0);
+    auto               entered   = std::make_shared<std::promise<void>>();
+    auto               started   = entered->get_future();
+    std::promise<void> release;
+    auto               released     = release.get_future().share();
+    auto               observed     = std::make_shared<std::atomic<int>>(0);
+    size_t             client_count = 0;
+    kv_cache_manager::MockTransferClient* group_client = nullptr;
+    EXPECT_CALL(*factory, createTransferClient(_, _))
+        .Times(2)
+        .WillRepeatedly(Invoke([&](const std::string&, const kv_cache_manager::InitParams& params)
+                                   -> std::unique_ptr<kv_cache_manager::TransferClient> {
+            if (++client_count == 1) {
+                return std::make_unique<kv_cache_manager::MockTransferClient>(destroyed);
+            }
+            EXPECT_EQ(params.self_location_spec_name, "tp0_Falpha");
+            EXPECT_EQ(params.role_type, kv_cache_manager::RoleType::WORKER);
+            EXPECT_NE(params.regist_span, nullptr);
+            if (params.regist_span) {
+                EXPECT_EQ(params.regist_span->size, 16u);
+            }
+            EXPECT_EQ(params.storage_configs, storage_config);
+            auto client = std::make_unique<kv_cache_manager::MockTransferClient>(destroyed);
+            group_client = client.get();
+            return client;
+        }));
+    ClientWrapper           wrapper(std::move(factory));
+    std::array<uint8_t, 32> registration{};
+    ASSERT_TRUE(
+        wrapper.initForPools({{"", makeConfig(false, "direct")}},
+                             kv_cache_manager::RoleType::HYBRID,
+                             {{{registration.data(), 16}, "tp0_Fzeta"}, {{registration.data() + 16, 16}, "tp0_Falpha"}},
+                             {"zeta", "alpha"}));
+    uint8_t                        payload = 87;
+    kv_cache_manager::BlockBuffers buffers(1);
+    buffers[0].iovs.push_back({kv_cache_manager::MemoryType::CPU, &payload, 1, false});
+    auto trace        = std::make_shared<kv_cache_manager::TransferTraceInfo>();
+    trace->need_print = true;
+    EXPECT_CALL(*group_client, SaveKvCaches(kv_cache_manager::UriStrVec{"alpha_uri"}, _, _))
+        .WillOnce(Invoke([&](const auto&, const auto& received_buffers, const auto& received_trace) {
+            EXPECT_NE(received_trace, nullptr);
+            EXPECT_NE(received_trace, trace);
+            if (received_trace) {
+                EXPECT_FALSE(received_trace->need_print);
+            }
+            entered->set_value();
+            // Keep the synchronous SDK call active until the test releases it.
+            released.wait();
+            observed->store(*static_cast<uint8_t*>(received_buffers[0].iovs[0].base));
+            return std::make_pair(kv_cache_manager::ER_SDK_TIMEOUT, kv_cache_manager::UriStrVec{});
+        }));
+    block_tree_cache_test::BoundedThread<bool> write(
+        [&] { return wrapper.saveKvCachesForTag("alpha", {"alpha_uri"}, buffers, trace).first; });
+    const auto          started_status = started.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(started_status, std::future_status::ready);
+    EXPECT_EQ(write.waitFor(std::chrono::milliseconds(50)), std::future_status::timeout);
+    release.set_value();
+    ASSERT_EQ(write.waitFor(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_FALSE(write.get());
+    EXPECT_EQ(observed->load(), 87);
+    EXPECT_TRUE(trace->need_print);
+    EXPECT_EQ(*destroyed, 0);
+    wrapper.shutdown();
+    EXPECT_EQ(*destroyed, 2);
+}
+
+TEST(ClientWrapperTest, CpuWriteFailureKeepsRegisteredClientAvailableForGpuWrite) {
+    auto                     factory        = std::make_unique<MockClientFactory>();
+    auto                     subscriber     = std::make_unique<MockSubscriber>();
+    auto                     meta           = std::make_unique<kv_cache_manager::MockMetaClient>();
+    static const std::string storage_config = "{}";
+    auto                     destroyed      = std::make_shared<int>(0);
+    auto                     gpu_client     = std::make_unique<kv_cache_manager::MockTransferClient>(destroyed);
+    EXPECT_CALL(*gpu_client, SaveKvCaches(kv_cache_manager::UriStrVec{"host_uri"}, _, _))
+        .WillOnce(Return(std::make_pair(kv_cache_manager::ER_SDK_TIMEOUT, kv_cache_manager::UriStrVec{})));
+    EXPECT_CALL(*gpu_client, SaveKvCaches(kv_cache_manager::UriStrVec{"gpu_uri"}, _, _))
+        .WillOnce(Return(std::make_pair(kv_cache_manager::ER_OK, kv_cache_manager::UriStrVec{})));
+    EXPECT_CALL(*meta, GetStorageConfig()).WillOnce(ReturnRef(storage_config));
+    EXPECT_CALL(*subscriber, init(std::vector<std::string>{"direct"})).WillOnce(Return(true));
+    EXPECT_CALL(*factory, createSubscriber(false)).WillOnce(Invoke([&](bool) { return std::move(subscriber); }));
+    EXPECT_CALL(*factory, createMetaClient(_, _)).WillOnce(Invoke([&](const auto&, const auto&) {
+        return std::move(meta);
+    }));
+    EXPECT_CALL(*factory, createTransferClient(_, _))
+        .WillOnce(Invoke([&](const auto&, const auto&) -> std::unique_ptr<kv_cache_manager::TransferClient> {
+            return std::move(gpu_client);
+        }));
+    ClientWrapper           wrapper(std::move(factory));
+    std::array<uint8_t, 16> registration{};
+    ASSERT_TRUE(wrapper.initForPools({{"", makeConfig(false, "direct")}},
+                                     kv_cache_manager::RoleType::HYBRID,
+                                     {{{registration.data(), registration.size()}, "tp0_Fdefault"}},
+                                     {"default"}));
+    uint8_t                        payload = 1;
+    kv_cache_manager::BlockBuffers buffers(1);
+    buffers[0].iovs.push_back({kv_cache_manager::MemoryType::CPU, &payload, 1, false});
+    EXPECT_FALSE(wrapper.saveKvCachesForTag("default", {"host_uri"}, buffers).first);
+    EXPECT_EQ(*destroyed, 0);
+    buffers[0].iovs[0].type = kv_cache_manager::MemoryType::GPU;
+    EXPECT_TRUE(wrapper.saveKvCachesForTag("default", {"gpu_uri"}, buffers).first);
+    wrapper.shutdown();
+    EXPECT_EQ(*destroyed, 1);
+}
+
+TEST(ClientWrapperTest, CpuWriteUsesGpuRegisteredGroupClientWithoutHostRegistration) {
+    GpuPoolClientTestState state;
+    kv_cache_manager::MockTransferClient* group_client = nullptr;
+    EXPECT_CALL(*state.factory, createTransferClient(_, _)).Times(0);
+    EXPECT_CALL(*state.factory, createTransferClientWithMemory(_, _, _))
+        .WillOnce(Invoke([&](const std::string&,
+                             const kv_cache_manager::InitParams& params,
+                             const kv_cache_manager::ClientMemoryRegistrations& memory) {
+            EXPECT_EQ(params.role_type, kv_cache_manager::RoleType::HYBRID);
+            EXPECT_EQ(params.self_location_spec_name, "tp0_Fgroup");
+            EXPECT_NE(params.regist_span, nullptr);
+            if (params.regist_span) {
+                EXPECT_EQ(params.regist_span->base, state.device.data());
+                EXPECT_EQ(params.regist_span->size, state.device.size());
+            }
+            EXPECT_EQ(memory.gpu.size(), 1u);
+            if (!memory.gpu.empty()) {
+                EXPECT_EQ(memory.gpu.front().base, state.gpu_span.base);
+                EXPECT_EQ(memory.gpu.front().size, state.gpu_span.size);
+                EXPECT_EQ(memory.gpu.front().device_id, state.gpu_span.device_id);
+            }
+            auto client = std::make_unique<kv_cache_manager::MockTransferClient>(state.destroyed);
+            group_client = client.get();
+            return client;
+        }));
+    ClientWrapper wrapper(std::move(state.factory));
+    ASSERT_TRUE(state.init(wrapper));
+    std::array<uint8_t, 32> payload{};
+    kv_cache_manager::BlockBuffers buffers(1);
+    buffers[0].iovs.push_back({kv_cache_manager::MemoryType::CPU, payload.data(), payload.size(), false});
+    auto trace = std::make_shared<kv_cache_manager::TransferTraceInfo>();
+    trace->need_print = true;
+    EXPECT_CALL(*group_client, SaveKvCaches(kv_cache_manager::UriStrVec{"host_uri"}, _, _))
+        .WillOnce(Invoke([&](const auto&, const auto& received_buffers, const auto& received_trace) {
+            EXPECT_EQ(received_buffers[0].iovs[0].type, kv_cache_manager::MemoryType::CPU);
+            EXPECT_EQ(received_buffers[0].iovs[0].base, payload.data());
+            EXPECT_NE(received_trace, nullptr);
+            EXPECT_NE(received_trace, trace);
+            if (received_trace) {
+                EXPECT_FALSE(received_trace->need_print);
+            }
+            return std::make_pair(kv_cache_manager::ER_OK, kv_cache_manager::UriStrVec{});
+        }));
+    EXPECT_TRUE(wrapper.saveKvCachesForTag("group", {"host_uri"}, buffers, trace).first);
+    EXPECT_TRUE(trace->need_print);
+    wrapper.shutdown();
+    EXPECT_EQ(*state.destroyed, 1);
+}
+
+TEST(ClientWrapperTest, FailedRegistrationOwnerPublishesNoRoutes) {
+    for (bool fail_by_exception : {false, true}) {
+        GpuPoolClientTestState state;
+        EXPECT_CALL(*state.factory, createTransferClient(_, _)).Times(0);
+        EXPECT_CALL(*state.factory, createTransferClientWithMemory(_, _, _))
+            .WillOnce(Invoke([&](const auto&, const auto&, const auto&)
+                                 -> std::unique_ptr<kv_cache_manager::TransferClient> {
+                if (fail_by_exception) {
+                    throw std::runtime_error("external memory registration unavailable");
+                }
+                return nullptr;
+            }));
+        ClientWrapper wrapper(std::move(state.factory));
+        if (fail_by_exception) {
+            EXPECT_THROW(state.init(wrapper), std::runtime_error);
+        } else {
+            EXPECT_FALSE(state.init(wrapper));
+        }
+        kv_cache_manager::BlockBuffers empty_buffers;
+        EXPECT_EQ(wrapper.loadKvCachesForTagWithStatus("group", {}, empty_buffers),
+                  kv_cache_manager::ER_CLIENT_NOT_EXISTS);
+        wrapper.shutdown();
+        EXPECT_EQ(*state.destroyed, 0);
+    }
+}
+
 TEST(ClientWrapperTest, RejectsInvalidConfigBeforeCreatingSubscriberOrClients) {
     auto                         valid      = makeConfig(false, "endpoint");
     auto                         serialized = autil::legacy::ToJsonString(valid);
@@ -287,53 +509,95 @@ TEST(ClientWrapperTest, RecreatesTransferClientForDifferentRegistrationSpan) {
     EXPECT_EQ(*second_destruction_count, 1);
 }
 
-TEST(ClientWrapperTest, ForwardsGpuMemoryRegistrationToTransferClient) {
-    auto  factory        = std::make_unique<MockClientFactory>();
-    auto* factory_ptr    = factory.get();
-    auto  subscriber     = std::make_unique<MockSubscriber>();
-    auto* subscriber_ptr = subscriber.get();
-
-    EXPECT_CALL(*factory_ptr, createSubscriber(false)).WillOnce(Invoke([&subscriber](bool) {
-        return std::move(subscriber);
-    }));
-    EXPECT_CALL(*subscriber_ptr, init(std::vector<std::string>{"direct"})).WillOnce(Return(true));
-    EXPECT_CALL(*subscriber_ptr, getAddresses(_)).Times(0);
-
-    static const std::string storage_config = R"({"sdk_backend_configs":[]})";
-    auto                     meta_client    = std::make_unique<kv_cache_manager::MockMetaClient>();
-    EXPECT_CALL(*meta_client, GetStorageConfig()).WillOnce(ReturnRef(storage_config));
-    EXPECT_CALL(*factory_ptr, createMetaClient(_, _))
-        .WillOnce(Invoke([&meta_client](const std::string&, const kv_cache_manager::InitParams&) {
-            return std::move(meta_client);
-        }));
-    EXPECT_CALL(*factory_ptr, createTransferClient(_, _)).Times(0);
-
-    std::array<char, 64> pool{};
-    auto*                gpu_base = reinterpret_cast<void*>(0x100000);
-    EXPECT_CALL(*factory_ptr, createTransferClientWithMemory(_, _, _))
-        .WillOnce(Invoke([&](const std::string&,
-                             const kv_cache_manager::InitParams& params,
-                             const kv_cache_manager::ClientMemoryRegistrations& registrations) {
-            EXPECT_NE(params.regist_span, nullptr);
-            EXPECT_EQ(registrations.gpu.size(), 1u);
-            if (!registrations.gpu.empty()) {
-                EXPECT_EQ(registrations.gpu.front().base, gpu_base);
-                EXPECT_EQ(registrations.gpu.front().size, 4096u);
-                EXPECT_EQ(registrations.gpu.front().device_id, 3);
+TEST(ClientWrapperTest, RegistersAllGpuPoolsBeforeCreatingClientsAndDestroysOwnerLast) {
+    for (int failure_mode : {0, 1, 2}) {
+        GpuPoolClientTestState state;
+        std::array<char, 64> second_device{}, third_device{};
+        std::vector<size_t> destruction_order;
+        const std::vector<kv_cache_manager::GpuMemorySpan> gpu_spans{
+            {reinterpret_cast<void*>(0x100000), 4096, 3},
+            {reinterpret_cast<void*>(0x200000), 8192, 3},
+            {reinterpret_cast<void*>(0x300000), 2048, 3}};
+        kv_cache_manager::ClientMemoryRegistrations first_memory, second_memory, third_memory;
+        first_memory.gpu.push_back(gpu_spans[0]);
+        second_memory.gpu.push_back(gpu_spans[1]);
+        third_memory.gpu.push_back(gpu_spans[2]);
+        const std::vector<ClientWrapper::PoolRegistration> registrations{
+            {{state.device.data(), state.device.size()}, "tp0_Ffull", std::move(first_memory)},
+            {{second_device.data(), second_device.size()}, "tp0_Fsliding", std::move(second_memory)},
+            {{third_device.data(), third_device.size()}, "tp0_Flast", std::move(third_memory)}};
+        const std::vector<std::string> tags{"full", "sliding", "last"};
+        size_t next_pool = 1;
+        ::testing::InSequence sequence;
+        EXPECT_CALL(*state.factory, createTransferClientWithMemory(_, _, _))
+            .WillOnce(Invoke([&](const std::string&,
+                                 const kv_cache_manager::InitParams& params,
+                                 const kv_cache_manager::ClientMemoryRegistrations& memory) {
+                EXPECT_EQ(params.role_type, kv_cache_manager::RoleType::HYBRID);
+                EXPECT_EQ(params.self_location_spec_name, "tp0_Ffull");
+                EXPECT_EQ(params.regist_span->base, state.device.data());
+                EXPECT_EQ(params.regist_span->size, state.device.size());
+                EXPECT_EQ(memory.gpu.size(), gpu_spans.size());
+                for (size_t index = 0; index < memory.gpu.size() && index < gpu_spans.size(); ++index) {
+                    EXPECT_EQ(memory.gpu[index].base, gpu_spans[index].base);
+                    EXPECT_EQ(memory.gpu[index].size, gpu_spans[index].size);
+                    EXPECT_EQ(memory.gpu[index].device_id, gpu_spans[index].device_id);
+                }
+                auto destroyed = std::shared_ptr<int>(new int(0), [&](int* count) {
+                    EXPECT_EQ(*count, 1);
+                    destruction_order.push_back(0);
+                    delete count;
+                });
+                return std::make_unique<kv_cache_manager::MockTransferClient>(std::move(destroyed));
+            }));
+        EXPECT_CALL(*state.factory, createTransferClient(_, _))
+            .Times(2)
+            .WillRepeatedly(Invoke([&](const std::string&, const kv_cache_manager::InitParams& params)
+                                       -> std::unique_ptr<kv_cache_manager::TransferClient> {
+                const size_t index = next_pool++;
+                EXPECT_EQ(params.role_type, kv_cache_manager::RoleType::WORKER);
+                EXPECT_EQ(params.self_location_spec_name, registrations.at(index).location_spec_name);
+                EXPECT_EQ(params.regist_span->base, registrations.at(index).span.base);
+                EXPECT_EQ(params.regist_span->size, registrations.at(index).span.size);
+                if (index == 2 && failure_mode != 0) {
+                    if (failure_mode == 2) {
+                        throw std::runtime_error("GPU transfer client unavailable");
+                    }
+                    return nullptr;
+                }
+                auto destroyed = std::shared_ptr<int>(new int(0), [&, index](int* count) {
+                    EXPECT_EQ(*count, 1);
+                    destruction_order.push_back(index);
+                    delete count;
+                });
+                return std::make_unique<kv_cache_manager::MockTransferClient>(std::move(destroyed));
+            }));
+        ClientWrapper wrapper(std::move(state.factory));
+        if (failure_mode == 2) {
+            EXPECT_THROW(wrapper.initForPools({{"", makeConfig(false, "direct")}},
+                                             kv_cache_manager::RoleType::HYBRID, registrations, tags),
+                         std::runtime_error);
+        } else {
+            EXPECT_EQ(wrapper.initForPools({{"", makeConfig(false, "direct")}},
+                                           kv_cache_manager::RoleType::HYBRID, registrations, tags),
+                      failure_mode == 0);
+        }
+        if (failure_mode != 0) {
+            kv_cache_manager::BlockBuffers empty_buffers;
+            for (const auto& tag : tags) {
+                EXPECT_EQ(wrapper.loadKvCachesForTagWithStatus(tag, {}, empty_buffers),
+                          kv_cache_manager::ER_CLIENT_NOT_EXISTS);
             }
-            return std::make_unique<kv_cache_manager::MockTransferClient>(std::make_shared<int>(0));
-        }));
-
-    kv_cache_manager::ClientMemoryRegistrations memory_registrations;
-    memory_registrations.gpu.push_back({gpu_base, 4096, 3});
-    const std::vector<ClientWrapper::PoolRegistration> registrations{
-        {{pool.data(), pool.size()}, "tp0_Ffull", std::move(memory_registrations)}};
-    ClientWrapper wrapper(std::move(factory));
-    ASSERT_TRUE(wrapper.initForPools({{"", makeConfig(false, "direct")}},
-                                    kv_cache_manager::RoleType::HYBRID,
-                                    registrations,
-                                    {"full"}));
-    wrapper.shutdown();
+        }
+        if (failure_mode == 0) {
+            EXPECT_TRUE(destruction_order.empty());
+        } else {
+            EXPECT_EQ(destruction_order, (std::vector<size_t>{1, 0}));
+        }
+        wrapper.shutdown();
+        EXPECT_EQ(destruction_order, failure_mode == 0 ? (std::vector<size_t>{2, 1, 0}) :
+                                                        (std::vector<size_t>{1, 0}));
+    }
 }
 
 TEST(ClientWrapperTest, RecreatesSubscriberWhenSwitchingFromDirectToVipServer) {

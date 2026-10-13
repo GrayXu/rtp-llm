@@ -30,6 +30,7 @@ public:
     struct PoolRegistration {
         kv_cache_manager::RegistSpan span;
         std::string                  location_spec_name;
+        // All GPU regions are owned by the first pool's transfer client.
         std::optional<kv_cache_manager::ClientMemoryRegistrations> memory_registrations;
     };
     virtual bool initForPools(const ConfigMap&                     config_map,
@@ -132,12 +133,13 @@ private:
     std::shared_mutex rr_mutex_;
     // Transfer I/O remains available while metadata clients are re-registering.
     // Shutdown takes this lock exclusively before destroying the pool transfer clients.
-    std::shared_mutex transfer_mutex_;
+    mutable std::shared_mutex transfer_mutex_;
 
     // when slaver reaches 3, need reinitAllMetaClients
     std::atomic<int> grpc_error_count_{0};
 
     std::unique_ptr<ClientFactory>                                 client_factory_;
+    // Destroy borrowers from the back before releasing slot 0's GPU registrations.
     std::vector<std::unique_ptr<kv_cache_manager::TransferClient>> transfer_clients_;
     std::unique_ptr<kvcm::Subscriber>                              subscriber_;
 
