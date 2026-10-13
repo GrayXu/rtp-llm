@@ -289,7 +289,25 @@ void NormalEngine::initExecutor(const EngineInitParams&                        p
     }
 }
 
+bool NormalEngine::shouldPollIdleRemoteCache(const ParallelismConfig& parallelism_config,
+                                            bool                     remote_cache_enabled,
+                                            bool                     remote_cache_gdr_enabled,
+                                            bool                     enable_ffn_disaggregate) {
+    // Cross-node TP workers may have an outstanding shape-header receive. Keep
+    // sending empty skip_run rounds so a remote GDR device sync can complete.
+    // DP and FFN disaggregation do not use the same no-model empty-round contract.
+    return parallelism_config.dp_size == 1 && parallelism_config.tp_rank == 0
+           && parallelism_config.tp_size > parallelism_config.local_world_size && remote_cache_enabled
+           && remote_cache_gdr_enabled && !enable_ffn_disaggregate;
+}
+
 void NormalEngine::initScheduler() {
+    const auto block_tree_cache = resource_context_.cache_manager ? resource_context_.cache_manager->blockTreeCache() :
+                                                                   nullptr;
+    const bool need_idle_control = shouldPollIdleRemoteCache(parallelism_config,
+                                                            block_tree_cache && block_tree_cache->isRemoteCacheEnabled(),
+                                                            remoteCacheGdrEnabled(),
+                                                            ffn_disaggregate_config.enable_ffn_disaggregate);
     const auto pdfusion_scheduler_mode =
         parsePDFusionSchedulerMode(runtime_config.fifo_scheduler_config.pdfusion_scheduler_mode);
     if (pdfusion_scheduler_mode == PDFusionSchedulerMode::UNKNOWN) {
@@ -297,8 +315,11 @@ void NormalEngine::initScheduler() {
                             runtime_config.fifo_scheduler_config.pdfusion_scheduler_mode.c_str());
     }
     if (runtime_config.use_batch_decode_scheduler) {
-        scheduler_.reset(new BatchDecodeScheduler(
-            runtime_config, resource_context_.cache_manager, metrics_reporter_, parallelism_config.dp_rank));
+        scheduler_.reset(new BatchDecodeScheduler(runtime_config,
+                                                  resource_context_.cache_manager,
+                                                  metrics_reporter_,
+                                                  parallelism_config.dp_rank,
+                                                  need_idle_control));
         RTP_LLM_LOG_INFO("create batch decode scheduler done");
     } else if (pdfusion_scheduler_mode == PDFusionSchedulerMode::RATIO
                && pd_sep_config.role_type == RoleType::PDFUSION) {
@@ -308,7 +329,9 @@ void NormalEngine::initScheduler() {
                                                     parallelism_config,
                                                     model_specific_config,
                                                     resource_context_.cache_manager,
-                                                    metrics_reporter_));
+                                                    metrics_reporter_,
+                                                    /*max_score_len=*/1,
+                                                    need_idle_control));
         RTP_LLM_LOG_INFO("create pdfusion ratio scheduler done");
     } else {
         if (pdfusion_scheduler_mode == PDFusionSchedulerMode::RATIO) {
@@ -321,7 +344,9 @@ void NormalEngine::initScheduler() {
                                            parallelism_config,
                                            model_specific_config,
                                            resource_context_.cache_manager,
-                                           metrics_reporter_));
+                                           metrics_reporter_,
+                                           /*max_score_len=*/1,
+                                           need_idle_control));
         RTP_LLM_LOG_INFO("create fifo scheduler done");
     }
 }

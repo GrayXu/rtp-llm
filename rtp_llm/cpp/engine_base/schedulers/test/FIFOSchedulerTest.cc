@@ -1,4 +1,5 @@
 #include <chrono>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <algorithm>
@@ -13,6 +14,7 @@
 #define protected public
 #include "rtp_llm/cpp/engine_base/schedulers/FIFOScheduler.h"
 #include "rtp_llm/cpp/engine_base/schedulers/PDFusionRatioScheduler.h"
+#include "rtp_llm/cpp/engine_base/schedulers/BatchDecodeScheduler.h"
 #include "rtp_llm/cpp/cache/test/CacheConfigTestUtils.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
@@ -47,6 +49,67 @@ static PDSepConfig makePDFusionPDSepConfig() {
     PDSepConfig pd_sep_config;
     pd_sep_config.role_type = RoleType::PDFUSION;
     return pd_sep_config;
+}
+
+TEST_F(FIFOSchedulerTest, testIdleControlReturnsEmptyWithoutFakeStreams) {
+    RuntimeConfig       runtime_config;
+    ModelConfig         model_config;
+    PDSepConfig         pd_sep_config;
+    ParallelismConfig   parallelism_config;
+    ModelSpecificConfig model_specific_config;
+    runtime_config.batch_decode_scheduler_config.batch_decode_scheduler_batch_size = 1;
+
+    FIFOScheduler fifo(runtime_config,
+                       model_config,
+                       pd_sep_config,
+                       parallelism_config,
+                       model_specific_config,
+                       nullptr,
+                       nullptr,
+                       1,
+                       true);
+    PDFusionRatioScheduler ratio(runtime_config,
+                                  model_config,
+                                  makePDFusionPDSepConfig(),
+                                  parallelism_config,
+                                  model_specific_config,
+                                  nullptr,
+                                  nullptr,
+                                  1,
+                                  true);
+    BatchDecodeScheduler batch(runtime_config, nullptr, nullptr, 0, true);
+
+    EXPECT_FALSE(fifo.need_fill_fake_stream_);
+    EXPECT_FALSE(ratio.need_fill_fake_stream_);
+    for (SchedulerBase* scheduler : {static_cast<SchedulerBase*>(&fifo),
+                                     static_cast<SchedulerBase*>(&ratio),
+                                     static_cast<SchedulerBase*>(&batch)}) {
+        // Repeat with no transfers or requests: polling must remain active
+        // after an empty round and must never synthesize model work.
+        for (int round = 0; round < 2; ++round) {
+            const auto start = std::chrono::steady_clock::now();
+            auto result_future = std::async(std::launch::async, [scheduler] { return scheduler->schedule(); });
+            const auto wait_status = result_future.wait_for(std::chrono::seconds(1));
+            if (wait_status != std::future_status::ready) {
+                (void)scheduler->stop();
+            }
+            ASSERT_EQ(wait_status, std::future_status::ready);
+            auto result = result_future.get();
+            EXPECT_GE(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(5));
+            ASSERT_TRUE(result.ok());
+            EXPECT_TRUE(result.value().empty());
+            EXPECT_EQ(scheduler->onflightStreams(), 0);
+        }
+    }
+
+    FIFOScheduler default_fifo(
+        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, nullptr);
+    PDFusionRatioScheduler default_ratio(
+        runtime_config, model_config, makePDFusionPDSepConfig(), parallelism_config, model_specific_config, nullptr);
+    BatchDecodeScheduler default_batch(runtime_config, nullptr, nullptr);
+    EXPECT_FALSE(default_fifo.need_idle_control_);
+    EXPECT_FALSE(default_ratio.need_idle_control_);
+    EXPECT_FALSE(default_batch.need_idle_control_);
 }
 
 TEST_F(FIFOSchedulerTest, testSimple) {

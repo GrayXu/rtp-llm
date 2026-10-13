@@ -139,6 +139,19 @@ allocate a separate HOST read pool. The first transfer client registers all requ
 before the first PACE INIT, and subsequent clients borrow those registrations. Shutdown drains
 borrowers before closing the registration owner.
 
+In non-FFN-disaggregated mode, when `dp_size=1`, TP spans nodes, and both remote BlockTree
+cache and GDR are enabled, rank 0 bounds idle scheduler waits to 10 ms. It reuses the empty-stream
+`skip_run` shape-header control round so previously submitted communication can complete.
+FIFO, ratio and Batch use the same derived condition. Polling continues independently of the
+current in-flight transfer count and backend quarantine.
+
+This idle path creates no FakeStream and runs no model forward. It adds approximately 100 empty
+scheduling rounds per second and increases scheduler metric reporting. Normal sends one
+shape-header per round; MTP PDFUSION sends one in prefill and one in decode, for two per round.
+These control rounds consume CPU, GPU and network resources; the cost depends on topology and
+communication time. DP>1 retains its existing FakeStream behavior and scheduling frequency.
+FFN disaggregation retains its existing behavior and is outside this model-free idle path.
+
 DEVICE and explicit HOST STORE references follow the storage task lifetime. On SDK timeout or
 unknown remote completion, affected references remain held until process termination. SDK task
 return and destruction do not prove physical I/O completion. An unknown read completion

@@ -18,7 +18,8 @@ FIFOSchedulerBase::FIFOSchedulerBase(const RuntimeConfig&                   runt
                                      const ParallelismConfig&               parallelism_config,
                                      const ModelSpecificConfig&             model_specific_config,
                                      const std::shared_ptr<KVCacheManager>& cache_manager,
-                                     const kmonitor::MetricsReporterPtr     metrics_reporter):
+                                     const kmonitor::MetricsReporterPtr     metrics_reporter,
+                                     const bool                             need_idle_control):
     pd_sep_config_(pd_sep_config),
     model_specific_config_(model_specific_config),
     cache_manager_(cache_manager),
@@ -28,6 +29,7 @@ FIFOSchedulerBase::FIFOSchedulerBase(const RuntimeConfig&                   runt
     max_inited_kv_cache_streams_(
         std::max<int64_t>(runtime_config.fifo_scheduler_config.max_inited_kv_cache_streams, 0)),
     need_fill_fake_stream_(parallelism_config.dp_size > 1 && parallelism_config.tp_rank == 0),
+    need_idle_control_(need_idle_control),
     metrics_reporter_(metrics_reporter) {}
 
 bool FIFOSchedulerBase::empty() {
