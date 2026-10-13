@@ -374,6 +374,8 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//rtp_llm/cpp/cache/events:kv_cache_event_publisher",
+        ":worker_cache_io_fence",
+        "//rtp_llm/cpp/cuda_graph:cuda_graph_hdrs_lib",
         ":cache_async_context",
         ":cache_core",
         ":cp_slot_mapper",

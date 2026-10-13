@@ -35,6 +35,7 @@ struct MLAKVCacheSpec: public KVCacheSpec {
         const auto seq    = ctx.seq_size_per_block == 0 ? 1 : ctx.seq_size_per_block;
         const auto kernel = SpecBuilder::kernelSeqSizePerBlock(desc, ctx, seq);
         auto       spec   = std::make_shared<MLAKVCacheSpec>(desc.tag, seq, kernel, 1);
+        spec->global_kv_head_num = 1;
         spec->dtype_      = desc.dtype != DataType::TYPE_INVALID ? desc.dtype : ctx.dtype;
         RTP_LLM_CHECK_WITH_INFO(spec->dtype_ != DataType::TYPE_INVALID,
                                 "KVCacheSpecDesc tag=%s cache_type=%d requires valid dtype",

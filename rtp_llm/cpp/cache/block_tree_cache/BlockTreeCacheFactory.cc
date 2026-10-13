@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "rtp_llm/cpp/cache/SingleTypeCacheManager.h"
+#include "rtp_llm/cpp/utils/RemoteCacheConfig.h"
 #include "rtp_llm/cpp/cache/CPSlotMapper.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeTaskPool.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTree.h"
@@ -642,6 +643,18 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
     auto         task_pool           = std::make_unique<BlockTreeTaskPool>(
         static_cast<size_t>(config.task_pool_size), business_queue_size, "BlockTreeCacheTaskPool");
 
+    StorageBackend::HostPoolsByTag               storage_host_pools;
+    std::unordered_map<std::string, GroupSetPtr> storage_host_groups;
+    if (storage_backend) {
+        for (const auto& group_set : group_sets) {
+            if (group_set->hostPool()) {
+                for (const auto& tag : group_set->groupTags()) {
+                    storage_host_pools.emplace(tag, group_set->hostPool());
+                    storage_host_groups.emplace(tag, group_set);
+                }
+            }
+        }
+    }
     auto tree = std::make_unique<BlockTree>(std::move(group_sets));
 
     auto result = std::make_shared<BlockTreeCache>(std::move(tree),
@@ -661,12 +674,39 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
                                     "duplicate storage pool tag=%s",
                                     tags[i].c_str());
         }
+        std::weak_ptr<BlockTreeCache> weak_cache = result;
         RTP_LLM_CHECK_WITH_INFO(
             result->storageBackend()->init(
                 storage_topology,
                 resolver_pools,
                 [storage_config, resolver_pools](int layer_id, const std::string& tag, int block_id) {
                     return resolveStorageBuffers(storage_config, resolver_pools, layer_id, tag, block_id);
+                },
+                std::move(storage_host_pools),
+                [host_groups = std::move(storage_host_groups)](int layer_id, const std::string& tag, int block_id) {
+                    return host_groups.at(tag)->convertHostIndexToBuffer(layer_id, tag, block_id);
+                },
+                [weak_cache, cp_mapper = coordinator_manager->cpSlotMapper(),
+                 canonical = kv_cache_config.kvcm_remote_layout == "canonical_v1"](const CacheKeysType& keys,
+                             const std::vector<std::string>& tags,
+                             const std::vector<uint32_t>& coordinates,
+                             int timeout_ms) {
+                    auto cache = weak_cache.lock();
+                    if (!cache) {
+                        return StorageBackend::HostWriteResolution{};
+                    }
+                    if (!canonical || !cp_mapper || !cp_mapper->isSharded()) {
+                        return cache->resolveHostWrite(keys, tags, coordinates, timeout_ms);
+                    }
+                    auto local_coordinates = coordinates;
+                    for (auto& coordinate : local_coordinates) {
+                        if (coordinate >= keys.size()) {
+                            return StorageBackend::HostWriteResolution{};
+                        }
+                        coordinate /= cp_mapper->cpSize();
+                    }
+                    return cache->resolveHostWrite(
+                        cp_mapper->canonicalCacheKeys(keys), tags, local_coordinates, timeout_ms);
                 }),
             "StorageBackend init failed");
     }

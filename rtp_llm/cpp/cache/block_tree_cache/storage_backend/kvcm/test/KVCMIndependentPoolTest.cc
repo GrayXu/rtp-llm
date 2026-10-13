@@ -2,6 +2,7 @@
 #include "rtp_llm/cpp/cache/CoordinatorCacheManager.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCacheFactory.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/DirectSubscriber.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/test/MultiPoolTestUtils.h"
 #include "rtp_llm/cpp/testing/TestBase.h"
 #include <cuda_runtime.h>
 
@@ -113,8 +114,7 @@ class KVCMIndependentPoolTest: public DeviceTestBase {
 protected:
     void SetUp() override {
         DeviceTestBase::SetUp();
-        auto environment = makeMultiGroupBackendEnvironment("independent_config", 2, 1, 1);
-        config_          = environment.cache_config;
+        config_          = test::makeHeterogeneousRemoteCacheConfig();
         allocator_       = std::make_shared<CoordinatorCacheManager>(config_);
         ASSERT_TRUE(allocator_->init());
         state_ = std::make_shared<PoolTransferState>();
@@ -162,6 +162,9 @@ protected:
                     }
                 }
                 EXPECT_NE(config_.blockSizeBytesForGroup("full0"), config_.blockSizeBytesForGroup("linear0"));
+                EXPECT_NE(config_.blockSizeBytesForGroup("full0"), config_.blockSizeBytesForGroup("full1"));
+                EXPECT_EQ(config_.seq_size_per_block, 8u);
+                EXPECT_GT(config_.group("full1").kvScaleStrideBytes(), 0u);
                 return std::move(meta);
             }));
         static const std::string storage_config = R"({"sdk_backend_configs":[]})";
@@ -234,12 +237,15 @@ protected:
         return cache_ != nullptr;
     }
 
-    StorageRequest request() const {
+    StorageRequest request(CacheKeysType keys = {101}) const {
         StorageRequest result;
-        result.keys    = std::make_shared<CacheKeysType>(CacheKeysType{101});
-        result.handles = {{{config_.groupTags().at(2), blocks_[2]},
-                           {config_.groupTags().at(1), blocks_[1]},
-                           {config_.groupTags().at(0), blocks_[0]}}};
+        result.keys = std::make_shared<CacheKeysType>(std::move(keys));
+        for (size_t key = 0; key < result.keys->size(); ++key) {
+            result.handles.push_back({
+                {config_.groupTags().at(2), refs_[2]->get().at(refs_[2]->get().size() - result.keys->size() + key)},
+                {config_.groupTags().at(1), refs_[1]->get().at(refs_[1]->get().size() - result.keys->size() + key)},
+                {config_.groupTags().at(0), refs_[0]->get().at(refs_[0]->get().size() - result.keys->size() + key)}});
+        }
         return result;
     }
 
@@ -294,6 +300,10 @@ TEST_F(KVCMIndependentPoolTest, FactoryPublishesHeterogeneousSpecsAndRoundTripsE
     EXPECT_EQ(state_->locations[0][1].uri, "full1");
     EXPECT_EQ(state_->locations[0][2].uri, "full0_actual");
     EXPECT_EQ(state_->writes, (std::vector<size_t>{1, 1, 1}));
+    for (size_t group = 0; group < pools_.size(); ++group) {
+        const std::string uri = group == 0 ? "full0_actual" : group == 1 ? "full1" : "linear";
+        EXPECT_EQ(state_->stored.at(uri).size(), config_.blockSizeBytesForGroup(config_.groupTags().at(group)));
+    }
     EXPECT_CALL(*meta_, MatchLocation(_, _, _, _, _, _, _))
         .WillOnce(Return(std::make_pair(kv_cache_manager::ClientErrorCode::ER_OK, state_->locations)));
     fill(0);
@@ -313,6 +323,74 @@ TEST_F(KVCMIndependentPoolTest, FactoryPublishesHeterogeneousSpecsAndRoundTripsE
         EXPECT_EQ(pools_[group]->refCount(blocks_[group]), 1u);
     }
     backend_->shutdown();
+    EXPECT_EQ(state_->destroyed, 3u);
+}
+
+TEST_F(KVCMIndependentPoolTest, BooleanMaskRetainsOriginalKeyAndGroupOffsets) {
+    ASSERT_TRUE(initialize());
+    const auto source = request({101, 102});
+    kv_cache_manager::WriteLocation proposal;
+    proposal.write_session_id = "masked_session";
+    proposal.block_mask = kv_cache_manager::BlockMaskVector{true, false};
+    proposal.locations = {{{"tp0_Llinear0", "linear_102"},
+                           {"tp0_Ffull1", "full1_102"}, {"tp0_Ffull0", "full0_102"}}};
+    EXPECT_CALL(*meta_, StartWrite(_, _, _, _, _, 0))
+        .WillOnce(Return(std::make_pair(kv_cache_manager::ClientErrorCode::ER_OK, proposal)));
+    EXPECT_CALL(*meta_, FinishWrite(_, "masked_session", _, _))
+        .WillOnce(Return(kv_cache_manager::ClientErrorCode::ER_OK));
+    for (size_t key = 0; key < source.handles.size(); ++key) {
+        for (const auto& handle : source.handles[key]) {
+            for (int layer : config_.layerIdsForGroup(handle.tag)) {
+                for (const auto& buffer : allocator_->convertIndexToBuffer(layer, handle.tag, handle.block)) {
+                    ASSERT_EQ(cudaMemset(buffer.addr, 23 + key, buffer.size_bytes), cudaSuccess);
+                }
+            }
+        }
+    }
+    ASSERT_TRUE(backend_->write(backend_->prepareWrite(source)));
+    ASSERT_TRUE(waitForBackendOperationsForTest(*backend_));
+    EXPECT_EQ(state_->writes, (std::vector<size_t>{1, 1, 1}));
+    for (const auto& [uri, bytes] : state_->stored) {
+        EXPECT_EQ(bytes, std::vector<uint8_t>(bytes.size(), 24)) << uri;
+    }
+    for (const auto& key_handles : source.handles) {
+        for (const auto& handle : key_handles) {
+            EXPECT_EQ(allocator_->groupBlockPools().at(handle.tag == "full0" ? 0 : handle.tag == "full1" ? 1 : 2)
+                          ->refCount(handle.block), 1u);
+        }
+    }
+}
+
+TEST_F(KVCMIndependentPoolTest, IncompleteWriteSpecSetAbortsBeforeAnyPayloadTransfer) {
+    ASSERT_TRUE(initialize());
+    kv_cache_manager::WriteLocation proposal;
+    proposal.write_session_id = "incomplete";
+    proposal.block_mask = kv_cache_manager::BlockMaskOffset{0};
+    proposal.locations = {{{"tp0_Llinear0", "linear"}, {"tp0_Ffull0", "full0"}}};
+    EXPECT_CALL(*meta_, StartWrite(_, _, _, _, _, 0))
+        .WillOnce(Return(std::make_pair(kv_cache_manager::ClientErrorCode::ER_OK, proposal)));
+    EXPECT_CALL(*meta_, FinishWrite(_, "incomplete",
+                ::testing::VariantWith<kv_cache_manager::BlockMaskOffset>(::testing::Eq(0u)), ::testing::IsEmpty()))
+        .WillOnce(Return(kv_cache_manager::ClientErrorCode::ER_OK));
+    ASSERT_TRUE(backend_->write(backend_->prepareWrite(request())));
+    ASSERT_TRUE(waitForBackendOperationsForTest(*backend_));
+    EXPECT_EQ(state_->writes, (std::vector<size_t>{0, 0, 0}));
+}
+
+TEST_F(KVCMIndependentPoolTest, PreparedWriteReleasesEveryPoolPinWhenAdmissionIsRejected) {
+    ASSERT_TRUE(initialize());
+    const auto source = request();
+    auto pending = backend_->prepareWrite(source);
+    for (const auto& handle : source.handles.front()) {
+        const auto group = handle.tag == "full0" ? 0 : handle.tag == "full1" ? 1 : 2;
+        EXPECT_EQ(pools_[group]->refCount(handle.block), 2u);
+    }
+    backend_->shutdown();
+    EXPECT_FALSE(backend_->write(std::move(pending)));
+    for (const auto& handle : source.handles.front()) {
+        const auto group = handle.tag == "full0" ? 0 : handle.tag == "full1" ? 1 : 2;
+        EXPECT_EQ(pools_[group]->refCount(handle.block), 1u);
+    }
     EXPECT_EQ(state_->destroyed, 3u);
 }
 
@@ -358,6 +436,7 @@ TEST_F(KVCMIndependentPoolTest, WorkerRoutesRepeatedTagsAcrossIndependentOrdersA
     for (size_t group : {2u, 0u, 1u, 0u}) {
         operation.add_group_tags(config_.groupTags().at(group));
         operation.add_block_ids(blocks_[group]);
+        operation.add_block_generations(pools_[group]->blockAllocationGeneration(blocks_[group]));
         operation.add_uris("group_" + std::to_string(group) + "_" + std::to_string(operation.uris_size()));
     }
     RemoteOperationResponsePB response;
@@ -393,7 +472,7 @@ TEST_F(KVCMIndependentPoolTest, WorkerRejectsUnknownTagBeforeAnyTransfer) {
     EXPECT_EQ(state_->reads, (std::vector<size_t>{0, 0, 0}));
 }
 
-TEST_F(KVCMIndependentPoolTest, TimeoutQuarantinesUpperRequestPinsUntilShutdown) {
+TEST_F(KVCMIndependentPoolTest, TimeoutRetainsUpperRequestPinsAfterShutdown) {
     ASSERT_TRUE(initialize());
     const kv_cache_manager::Locations locations = {
         {{"tp0_Ffull0", "full0"}, {"tp0_Ffull1", "full1"}, {"tp0_Llinear0", "linear"}}};
@@ -414,30 +493,33 @@ TEST_F(KVCMIndependentPoolTest, TimeoutQuarantinesUpperRequestPinsUntilShutdown)
 
     backend_->shutdown();
     for (size_t group = 0; group < pools_.size(); ++group) {
-        EXPECT_EQ(pools_[group]->refCount(blocks_[group]), ref_counts[group]);
+        EXPECT_EQ(pools_[group]->refCount(blocks_[group]), ref_counts[group] + 1);
     }
 }
 
 TEST_F(KVCMIndependentPoolTest, WorkerReportsTimeoutWithoutCreatingLocalPins) {
-    ASSERT_TRUE(initialize());
+    ASSERT_TRUE(initialize(false, /*rank=*/1));
     RemoteOperationRequestPB operation;
     operation.set_op(REMOTE_OPERATION_READ);
     for (size_t group = 0; group < pools_.size(); ++group) {
         operation.add_group_tags(config_.groupTags().at(group));
         operation.add_block_ids(blocks_[group]);
+        operation.add_block_generations(pools_[group]->blockAllocationGeneration(blocks_[group]));
         operation.add_uris("group_" + std::to_string(group));
     }
+    state_->stored[operation.uris(0)].resize(config_.blockSizeBytesForGroup(operation.group_tags(0)));
     std::vector<uint32_t> ref_counts;
     for (size_t group = 0; group < pools_.size(); ++group) {
         ref_counts.push_back(pools_[group]->refCount(blocks_[group]));
     }
 
-    // Worker ranks only report the transfer result. Rank 0 owns and, when
-    // needed, quarantines the StorageBackend request pins.
+    // Rank 0 owns allocator pins. Workers retain their registered backing
+    // without introducing rank-local allocation references.
     state_->timeout_pool = 1;
     RemoteOperationResponsePB response;
     EXPECT_FALSE(backend_->execute(operation, response));
     EXPECT_EQ(response.transfer_status(), REMOTE_TRANSFER_STATUS_TIMEOUT);
+    EXPECT_EQ(state_->reads, (std::vector<size_t>{1, 0, 0}));
     for (size_t group = 0; group < pools_.size(); ++group) {
         EXPECT_EQ(pools_[group]->refCount(blocks_[group]), ref_counts[group]);
     }
@@ -445,6 +527,18 @@ TEST_F(KVCMIndependentPoolTest, WorkerReportsTimeoutWithoutCreatingLocalPins) {
     backend_->shutdown();
     for (size_t group = 0; group < pools_.size(); ++group) {
         EXPECT_EQ(pools_[group]->refCount(blocks_[group]), ref_counts[group]);
+    }
+    std::vector<std::weak_ptr<DeviceBlockPool>> borrowed;
+    for (const auto& pool : pools_) {
+        borrowed.push_back(pool);
+    }
+    backend_.reset();
+    wrapper_.reset();
+    refs_.clear();
+    allocator_.reset();
+    pools_.clear();
+    for (const auto& pool : borrowed) {
+        EXPECT_FALSE(pool.expired());
     }
 }
 

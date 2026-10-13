@@ -104,10 +104,27 @@ The following arguments have equivalent upper-case environment variables:
 
 | Argument | Default | Meaning |
 |---|---:|---|
+| `--kvcm_remote_layout` | `legacy` | Rank-local storage; `canonical_v1` supports compatible TP/CP layouts |
 | `--kvcm_read_backend_type` | 0 | 0=regular query; 1=3fs, 2=mooncake, 3=PACE, 4=NFS, 5=VCNS 3fs |
 | `--kvcm_min_replica_count` | 0 | Minimum readable replicas for StartWrite; the server treats 0 as 1 |
 
-See [KV cache event publisher](kv_cache_event_publisher.md) for HBM reporting.
+Processes exchanging `KVCacheConfig` must use the same build version. The config uses pickle
+v9 and can read v1–v8. See [KV cache event publisher](kv_cache_event_publisher.md) for HBM reporting.
+
+#### GPU dual writes and explicit HOST writes
+
+Explicit inserts of ready HOST content use ordinary CPU IOVs and the transfer client for the
+original business tag. Each rank resolves HOST blocks by its local cache key/coordinate and
+holds STORE references during I/O. This path requires neither HOST fd registration nor a
+dedicated HOST client.
+
+For sharded CP, explicit HOST inserts use the existing `remote_write` parameter. The
+`StorageRequest` supplies `source_tier=HOST`, local round endpoint keys/handles, and the original
+global fixed-block keys in `remote_keys`. It uploads complete rounds stored in the local HOST
+tree. Workers use the same `CPSlotMapper` to project global keys/coordinates into local rounds;
+the original keys cannot be recovered from endpoint hashes. A TP replica with no write shard
+completes as an empty task.
+
 Remote reads always target GPU IOVs. SDK/PACE selects direct, landing or staging; RTP does not
 allocate a separate HOST read pool. The first transfer client registers all required GPU spans
 before the first PACE INIT, and subsequent clients borrow those registrations. Shutdown drains
@@ -119,6 +136,40 @@ return and destruction do not prove physical I/O completion. An unknown read com
 terminates that request to avoid recomputing into the same target blocks; determinate failures
 retain the existing Prefill fallback. After quarantine, requests that have not submitted I/O
 keep local hits and recompute the missing portion.
+
+With `PACE_ENABLE_GATHERSCATTER=ON`, compatible equal-size IOVs within each block retain the
+accelerated path. Heterogeneous IOV sizes use the SDK's order-preserving Normal path, keeping
+the same remote byte order for CPU and GPU.
+
+#### Multiple pools and canonical layouts
+
+Remote keys across cache groups use a common token stride. Each location must contain every
+spec in the selected groups and a nonempty URI. Each pool's payload must match its declared
+byte size. Generated legacy Instance IDs include the heterogeneous physical layout. Custom
+configurations must match token-block size, specs and groups; spec order within a group does
+not affect matching.
+
+Set `--kvcm_remote_layout canonical_v1` on both producer and consumer to reuse KV across
+compatible TP/CP partitions. Canonical Instance IDs use the `canonical_v1_` namespace, derived
+from the logical KV layout and model identity with deployment TP/CP partitioning normalized.
+Legacy and canonical payloads require separate Instances. Change `KVCM_INSTANCE_ID_SALT`
+when weights or other cache semantics change.
+
+Canonical supports typed MHA/GQA/MQA, MLA FULL, and typed FULL+LINEAR state. TP partitions
+logical heads. Sharded CP places global block `i` on rank `i % CP` at local slot `i / CP`.
+Reads reuse complete consumer CP rounds. Request-completion writes preserve complete token
+blocks within a partial CP round and exclude the final incomplete token block.
+
+Sharded CP requires `canonical_v1`. ALL_GATHER, ALL_GATHER_WITH_OVERLAP and ALLTOALL use
+the same CP page plan. Decode's `PREFILL_CP` describes the producer topology; payloads are
+placed according to Decode's own attention TP. Worker I/O uses allocation generation and
+an access fence to keep transfers and computation mutually exclusive.
+
+Canonical requires DEVICE groups and `pp_size=1`. Compact CP SWA rings, opaque state layouts,
+incompatible block coverage and orthogonal TP×CP execution are unsupported. Typed MHA SWA
+retains its window policy and supports TP head conversion. Canonical GPU and explicit HOST
+CPU IOV writes use the same logical shard slicing. Remote reads target GPU memory, with the
+transfer strategy selected by SDK/PACE.
 
 ### Ignoring request cache switches
 

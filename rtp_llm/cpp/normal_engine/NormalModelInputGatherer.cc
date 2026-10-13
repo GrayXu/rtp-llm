@@ -362,7 +362,13 @@ void publishModelInputCoreTensorsToCuda(GptModelInputs& model_input, TensorHolde
     // consume both views, and the speculative async path snapshots the pair
     // atomically for the next round. This also replaces the former per-group
     // tensorHoldHostAndToCuda copies in PyWrappedModel.
+    if (model_input.kv_cache_block_id.defined() && !model_input.kv_cache_block_id.is_cuda()) {
+        model_input.cache_generation_host_blocks = model_input.kv_cache_block_id;
+    }
     model_input.kv_cache_block_id        = publishInt32ToCuda(model_input.kv_cache_block_id, host_holder);
+    if (model_input.cache_generation_host_blocks.defined()) {
+        model_input.cache_generation_published_blocks = model_input.kv_cache_block_id;
+    }
     model_input.kv_cache_kernel_block_id = publishInt32ToCuda(model_input.kv_cache_kernel_block_id, host_holder);
 }
 

@@ -43,6 +43,7 @@ struct KVCMBroadcastState {
     std::mutex                            mutex;
     std::vector<RemoteOperationRequestPB> requests;
     bool                                  fail{false};
+    std::function<bool(const RemoteOperationRequestPB&, RemoteOperationResponsePB&)> execute;
 };
 
 class KVCMBroadcastRpcService final: public RpcService::Service {
@@ -63,11 +64,27 @@ public:
         if (state_->fail) {
             return grpc::Status(grpc::StatusCode::INTERNAL, "injected KVCM broadcast failure");
         }
-        if (remote_request.op() == REMOTE_OPERATION_WRITE) {
+        if (state_->execute) {
             auto* remote_response = response->mutable_remote_response();
-            for (int index = 0; index < remote_request.uris_size(); ++index) {
-                remote_response->add_actual_uris("actual_rank_" + std::to_string(rank_) + "_" + std::to_string(index));
+            const bool success = state_->execute(remote_request, *remote_response);
+            return success || remote_response->transfer_status() != REMOTE_TRANSFER_STATUS_UNSPECIFIED ?
+                       grpc::Status::OK : grpc::Status(grpc::StatusCode::INTERNAL, "worker backend failed");
+        }
+        switch (remote_request.op()) {
+            case REMOTE_OPERATION_READ:
+                response->mutable_remote_response()->set_transfer_status(REMOTE_TRANSFER_STATUS_SUCCESS);
+                break;
+            case REMOTE_OPERATION_WRITE: {
+                auto* remote_response = response->mutable_remote_response();
+                remote_response->set_transfer_status(REMOTE_TRANSFER_STATUS_SUCCESS);
+                for (int index = 0; index < remote_request.uris_size(); ++index) {
+                    remote_response->add_actual_uris("actual_rank_" + std::to_string(rank_) + "_"
+                                                     + std::to_string(index));
+                }
+                break;
             }
+            default:
+                return grpc::Status(grpc::StatusCode::INTERNAL, "unsupported mock KVCM operation");
         }
         return grpc::Status::OK;
     }
@@ -200,8 +217,8 @@ public:
             return {*save_status, {}};
         }
         auto [success, result] = saveKvCachesForTag(tag, uris, buffers, trace_info);
-        return {success ? kv_cache_manager::ClientErrorCode::ER_OK
-                        : kv_cache_manager::ClientErrorCode::ER_SDKWRITE_ERROR,
+        return {save_status.value_or(success ? kv_cache_manager::ClientErrorCode::ER_OK
+                                            : kv_cache_manager::ClientErrorCode::ER_SDKWRITE_ERROR),
                 std::move(result)};
     }
 };

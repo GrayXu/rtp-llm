@@ -16,6 +16,7 @@ class MetricsReporter;
 namespace rtp_llm {
 
 class BroadcastManager;
+class WorkerCacheIOFence;
 namespace kvcm {
 class ClientWrapper;
 }
@@ -33,7 +34,8 @@ public:
                        std::shared_ptr<BroadcastManager>             broadcast_manager,
                        bool                                          gdr_enabled,
                        std::shared_ptr<kmonitor::MetricsReporter>    metrics_reporter = nullptr,
-                       std::shared_ptr<kvcm::ClientWrapper>          client_wrapper = nullptr);
+                       std::shared_ptr<kvcm::ClientWrapper>          client_wrapper = nullptr,
+                       std::shared_ptr<WorkerCacheIOFence>            worker_fence = nullptr);
     ~KVCMStorageBackend() override;
 
     // Returns whether the request was handled and response is valid. Transfer
