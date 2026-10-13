@@ -890,32 +890,33 @@ private:
             auto result =
                 broadcast_manager_->broadcast<FunctionRequestPB, FunctionResponsePB>(requests, timeout_ms, rpc_call);
             if (result == nullptr) {
-                throw StorageOperationCompletionUnknown("KVCM broadcast dispatch failed");
+                // No RPC has been submitted when broadcast returns nullptr.
+                throw std::runtime_error("KVCM broadcast dispatch failed");
             }
             try {
                 result->waitDone();
             } catch (const std::exception& exception) {
                 if (result->deadlineExceeded()) {
-                    throw StorageOperationTimeout(std::string("KVCM broadcast timed out: ") + exception.what());
+                    throw StorageOperationTimeout(std::string("KVCM broadcast timed out: ") + exception.what(), false);
                 }
                 throw StorageOperationCompletionUnknown(
-                    std::string("KVCM broadcast completion is unknown: ") + exception.what());
+                    std::string("KVCM broadcast completion is unknown: ") + exception.what(), false);
             } catch (...) {
-                throw StorageOperationCompletionUnknown("KVCM broadcast completion is unknown");
+                throw StorageOperationCompletionUnknown("KVCM broadcast completion is unknown", false);
             }
             if (!result->success()) {
-                throw StorageOperationCompletionUnknown("KVCM broadcast completion is unknown");
+                throw StorageOperationCompletionUnknown("KVCM broadcast completion is unknown", false);
             }
             responses = result->responses();
         }
 
         if (responses.size() != requests.size()) {
-            throw StorageOperationCompletionUnknown("KVCM worker response count mismatch");
+            throw StorageOperationCompletionUnknown("KVCM worker response count mismatch", false);
         }
         bool failed = false;
         for (const auto& response : responses) {
             if (!response.has_remote_response()) {
-                throw StorageOperationCompletionUnknown("KVCM worker returned no transfer response");
+                throw StorageOperationCompletionUnknown("KVCM worker returned no transfer response", false);
             }
             switch (response.remote_response().transfer_status()) {
                 case REMOTE_TRANSFER_STATUS_UNSPECIFIED:  // successful legacy worker
@@ -925,9 +926,11 @@ private:
                     failed = true;
                     break;
                 case REMOTE_TRANSFER_STATUS_TIMEOUT:
-                    throw StorageOperationTimeout("KVCM transfer timed out");
+                    throw StorageOperationTimeout("KVCM transfer timed out", false);
+                case REMOTE_TRANSFER_STATUS_COMPLETION_UNKNOWN:
+                    throw StorageOperationCompletionUnknown("KVCM transfer completion is unknown", false);
                 default:
-                    throw StorageOperationCompletionUnknown("KVCM transfer completion is unknown");
+                    throw StorageOperationCompletionUnknown("KVCM transfer completion is unknown", false);
             }
         }
         if (failed) {

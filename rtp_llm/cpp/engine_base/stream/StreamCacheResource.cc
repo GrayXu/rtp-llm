@@ -299,7 +299,8 @@ absl::Status StreamCacheResource::finalizeAllocatorLoad() {
         resource.setDiskReuseBlockNum(disk);
         resource.setStorageBackendReuseBlockNum(backend);
         publishReuseLengths(total * tokens, host * tokens, disk * tokens, backend * tokens);
-    } else if (resource_context_.role_type == RoleType::PREFILL && malloc_status == MallocStatus::NONE) {
+    } else if (resource_context_.role_type == RoleType::PREFILL && malloc_status == MallocStatus::NONE
+               && !error.completionUnknown()) {
         stream_->setHostReuseLength(0);
         stream_->setDiskReuseLength(0);
     } else {
@@ -319,17 +320,20 @@ absl::Status StreamCacheResource::finalizeAllocatorLoad() {
     if (load_success) {
         return absl::OkStatus();
     }
-    if (malloc_status == MallocStatus::RETRYABLE_RESOURCE_EXHAUSTED) {
-        return absl::UnavailableError("allocator load materialization is temporarily out of KV blocks");
-    }
-    if (malloc_status == MallocStatus::PERMANENT_RESOURCE_EXHAUSTED) {
-        return absl::ResourceExhaustedError("allocator load materialization exceeds KV cache capacity");
-    }
-    if (malloc_status == MallocStatus::INTERNAL_ERROR) {
-        return absl::InternalError("allocator load materialization failed");
-    }
-    if (resource_context_.role_type == RoleType::PREFILL) {
-        return absl::OkStatus();
+    // An unfinished transfer may still write the request's compute targets.
+    if (!error.completionUnknown()) {
+        if (malloc_status == MallocStatus::RETRYABLE_RESOURCE_EXHAUSTED) {
+            return absl::UnavailableError("allocator load materialization is temporarily out of KV blocks");
+        }
+        if (malloc_status == MallocStatus::PERMANENT_RESOURCE_EXHAUSTED) {
+            return absl::ResourceExhaustedError("allocator load materialization exceeds KV cache capacity");
+        }
+        if (malloc_status == MallocStatus::INTERNAL_ERROR) {
+            return absl::InternalError("allocator load materialization failed");
+        }
+        if (resource_context_.role_type == RoleType::PREFILL) {
+            return absl::OkStatus();
+        }
     }
     const std::string error_text = error.ToString();
     if (error.code() == ErrorCode::DEADLINE_EXCEEDED) {

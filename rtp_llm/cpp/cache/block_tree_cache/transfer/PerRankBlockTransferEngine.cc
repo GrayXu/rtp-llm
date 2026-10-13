@@ -84,6 +84,10 @@ std::shared_ptr<AsyncContext> PerRankBlockTransferEngine::execute(TransferTask t
             return invalidTransferContext();
         }
         const auto* group_set = group_sets_[descriptor.group_set_id].get();
+        if ((source == Tier::HOST || target == Tier::HOST) && group_set->hostPool()
+            && group_set->hostPool()->hasUncertainRemoteIo()) {
+            return invalidTransferContext();
+        }
         group_sets.push_back(group_set);
         if (source == Tier::HOST || target == Tier::HOST) {
             hosts.push_back(resolveHostView(*group_set, descriptor.singleBlockAt(Tier::HOST)));

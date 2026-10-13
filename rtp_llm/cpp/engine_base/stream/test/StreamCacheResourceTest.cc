@@ -16,6 +16,8 @@
 #include "rtp_llm/cpp/cache/AsyncContext.h"
 #include "rtp_llm/cpp/cache/KVCacheResource.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCacheFactory.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/ScopeRollback.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/test/BlockTreeCacheTestUtils.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/StorageBackend.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/load/LoadAsyncContext.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
@@ -114,7 +116,10 @@ makeAllocatorLoadContext(size_t matched_blocks, const std::vector<Tier>& source_
 
 class StreamReadStorageBackend: public StorageBackend {
 public:
+    enum class ReadFailure { NONE, KNOWN, TIMEOUT, COMPLETION_UNKNOWN };
+
     ~StreamReadStorageBackend() override {
+        releaseWrites();
         shutdown();
     }
 
@@ -140,6 +145,16 @@ public:
         cv_.notify_all();
     }
 
+    void failNextRead(ReadFailure failure) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        read_failure_ = failure;
+    }
+
+    BlockIndicesType readTargets() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return read_targets_;
+    }
+
     void waitForMatches(size_t count) {
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [&] { return match_calls_ >= count; });
@@ -148,6 +163,27 @@ public:
     void waitForReads(size_t count) {
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [&] { return read_calls_ >= count; });
+    }
+
+    void blockWrites() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        release_writes_ = false;
+    }
+
+    void releaseWrites() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        release_writes_ = true;
+        cv_.notify_all();
+    }
+
+    bool waitForWrites(size_t count) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(5), [&] { return write_calls_ >= count; });
+    }
+
+    CacheKeysType writtenKeySequence() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return written_key_sequence_;
     }
 
     size_t writeCalls() const {
@@ -176,17 +212,39 @@ protected:
         return {request.handles.size(), nullptr};
     }
 
-    void readImpl(const StorageRequest&, const std::shared_ptr<StorageBackendMatchMeta>&) override {
+    void readImpl(const StorageRequest& request, const std::shared_ptr<StorageBackendMatchMeta>&) override {
         std::unique_lock<std::mutex> lock(mutex_);
         ++read_calls_;
+        read_targets_.clear();
+        for (const auto& handles : request.handles) {
+            for (const auto& handle : handles) {
+                read_targets_.push_back(handle.block);
+            }
+        }
         cv_.notify_all();
         cv_.wait(lock, [&] { return release_reads_; });
+        const auto failure = read_failure_;
+        read_failure_      = ReadFailure::NONE;
+        switch (failure) {
+            case ReadFailure::KNOWN:
+                throw std::runtime_error("read failed");
+            case ReadFailure::TIMEOUT:
+                throw StorageOperationTimeout("transport timed out", false);
+            case ReadFailure::COMPLETION_UNKNOWN:
+                throw StorageOperationCompletionUnknown("transfer completion unknown", false);
+            case ReadFailure::NONE:
+                break;
+        }
     }
 
     void writeImpl(const StorageRequest& request) override {
-        std::lock_guard<std::mutex> lock(mutex_);
+        EXPECT_EQ(request.source_tier, Tier::DEVICE);
+        std::unique_lock<std::mutex> lock(mutex_);
         ++write_calls_;
         written_keys_ += request.handles.size();
+        written_key_sequence_.insert(written_key_sequence_.end(), request.keys->begin(), request.keys->end());
+        cv_.notify_all();
+        cv_.wait(lock, [&] { return release_writes_; });
     }
 
 private:
@@ -194,10 +252,14 @@ private:
     std::condition_variable cv_;
     bool                    release_matches_{true};
     bool                    release_reads_{true};
+    bool                    release_writes_{true};
     size_t                  match_calls_{0};
     size_t                  read_calls_{0};
     size_t                  write_calls_{0};
     size_t                  written_keys_{0};
+    CacheKeysType           written_key_sequence_;
+    ReadFailure             read_failure_{ReadFailure::NONE};
+    BlockIndicesType        read_targets_;
 };
 
 class StreamCacheResourceTest: public DeviceTestBase {
@@ -272,17 +334,29 @@ protected:
     }
 
     std::shared_ptr<StreamReadStorageBackend>
-    prepareStorageBackendResource(bool block_matches, bool seed_host = false, RoleType role_type = RoleType::PDFUSION) {
+    prepareStorageBackendResource(bool                    block_matches,
+                                   bool                    seed_host    = false,
+                                   RoleType                role_type    = RoleType::PDFUSION,
+                                   Tier                    store_target = Tier::DEVICE,
+                                   const std::vector<int>& input_tokens = {1, 2, 3, 4, 5, 6}) {
         KVCacheConfig kv_cache_config;
         kv_cache_config.enable_remote_cache   = true;
-        kv_cache_config.enable_memory_cache   = seed_host;
-        kv_cache_config.memory_cache_size_mb  = seed_host ? 1 : 0;
+        kv_cache_config.enable_device_cache   = store_target == Tier::DEVICE;
+        kv_cache_config.enable_memory_cache   = seed_host || store_target == Tier::HOST;
+        kv_cache_config.memory_cache_size_mb  = kv_cache_config.enable_memory_cache ? 1 : 0;
+        kv_cache_config.enable_disk_cache     = store_target == Tier::DISK;
+        if (kv_cache_config.enable_disk_cache) {
+            disk_dirs_.push_back(std::make_unique<block_transfer_engine_test::TempDirGuard>("stream_finish_dual_write"));
+            kv_cache_config.disk_cache_paths   = disk_dirs_.back()->path;
+            kv_cache_config.disk_cache_size_mb = 1;
+        }
         KVCacheConfig manager_kv_cache_config = kv_cache_config;
-        // The manager must not construct a real KVCM client before this test
-        // replaces its BlockTreeCache with the controllable fake backend.
+        // Avoid constructing a real KVCM client or claiming the disk mount
+        // before replacing the manager's cache with the controllable backend.
         manager_kv_cache_config.enable_remote_cache = false;
+        manager_kv_cache_config.enable_disk_cache   = false;
         prepareResourceWithCacheConfig(
-            init_config(), {1, 2, 3, 4, 5, 6}, /*reuse_cache=*/true, role_type, manager_kv_cache_config);
+            init_config(), input_tokens, /*reuse_cache=*/true, role_type, manager_kv_cache_config);
 
         auto backend = std::make_shared<StreamReadStorageBackend>();
         if (block_matches) {
@@ -318,6 +392,9 @@ protected:
         }
 
         auto& resource                                                 = stream_->streamCacheResource();
+        resource.resource_context_.enable_device_cache                 = kv_cache_config.enable_device_cache;
+        resource.resource_context_.enable_memory_cache                 = kv_cache_config.enable_memory_cache;
+        resource.resource_context_.enable_disk_cache                   = kv_cache_config.enable_disk_cache;
         resource.resource_context_.enable_remote_cache                 = true;
         stream_->generate_input_->generate_config->enable_remote_cache = true;
         resource.kvCacheMutable().setBatchCacheKeys(0, {100, 200, 300});
@@ -338,6 +415,7 @@ protected:
     } while (0)
 
 protected:
+    std::vector<std::unique_ptr<block_transfer_engine_test::TempDirGuard>> disk_dirs_;
     autil::EnvGuard                 perf_scope;
     GenerateStreamPtr               stream_;
     std::shared_ptr<KVCacheManager> cache_manager_;
@@ -1178,6 +1256,86 @@ TEST_F(StreamCacheResourceTest, testPrefillAllocatorLoadFailureKeepsDeviceReadyR
     EXPECT_FALSE(stream_->hasError());
 }
 
+TEST_F(StreamCacheResourceTest, PrefillBackendReadFailureOnlyTerminatesOnUnknownCompletion) {
+    for (const auto failure : {StreamReadStorageBackend::ReadFailure::KNOWN,
+                               StreamReadStorageBackend::ReadFailure::TIMEOUT,
+                               StreamReadStorageBackend::ReadFailure::COMPLETION_UNKNOWN}) {
+        SCOPED_TRACE(static_cast<int>(failure));
+        auto backend = prepareStorageBackendResource(false, false, RoleType::PREFILL);
+        backend->failNextRead(failure);
+        auto& resource = stream_->streamCacheResource();
+        stream_->generate_status_->status = StreamState::WAITING;
+        stream_->reportEvent(StreamEvents::CanRun);
+        ASSERT_EQ(stream_->moveToNext(), StreamState::LOADING_CACHE);
+        const auto context = std::dynamic_pointer_cast<LoadAsyncContext>(resource.allocator_load_context_);
+        ASSERT_NE(context, nullptr);
+        context->waitDone();
+        ASSERT_FALSE(context->success());
+        EXPECT_EQ(context->mallocStatus(), MallocStatus::NONE);
+        const bool completion_unknown = failure != StreamReadStorageBackend::ReadFailure::KNOWN;
+        const auto error = context->errorInfo();
+        EXPECT_EQ(error.completionUnknown(), completion_unknown);
+        EXPECT_EQ(error.code(), failure == StreamReadStorageBackend::ReadFailure::TIMEOUT ?
+                                    ErrorCode::DEADLINE_EXCEEDED : ErrorCode::EXECUTION_EXCEPTION);
+        EXPECT_EQ(error.ToString(), failure == StreamReadStorageBackend::ReadFailure::KNOWN ? "read failed" :
+                                       failure == StreamReadStorageBackend::ReadFailure::TIMEOUT ? "transport timed out" :
+                                                                                                  "transfer completion unknown");
+        const auto targets = backend->readTargets();
+        ASSERT_FALSE(targets.empty());
+        const auto blocks = resource.kvCache().blocks(0, "default");
+        const auto pool = cache_manager_->coordinator_manager_->groupBlockPools().front();
+        for (const auto target : targets) {
+            EXPECT_NE(std::find(blocks.begin(), blocks.end(), target), blocks.end());
+        }
+
+        if (completion_unknown) {
+            EXPECT_EQ(stream_->moveToNext(), StreamState::FINISHED);
+            EXPECT_TRUE(stream_->hasError());
+            EXPECT_EQ(stream_->statusInfo().code(), failure == StreamReadStorageBackend::ReadFailure::TIMEOUT ?
+                                                       ErrorCode::LOAD_CACHE_TIMEOUT : ErrorCode::MALLOC_FAILED);
+            EXPECT_EQ(resource.curBlocksNum(), 0);
+            EXPECT_TRUE(resource.isResourceReleased());
+            EXPECT_EQ(stream_->moveToNext(), StreamState::FINISHED);
+            EXPECT_EQ(stream_->moveToNext(), StreamState::FINISHED);
+            auto next_input = std::make_shared<GenerateInput>(*stream_->generate_input_);
+            ++next_input->request_id;
+            ModelConfig next_config;
+            next_config.attn_config.tokens_per_block = 2;
+            next_config.max_seq_len = 2048;
+            auto next_stream = std::make_shared<NormalGenerateStream>(
+                next_input, next_config, RuntimeConfig{}, resource.resourceContext(), nullptr);
+            auto& next_resource = next_stream->streamCacheResource();
+            next_resource.kvCacheMutable().setBatchCacheKeys(0, {100, 200, 300});
+            next_stream->generate_status_->status = StreamState::WAITING;
+            next_stream->reportEvent(StreamEvents::CanRun);
+            ASSERT_EQ(next_stream->moveToNext(), StreamState::LOADING_CACHE);
+            auto next_load = std::dynamic_pointer_cast<LoadAsyncContext>(next_resource.allocator_load_context_);
+            ASSERT_NE(next_load, nullptr);
+            next_load->waitDone();
+            EXPECT_TRUE(next_load->success());
+            EXPECT_EQ(next_load->matchedBlocks(), 0u);
+            EXPECT_EQ(next_stream->moveToNext(), StreamState::WAITING);
+            EXPECT_EQ(next_stream->moveToNext(), StreamState::RUNNING);
+            EXPECT_FALSE(next_stream->hasError());
+            EXPECT_EQ(backend->matchCalls(), 1u);
+            EXPECT_EQ(backend->readTargets(), targets);
+            next_resource.releaseResource();
+            backend->shutdown();
+            for (const auto target : targets) {
+                EXPECT_TRUE(pool->isAllocated(target));
+                EXPECT_EQ(pool->refCount(target), 1u);
+            }
+        } else {
+            EXPECT_EQ(stream_->moveToNext(), StreamState::WAITING);
+            EXPECT_FALSE(stream_->hasError());
+            EXPECT_EQ(resource.kvCache().blocks(0, "default"), blocks);
+            EXPECT_EQ(stream_->moveToNext(), StreamState::RUNNING);
+            EXPECT_EQ(resource.kvCache().blocks(0, "default"), blocks);
+            backend->shutdown();
+        }
+    }
+}
+
 TEST_F(StreamCacheResourceTest, testPrefillMaterializationShortfallRearmsAllocatorLoad) {
     auto backend = prepareStorageBackendResource(/*block_matches=*/false, /*seed_host=*/false, RoleType::PREFILL);
     kmonitor::MetricsTags tags;
@@ -1284,7 +1442,7 @@ TEST_F(StreamCacheResourceTest, testPrefillPermanentMaterializationFailureTermin
     context->startBackendMatch();
     context->waitDone();
 
-    EXPECT_EQ(stream_->moveToNext(), StreamState::WAITING);
+    EXPECT_EQ(stream_->moveToNext(), StreamState::FINISHED);
     EXPECT_TRUE(stream_->hasError());
     EXPECT_EQ(resource.curBlocksNum(), 0);
     EXPECT_EQ(stream_->moveToNext(), StreamState::FINISHED);
@@ -1311,7 +1469,7 @@ TEST_F(StreamCacheResourceTest, testPrefillCoordinatorCommitFailureTerminates) {
     context->waitDone();
     ASSERT_EQ(context->mallocStatus(), MallocStatus::INTERNAL_ERROR);
 
-    EXPECT_EQ(stream_->moveToNext(), StreamState::WAITING);
+    EXPECT_EQ(stream_->moveToNext(), StreamState::FINISHED);
     EXPECT_TRUE(stream_->hasError());
     EXPECT_EQ(resource.curBlocksNum(), 0);
     EXPECT_EQ(stream_->moveToNext(), StreamState::FINISHED);

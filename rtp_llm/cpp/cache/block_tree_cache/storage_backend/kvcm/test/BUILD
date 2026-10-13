@@ -182,3 +182,14 @@ cc_test_wrapper(
         "@local_config_cuda//cuda:cudart",
     ],
 )
+
+cc_test_wrapper(
+    name = "worker_cache_io_fence_test",
+    srcs = ["WorkerCacheIOFenceTest.cc"],
+    copts = copts(),
+    deps = [
+        "//rtp_llm/cpp/cache:worker_cache_io_fence",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

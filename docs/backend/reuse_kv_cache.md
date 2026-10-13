@@ -113,6 +113,13 @@ allocate a separate HOST read pool. The first transfer client registers all requ
 before the first PACE INIT, and subsequent clients borrow those registrations. Shutdown drains
 borrowers before closing the registration owner.
 
+DEVICE and explicit HOST STORE references follow the storage task lifetime. On SDK timeout or
+unknown remote completion, affected references remain held until process termination. SDK task
+return and destruction do not prove physical I/O completion. An unknown read completion
+terminates that request to avoid recomputing into the same target blocks; determinate failures
+retain the existing Prefill fallback. After quarantine, requests that have not submitted I/O
+keep local hits and recompute the missing portion.
+
 ### Ignoring request cache switches
 
 Setting `RTP_LLM_IGNORE_REQUEST_CACHE_SWITCHES=1` (default off) ignores the request's

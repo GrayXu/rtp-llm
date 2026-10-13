@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <string>
@@ -43,6 +44,8 @@ public:
     size_t payloadBytes() const;
     size_t strideBytes() const;
     size_t blockSizeBytes() const override;
+    void markUncertainRemoteIo();
+    bool hasUncertainRemoteIo() const;
 
     std::string debugString() const override;
 
@@ -51,6 +54,7 @@ private:
 
 private:
     std::optional<AlignedHostMemory> backing_;
+    std::atomic<bool> uncertain_remote_io_{false};
 };
 
 }  // namespace rtp_llm

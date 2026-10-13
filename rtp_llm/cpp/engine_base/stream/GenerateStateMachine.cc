@@ -121,6 +121,12 @@ void GenerateStateMachine::handleLoading() {
         if (stream != nullptr) {
             stream->recordLoadingCacheDoneTime();
         }
+        // loadCacheDone() can report an error after moveToNext() checked the event.
+        if (events_.has(StreamEvents::Error)) {
+            status.store(StreamState::FINISHED, std::memory_order_release);
+            releaseResource();
+            return;
+        }
         status.store(StreamState::WAITING, std::memory_order_release);
     }
 }

@@ -325,8 +325,9 @@ public:
         return write_handle_count_;
     }
 
-    std::vector<BlockInfo> resolve(int layer_id, const std::string& tag, int block_id) const {
-        return convertIndexToBuffer(layer_id, tag, block_id);
+    std::vector<BlockInfo>
+    resolve(int layer_id, const std::string& tag, int block_id, Tier source_tier = Tier::DEVICE) const {
+        return convertIndexToBuffer(layer_id, tag, block_id, source_tier);
     }
 
     const std::vector<std::string>& poolTags() const {
@@ -691,6 +692,7 @@ TEST(StorageBackendTest, SubmissionFailureCompletesOnceAndReleasesPins) {
     backend.read(makeRequest(block), nullptr, [&](ErrorInfo error) {
         ++read_completions;
         EXPECT_FALSE(error.ok());
+        EXPECT_FALSE(error.completionUnknown());
     });
     EXPECT_EQ(read_completions, 1u);
     EXPECT_EQ(pool->refCount(block), 1u);
@@ -725,10 +727,12 @@ TEST(StorageBackendTest, IoExceptionsPropagateFailureAndReleasePins) {
     ASSERT_TRUE(initBackend(backend, pool));
 
     backend.failNextRead();
-    bool read_success = true;
-    backend.read(makeRequest(block), nullptr, [&](ErrorInfo error) { read_success = error.ok(); });
+    ErrorInfo read_error;
+    backend.read(makeRequest(block), nullptr, [&](ErrorInfo error) { read_error = std::move(error); });
     EXPECT_EQ(executor->runAll(), 1u);
-    EXPECT_FALSE(read_success);
+    EXPECT_EQ(read_error.code(), ErrorCode::EXECUTION_EXCEPTION);
+    EXPECT_EQ(read_error.ToString(), "read failed");
+    EXPECT_FALSE(read_error.completionUnknown());
     EXPECT_EQ(pool->refCount(block), 1u);
 
     backend.failNextWrite();
@@ -743,6 +747,100 @@ TEST(StorageBackendTest, IoExceptionsPropagateFailureAndReleasePins) {
     EXPECT_FALSE(match_success);
     pool->decRef(block);
     backend.shutdown();
+}
+
+TEST(StorageBackendTest, ReadTimeoutPreservesDeadlineAndExplicitDrainPolicy) {
+    class TimeoutBackend final: public TestBackend {
+    public:
+        TimeoutBackend(bool sdk_can_drain, std::shared_ptr<StorageBackendExecutor> executor):
+            TestBackend(true, std::move(executor)), sdk_can_drain_(sdk_can_drain) {}
+
+    protected:
+        void readImpl(const StorageRequest&, const std::shared_ptr<StorageBackendMatchMeta>&) override {
+            if (sdk_can_drain_) {
+                throw StorageOperationTimeout("transport timeout");
+            }
+            throw StorageOperationTimeout("transport timeout", false);
+        }
+
+    private:
+        bool sdk_can_drain_;
+    };
+    for (bool sdk_can_drain : {true, false}) {
+        auto pool = std::make_shared<TestBlockPool>();
+        const auto block = pool->malloc().value();
+        pool->incRef(block);
+        auto executor = std::make_shared<HoldingExecutor>();
+        TimeoutBackend backend(sdk_can_drain, executor);
+        ASSERT_TRUE(initBackend(backend, pool));
+        ErrorInfo observed;
+        backend.read(makeRequest(block), nullptr, [&](ErrorInfo error) { observed = std::move(error); });
+        ASSERT_EQ(executor->runAll(), 1u);
+        EXPECT_EQ(observed.code(), ErrorCode::DEADLINE_EXCEEDED);
+        EXPECT_EQ(observed.ToString(), "transport timeout");
+        EXPECT_TRUE(observed.completionUnknown());
+        EXPECT_EQ(pool->refCount(block), 2u);
+        backend.shutdown();
+        EXPECT_EQ(pool->refCount(block), sdk_can_drain ? 1u : 2u);
+        pool->decRef(block);
+        EXPECT_EQ(pool->isAllocated(block), !sdk_can_drain);
+    }
+}
+
+TEST(StorageBackendTest, ReadCompletionUnknownDoesNotMarkUndispatchedRequestsUnsafe) {
+    class UnknownBackend final: public TestBackend {
+    public:
+        explicit UnknownBackend(std::shared_ptr<StorageBackendExecutor> executor): TestBackend(true, std::move(executor)) {}
+
+    protected:
+        void readImpl(const StorageRequest&, const std::shared_ptr<StorageBackendMatchMeta>&) override {
+            throw StorageOperationCompletionUnknown("transfer completion unknown", false);
+        }
+    };
+    auto pool = std::make_shared<TestBlockPool>();
+    const auto target = pool->malloc().value();
+    const auto undispatched = pool->malloc().value();
+    pool->incRef(target);
+    pool->incRef(undispatched);
+    auto executor = std::make_shared<HoldingExecutor>();
+    UnknownBackend backend(executor);
+    ASSERT_TRUE(initBackend(backend, pool));
+
+    ErrorInfo observed;
+    backend.read(makeRequest(target), nullptr, [&](ErrorInfo error) { observed = std::move(error); });
+    ASSERT_EQ(executor->runAll(), 1u);
+    EXPECT_EQ(observed.code(), ErrorCode::EXECUTION_EXCEPTION);
+    EXPECT_EQ(observed.ToString(), "transfer completion unknown");
+    EXPECT_TRUE(observed.completionUnknown());
+
+    backend.failNextMatch();
+    for (const size_t local_prefix : {0u, 1u}) {
+        auto request = makeRequest(NULL_BLOCK_IDX, 2);
+        request.local_matched_blocks_num = local_prefix;
+        bool matched = false;
+        backend.match(std::move(request), [&](size_t count, auto meta, bool success) {
+            matched = true;
+            EXPECT_TRUE(success);
+            EXPECT_EQ(count, local_prefix);
+            EXPECT_EQ(meta, nullptr);
+        });
+        ASSERT_EQ(executor->runAll(), 1u);
+        EXPECT_TRUE(matched);
+    }
+
+    ErrorInfo rejected;
+    backend.read(makeRequest(undispatched), nullptr, [&](ErrorInfo error) { rejected = std::move(error); });
+    ASSERT_EQ(executor->runAll(), 1u);
+    EXPECT_EQ(rejected.code(), ErrorCode::EXECUTION_EXCEPTION);
+    EXPECT_FALSE(rejected.completionUnknown());
+    EXPECT_EQ(pool->refCount(undispatched), 1u);
+
+    pool->decRef(target);
+    pool->decRef(undispatched);
+    backend.shutdown();
+    EXPECT_TRUE(pool->isAllocated(target));
+    EXPECT_EQ(pool->refCount(target), 1u);
+    EXPECT_FALSE(pool->isAllocated(undispatched));
 }
 
 TEST(StorageBackendTest, AsyncWritesReturnBeforeCompletionAndReleaseOnlyTheirOwnPins) {
@@ -796,6 +894,76 @@ TEST(StorageBackendTest, AsyncWriteFailuresAndRejectionReleasePins) {
     EXPECT_FALSE(backend.write(backend.prepareWrite(makeRequest(block))));
     EXPECT_EQ(pool->refCount(block), 1u);
     pool->decRef(block);
+}
+
+TEST(StorageBackendTest, HostWritePinsSharedPackedBlockOnceAndReleasesOnEveryExit) {
+    for (const std::string outcome : {"success", "failure", "rejection", "shutdown", "unsubmitted"}) {
+        auto host_config                  = std::make_shared<HostBlockPoolConfig>();
+        host_config->pool_type            = BlockPoolType::HOST;
+        host_config->pool_name            = "storage_host_" + outcome;
+        host_config->physical_block_count = 4;
+        host_config->payload_bytes        = 32;
+        host_config->stride_bytes         = 4096;
+        auto host_pool                    = std::make_shared<HostBlockPool>(host_config);
+        ASSERT_TRUE(host_pool->init());
+        const auto block = host_pool->malloc().value();
+        host_pool->incTreeRef(block, BlockTreeRefType::CACHE);
+        auto        pool_a   = std::make_shared<TestBlockPool>();
+        auto        pool_b   = std::make_shared<TestBlockPool>();
+        auto        executor = std::make_shared<HoldingExecutor>();
+        TestBackend backend(true, executor);
+        ASSERT_TRUE(backend.init(
+            makeSharedPoolTopology(),
+            {{"group_0", pool_a}, {"group_1", pool_b}},
+            [](int, const std::string&, int) { return std::vector<BlockInfo>{{false, 0, 0, nullptr, 16}}; },
+            {{"group_0", host_pool}, {"group_1", host_pool}},
+            [host_pool](int, const std::string& tag, int block_id) {
+                auto* base = static_cast<uint8_t*>(host_pool->blockBuffer(block_id).addr);
+                return std::vector<BlockInfo>{{false, 0, 0, base + (tag == "group_0" ? 0 : 16), 16}};
+            }));
+        StorageRequest request{std::make_shared<const CacheKeysType>(CacheKeysType{1, 2}),
+                               {{{"group_0", block}, {"group_1", block}}, {{"group_0", block}, {"group_1", block}}}};
+        request.source_tier = Tier::HOST;
+        const auto buffers  = backend.resolve(0, "group_1", block, Tier::HOST);
+        ASSERT_EQ(buffers.size(), 1u);
+        EXPECT_FALSE(buffers[0].is_cuda);
+        EXPECT_EQ(buffers[0].addr, static_cast<uint8_t*>(host_pool->blockBuffer(block).addr) + 16);
+        auto task = backend.prepareWrite(request);
+        EXPECT_EQ(host_pool->treeRefCount(block), 2u);
+        EXPECT_EQ(pool_a->usedBlocksNum(), 0u);
+        EXPECT_EQ(pool_b->usedBlocksNum(), 0u);
+        host_pool->decTreeRef(block, BlockTreeRefType::CACHE);
+        EXPECT_EQ(host_pool->treeRefCount(block), 1u);
+        if (outcome == "unsubmitted") {
+            task = {};
+        } else {
+            if (outcome == "failure") {
+                backend.failNextWrite();
+            } else if (outcome == "rejection") {
+                executor->setReject(true);
+            } else if (outcome == "shutdown") {
+                backend.shutdown();
+            }
+            executor->setDuplicate(true);
+            EXPECT_EQ(backend.write(std::move(task)), outcome != "rejection" && outcome != "shutdown");
+            EXPECT_NO_THROW(executor->runAll());
+        }
+        EXPECT_FALSE(host_pool->isAllocated(block)) << outcome;
+        EXPECT_EQ(host_pool->referencedBlocksNum(BlockTreeRefType::STORE), 0u);
+        backend.shutdown();
+    }
+}
+
+TEST(StorageBackendTest, HostSourcesAreRejectedForReadsAndUnboundWrites) {
+    auto        pool = std::make_shared<TestBlockPool>();
+    TestBackend backend;
+    ASSERT_TRUE(initBackend(backend, pool));
+    auto request        = makeRequest(1);
+    request.source_tier = Tier::HOST;
+    EXPECT_ANY_THROW(backend.prepareWrite(request));
+    EXPECT_ANY_THROW(backend.read(request, nullptr, {}));
+    EXPECT_ANY_THROW(backend.match(request, {}));
+    backend.shutdown();
 }
 
 TEST(StorageBackendTest, AsyncWriteDuringStoppingIsRejectedAndReleasesPins) {

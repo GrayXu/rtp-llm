@@ -33,16 +33,25 @@ void invokeCallback(const StorageBackend* backend, Callback&& callback) noexcept
 struct StorageTaskState {
     struct Pin {
         DeviceBlockPoolPtr pool;
+        std::shared_ptr<HostBlockPool> host_pool;
         BlockIdxType       block;
     };
 
+    StorageBackend* owner{nullptr};
+    bool quarantined{false};
+    bool sdk_can_drain{true};
     StorageRequest   request;
     std::vector<Pin> pins;
+    std::vector<std::shared_ptr<IBlockPool>> borrowed_pools;
     std::once_flag   finish_once;
     void             finish() {
         std::call_once(finish_once, [this] {
             for (const Pin& pin : pins) {
-                pin.pool->decRef(pin.block);
+                if (pin.host_pool) {
+                    pin.host_pool->decTreeRef(pin.block, BlockTreeRefType::STORE);
+                } else {
+                    pin.pool->decRef(pin.block);
+                }
             }
             pins.clear();
         });
@@ -59,7 +68,7 @@ namespace rtp_llm {
 namespace {
 
 struct BlockKey {
-    DeviceBlockPool* pool;
+    IBlockPool*      pool;
     BlockIdxType     block;
     bool             operator==(const BlockKey& other) const {
         return pool == other.pool && block == other.block;
@@ -68,7 +77,7 @@ struct BlockKey {
 
 struct BlockKeyHash {
     size_t operator()(const BlockKey& key) const {
-        return std::hash<DeviceBlockPool*>{}(key.pool) ^ (std::hash<BlockIdxType>{}(key.block) << 1U);
+        return std::hash<IBlockPool*>{}(key.pool) ^ (std::hash<BlockIdxType>{}(key.block) << 1U);
     }
 };
 
@@ -76,6 +85,12 @@ struct BlockKeyHash {
 
 StorageWriteTask::StorageWriteTask(std::shared_ptr<storage_backend_detail::StorageTaskState> state):
     state_(std::move(state)) {}
+
+void StorageWriteTask::quarantine(bool sdk_can_drain) {
+    if (state_) {
+        state_->owner->quarantineTask(state_, sdk_can_drain);
+    }
+}
 
 StorageBackend::StorageBackend(std::shared_ptr<StorageBackendExecutor> executor): executor_(std::move(executor)) {}
 
@@ -87,7 +102,10 @@ StorageBackend::~StorageBackend() {
 
 bool StorageBackend::init(std::shared_ptr<const CacheTopology> topology,
                           PoolsByTag                           pools_by_tag,
-                          BufferResolver                       buffer_resolver) {
+                          BufferResolver                       buffer_resolver,
+                          HostPoolsByTag                       host_pools_by_tag,
+                          BufferResolver                       host_buffer_resolver,
+                          HostWriteResolver                    host_write_resolver) {
     if (init_attempted_) {
         RTP_LLM_LOG_ERROR("StorageBackend initialization has already been attempted");
         return false;
@@ -101,6 +119,12 @@ bool StorageBackend::init(std::shared_ptr<const CacheTopology> topology,
         RTP_LLM_CHECK_WITH_INFO(
             seen_pools.emplace(pool.get()).second, "storage tags must own distinct pools: tag=%s", tag.c_str());
     }
+    RTP_LLM_CHECK_WITH_INFO(host_pools_by_tag.empty() || host_buffer_resolver,
+                            "host storage pools require a buffer resolver");
+    for (const auto& [tag, pool] : host_pools_by_tag) {
+        (void)topology->group(tag);
+        RTP_LLM_CHECK_WITH_INFO(pool != nullptr, "null host storage pool for tag=%s", tag.c_str());
+    }
     init_attempted_ = true;
     if (executor_ == nullptr) {
         executor_ = makeDefaultStorageBackendExecutor();
@@ -112,10 +136,16 @@ bool StorageBackend::init(std::shared_ptr<const CacheTopology> topology,
     topology_            = std::move(topology);
     pools_by_tag_        = std::move(pools_by_tag);
     buffer_resolver_     = std::move(buffer_resolver);
+    host_pools_by_tag_ = std::move(host_pools_by_tag);
+    host_buffer_resolver_ = std::move(host_buffer_resolver);
+    host_write_resolver_ = std::move(host_write_resolver);
     const auto fail_init = [this] {
         shutdownImpl();
         buffer_resolver_ = {};
         pools_by_tag_.clear();
+        host_buffer_resolver_ = {};
+        host_pools_by_tag_.clear();
+        host_write_resolver_ = {};
         topology_.reset();
         return false;
     };
@@ -227,6 +257,18 @@ void StorageBackend::shutdown() {
         quarantine_generation    = ++quarantine_generation_;
     }
     onQuarantineChanged(quarantine_generation, /*task_count=*/0, /*block_count=*/0);
+    // Shutdown may return before unconfirmed DMA has stopped. Keep those
+    // HOST and DEVICE allocations alive through process termination.
+    static auto* retained_tasks = new std::vector<std::shared_ptr<storage_backend_detail::StorageTaskState>>;
+    static auto* retained_mutex = new std::mutex;
+    {
+        std::lock_guard<std::mutex> lock(*retained_mutex);
+        for (auto& task : released_tasks) {
+            if (!task->sdk_can_drain) {
+                retained_tasks->push_back(std::move(task));
+            }
+        }
+    }
     // shutdownImpl() drains the transport before these pins become reusable.
     released_tasks.clear();
     {
@@ -236,7 +278,8 @@ void StorageBackend::shutdown() {
     lifecycle_cv_.notify_all();
 }
 
-void StorageBackend::quarantineTask(const std::shared_ptr<storage_backend_detail::StorageTaskState>& state) {
+void StorageBackend::quarantineTask(const std::shared_ptr<storage_backend_detail::StorageTaskState>& state,
+                                    bool sdk_can_drain) {
     if (!state) {
         return;
     }
@@ -245,7 +288,17 @@ void StorageBackend::quarantineTask(const std::shared_ptr<storage_backend_detail
     uint64_t generation;
     {
         std::lock_guard<std::mutex> lock(quarantine_mutex_);
+        state->sdk_can_drain = state->sdk_can_drain && sdk_can_drain;
+        if (state->quarantined) {
+            return;
+        }
+        state->quarantined = true;
         quarantine_active_.store(true, std::memory_order_release);
+        for (const auto& pin : state->pins) {
+            if (pin.host_pool) {
+                pin.host_pool->markUncertainRemoteIo();
+            }
+        }
         quarantined_block_count_ += state->pins.size();
         quarantined_tasks_.push_back(state);
         task_count  = quarantined_tasks_.size();
@@ -277,9 +330,11 @@ void StorageBackend::endTransfer() {
     --active_transfer_count_;
 }
 
-std::shared_ptr<storage_backend_detail::StorageTaskState> StorageBackend::prepare(StorageRequest request) {
-    validateRequest(request, /*allow_null_blocks=*/false);
+std::shared_ptr<storage_backend_detail::StorageTaskState>
+StorageBackend::prepare(StorageRequest request, bool allow_host, bool allocation_owner) {
+    validateRequest(request, /*allow_null_blocks=*/false, allow_host);
     auto state     = std::make_shared<storage_backend_detail::StorageTaskState>();
+    state->owner   = this;
     state->request = std::move(request);
     RTP_LLM_CHECK(initialized_);
 
@@ -292,11 +347,36 @@ std::shared_ptr<storage_backend_detail::StorageTaskState> StorageBackend::prepar
     std::unordered_set<BlockKey, BlockKeyHash> pinned;
     for (const auto& key_handles : state->request.handles) {
         for (const StorageBlockHandle& handle : key_handles) {
-            const auto&    pool = devicePool(handle.tag);
-            const BlockKey key{pool.get(), handle.block};
-            if (pinned.insert(key).second) {
-                pool->incRef(handle.block);
-                state->pins.push_back({pool, handle.block});
+            if (state->request.source_tier == Tier::HOST) {
+                const auto& pool = host_pools_by_tag_.at(handle.tag);
+                if (pinned.insert({pool.get(), handle.block}).second) {
+                    if (!allocation_owner) {
+                        RTP_LLM_CHECK_WITH_INFO(pool->validBlock(handle.block), "invalid worker HOST cache block ID");
+                        state->borrowed_pools.push_back(pool);
+                        continue;
+                    }
+                    // Several tags can share one packed HOST block.
+                    state->pins.push_back({nullptr, pool, handle.block});
+                    try {
+                        pool->incTreeRef(handle.block, BlockTreeRefType::STORE);
+                    } catch (...) {
+                        state->pins.pop_back();
+                        throw;
+                    }
+                }
+                continue;
+            }
+            {
+                const auto& pool = devicePool(handle.tag);
+                if (pinned.insert({pool.get(), handle.block}).second) {
+                    if (allocation_owner) {
+                        pool->incRef(handle.block);
+                        state->pins.push_back({pool, nullptr, handle.block});
+                    } else {
+                        RTP_LLM_CHECK_WITH_INFO(pool->validBlock(handle.block), "invalid worker cache block ID");
+                        state->borrowed_pools.push_back(pool);
+                    }
+                }
             }
         }
     }
@@ -307,7 +387,43 @@ std::shared_ptr<storage_backend_detail::StorageTaskState> StorageBackend::prepar
     return state;
 }
 
-void StorageBackend::validateRequest(const StorageRequest& request, bool allow_null_blocks) const {
+bool StorageBackend::runTransfer(StorageRequest request,
+                                  bool allocation_owner,
+                                  const std::function<bool(StorageWriteTask)>& transfer) {
+    {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        if (lifecycle_ != Lifecycle::ACCEPTING) {
+            return false;
+        }
+        ++in_flight_;
+    }
+    struct Completion {
+        StorageBackend* backend;
+        bool transfer_started{false};
+        ~Completion() {
+            if (transfer_started) {
+                backend->endTransfer();
+            }
+            backend->taskFinished();
+        }
+    } completion{this};
+    auto state = prepare(std::move(request), /*allow_host=*/true, allocation_owner);
+    if (!state || !tryBeginTransfer()) {
+        return false;
+    }
+    completion.transfer_started = true;
+    try {
+        return transfer(StorageWriteTask(state));
+    } catch (const StorageOperationCompletionUnknown& error) {
+        quarantineTask(state, error.sdkCanDrain());
+        throw;
+    }
+}
+
+void StorageBackend::validateRequest(const StorageRequest& request, bool allow_null_blocks, bool allow_host) const {
+    RTP_LLM_CHECK_WITH_INFO(request.source_tier == Tier::DEVICE || (allow_host && request.source_tier == Tier::HOST),
+                            "unsupported storage source tier: %s",
+                            tierName(request.source_tier));
     RTP_LLM_CHECK_WITH_INFO(request.keys != nullptr, "storage request requires cache keys");
     RTP_LLM_CHECK_WITH_INFO(request.handles.size() == request.keys->size(),
                             "storage request key/handle count mismatch: keys=%zu handles=%zu",
@@ -318,6 +434,11 @@ void StorageBackend::validateRequest(const StorageRequest& request, bool allow_n
         for (const auto& handle : request.handles[key_index]) {
             RTP_LLM_CHECK_WITH_INFO(!handle.tag.empty(), "storage handle has empty tag at key=%zu", key_index);
             (void)topology().group(handle.tag);
+            if (request.source_tier == Tier::HOST) {
+                RTP_LLM_CHECK_WITH_INFO(host_pools_by_tag_.count(handle.tag) != 0 && host_buffer_resolver_,
+                                        "storage has no HOST source for tag=%s",
+                                        handle.tag.c_str());
+            }
             RTP_LLM_CHECK_WITH_INFO(seen_tags.emplace(handle.tag).second,
                                     "storage request has duplicate tag=%s at key=%zu",
                                     handle.tag.c_str(),
@@ -339,9 +460,22 @@ const DeviceBlockPoolPtr& StorageBackend::devicePool(const std::string& tag) con
     return pools_by_tag_.at(tag);
 }
 
-std::vector<BlockInfo> StorageBackend::convertIndexToBuffer(int layer_id, const std::string& tag, int block_id) const {
-    RTP_LLM_CHECK(static_cast<bool>(buffer_resolver_));
+const std::shared_ptr<HostBlockPool>& StorageBackend::hostPool(const std::string& tag) const {
+    return host_pools_by_tag_.at(tag);
+}
+
+const StorageBackend::HostWriteResolver& StorageBackend::hostWriteResolver() const {
+    return host_write_resolver_;
+}
+
+std::vector<BlockInfo>
+StorageBackend::convertIndexToBuffer(int layer_id, const std::string& tag, int block_id, Tier source_tier) const {
     (void)topology().group(tag);
+    if (source_tier == Tier::HOST) {
+        RTP_LLM_CHECK(host_pools_by_tag_.count(tag) != 0 && host_buffer_resolver_);
+        return host_buffer_resolver_(layer_id, tag, block_id);
+    }
+    RTP_LLM_CHECK(source_tier == Tier::DEVICE && buffer_resolver_);
     return buffer_resolver_(layer_id, tag, block_id);
 }
 
@@ -356,11 +490,16 @@ void StorageBackend::match(StorageRequest request, MatchDone done) {
     validateRequest(request, /*allow_null_blocks=*/true);
     dispatch([this, request = std::move(request), done = std::move(done)](Lifecycle outcome) mutable {
         StorageMatchResult result;
-        bool               success = outcome == Lifecycle::ACCEPTING && !quarantineActive();
+        bool               success = outcome == Lifecycle::ACCEPTING;
         if (success) {
-            try {
-                result = matchImpl(request);
-            } catch (...) { success = false; }
+            if (quarantineActive()) {
+                // Unsubmitted requests can keep their local prefix and recompute.
+                result.matched_blocks_num = request.local_matched_blocks_num;
+            } else {
+                try {
+                    result = matchImpl(request);
+                } catch (...) { success = false; }
+            }
         }
         if (done) {
             done(success ? result.matched_blocks_num : 0, success ? std::move(result.match_meta) : nullptr, success);
@@ -385,6 +524,7 @@ void StorageBackend::read(StorageRequest request, std::shared_ptr<StorageBackend
                               ErrorInfo::OkStatus() :
                               ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, "storage backend is not accepting reads");
         bool quarantine = false;
+        bool sdk_can_drain = true;
         const bool transfer_started = error.ok() && tryBeginTransfer();
         if (error.ok() && !transfer_started) {
             error = ErrorInfo(ErrorCode::EXECUTION_EXCEPTION,
@@ -394,17 +534,19 @@ void StorageBackend::read(StorageRequest request, std::shared_ptr<StorageBackend
             try {
                 readImpl(state->request, match_meta);
             } catch (const StorageOperationTimeout& exception) {
-                error      = ErrorInfo(ErrorCode::DEADLINE_EXCEEDED, exception.what());
+                error      = ErrorInfo(ErrorCode::DEADLINE_EXCEEDED, exception.what(), /*completion_unknown=*/true);
                 quarantine = true;
+                sdk_can_drain = exception.sdkCanDrain();
             } catch (const StorageOperationCompletionUnknown& exception) {
-                error      = ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, exception.what());
+                error      = ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, exception.what(), /*completion_unknown=*/true);
                 quarantine = true;
+                sdk_can_drain = exception.sdkCanDrain();
             } catch (const std::exception& exception) {
                 error = ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, exception.what());
             } catch (...) { error = ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, "unknown storage read failure"); }
         }
         if (quarantine) {
-            quarantineTask(state);
+            quarantineTask(state, sdk_can_drain);
         }
         if (transfer_started) {
             endTransfer();
@@ -423,7 +565,7 @@ StorageWriteTask StorageBackend::prepareWrite(StorageRequest request) {
     if (request.empty()) {
         return {};
     }
-    return StorageWriteTask(prepare(std::move(request)));
+    return StorageWriteTask(prepare(std::move(request), /*allow_host=*/true));
 }
 
 bool StorageBackend::write(StorageWriteTask task) {
@@ -432,16 +574,18 @@ bool StorageBackend::write(StorageWriteTask task) {
     auto state = std::move(task.state_);
     return dispatch([this, state](Lifecycle outcome) {
         bool quarantine = false;
+        bool sdk_can_drain = true;
         const bool transfer_started = outcome == Lifecycle::ACCEPTING && tryBeginTransfer();
         if (transfer_started) {
             try {
                 writeImpl(state->request);
-            } catch (const StorageOperationCompletionUnknown&) {
+            } catch (const StorageOperationCompletionUnknown& error) {
                 quarantine = true;
+                sdk_can_drain = error.sdkCanDrain();
             } catch (...) {}
         }
         if (quarantine) {
-            quarantineTask(state);
+            quarantineTask(state, sdk_can_drain);
         }
         if (transfer_started) {
             endTransfer();
