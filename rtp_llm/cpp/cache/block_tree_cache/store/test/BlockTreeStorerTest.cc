@@ -1035,6 +1035,7 @@ TEST(BlockTreeStorerTest, RequestFinishDualWriteReturnsBeforeLocalTransferSettle
             FAIL() << "HOST/DISK transfer did not enter the controlled barrier";
         }
         const auto before_release = insert.waitFor(std::chrono::seconds(5));
+        EXPECT_EQ(backend->submittedCount(), 1u);
         barrier->release();
         const auto after_cleanup =
             before_release == std::future_status::ready ? before_release : insert.waitFor(std::chrono::seconds(5));
@@ -1053,6 +1054,9 @@ TEST(BlockTreeStorerTest, RequestFinishDualWriteReturnsBeforeLocalTransferSettle
         const BlockIdxType target_block = resource.getBlocks(target_tier).front();
         EXPECT_EQ(env->poolFor(target_tier).treeRefCount(target_block), 1u);
         EXPECT_EQ(env->storeRefCount(), 0u);
+        EXPECT_EQ(env->device_pools[0]->refCount(holder[0][0]), 2u);
+        releaseDeviceBlocks(*env->cache, env->device_pools[0], holder[0]);
+        EXPECT_EQ(env->device_pools[0]->refCount(holder[0][0]), 1u);
         backend->finishWrite();
         EXPECT_EQ(backend->blocks(), (std::vector<BlockIdxType>{holder[0][0]}));
         EXPECT_EQ(backend->keyHandleCounts(), (std::vector<size_t>{1}));

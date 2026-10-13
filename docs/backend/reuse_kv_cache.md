@@ -67,11 +67,12 @@ protocol compatibility, but do not change this local-tier policy.
 
 - **Lookup** may use any enabled local tier, plus the configured remote backend.
 - **Storage after successful completion** selects one local target: L1 (DEVICE), then L2
-  (HOST), then L3 (DISK). Lower-tier demotion is a separate operation.
+  (HOST), then L3 (DISK). With `ENABLE_REMOTE_CACHE=1` and an initialized backend,
+  completion also submits a remote write. Lower-tier demotion is a separate operation.
 
 With cache reuse enabled, the local-tier rules are:
 
-| Enabled local tiers (deployment) | Lookup may use | Request-completion store target |
+| Enabled local tiers (deployment) | Lookup may use | Request-completion local target |
 |---------------------------------|----------------|---------------------------------|
 | None | None locally | None |
 | L1 | L1 | L1 |
@@ -83,16 +84,19 @@ With cache reuse enabled, the local-tier rules are:
 | L1, L2, L3 | L1, L2, L3 | L1 |
 
 Remote caching requires a backend enabled and initialized by the deployment configuration.
-Every DEVICE insert also prepares a remote upload when that backend exists, including
-resident inserts and duplicate keys. HOST/DISK inserts do not upload. Remote writes are
-asynchronous, submitted outside the tree lock, and do not delay insert until I/O completes;
-a failed upload does not roll back the DEVICE cache entry.
+A remote-only deployment supports both lookup and automatic upload after successful completion.
+Request-completion uploads always use a DEVICE source; explicit HOST inserts use CPU IOVs.
+Remote writes are asynchronous, so request completion does not guarantee remote persistence.
+A failed upload does not roll back the local cache or change the request's successful status.
 
-The request's `enable_remote_cache` field remains accepted but does not control this DEVICE
-upload path or remote lookup admission. A remote-only deployment can still look up remote
-entries, but has no request-completion store target. Direct REMOTE inserts are unsupported.
-Backend availability does not bypass successful completion, `reuse_cache`, or allocator
-resource eligibility checks required to reach a DEVICE insert.
+Other DEVICE inserts also prepare an upload when the backend is available, including resident
+system prompts and duplicate keys.
+
+The request's `enable_remote_cache` field remains accepted but does not control remote lookup
+or request-completion upload. Completion storage still requires a successful request,
+`reuse_cache`, and eligible allocator resources. See
+[GPU dual writes and explicit HOST writes](#gpu-dual-writes-and-explicit-host-writes)
+for uploading populated HOST blocks.
 
 ### KVCM remote cache
 
@@ -112,6 +116,11 @@ Processes exchanging `KVCacheConfig` must use the same build version. The config
 v9 and can read v1–v8. See [KV cache event publisher](kv_cache_event_publisher.md) for HBM reporting.
 
 #### GPU dual writes and explicit HOST writes
+
+On successful completion, the request stores KV in the configured local tier and asynchronously
+writes remote cache from a DEVICE source through the GDR path. A local HOST target still uses
+the GPU for upload, without waiting for or reusing the D2H copy. Regular local copies, migration
+and eviction do not trigger additional uploads.
 
 Explicit inserts of ready HOST content use ordinary CPU IOVs and the transfer client for the
 original business tag. Each rank resolves HOST blocks by its local cache key/coordinate and
@@ -174,7 +183,7 @@ transfer strategy selected by SDK/PACE.
 ### Ignoring request cache switches
 
 Setting `RTP_LLM_IGNORE_REQUEST_CACHE_SWITCHES=1` (default off) ignores the request's
-`reuse_cache` switch for lookup and storage. Local tiers and DEVICE uploads already follow
+`reuse_cache` switch for lookup and storage. Local tiers and remote uploads already follow
 deployment policy regardless of this setting. It does not enable a tier disabled by the
 deployment, and deployment-level `REUSE_CACHE=0` still disables reuse entirely.
 
