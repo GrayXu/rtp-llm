@@ -4,6 +4,7 @@
 #include <exception>
 #include <mutex>
 #include <memory>
+#include <numeric>
 #include <thread>
 #include <unistd.h>
 #include <limits.h>
@@ -364,14 +365,26 @@ void DecodeRpcServer::prepareGenerateContext(DecodeGenerateContext& decode_conte
     for (auto& addr : allocate_request.peer_addrs()) {
         decode_context.peer_addrs.push_back(addr);
     }
-    if (maga_init_params_.parallelism_config.prefill_cp_config.kv_cache_sharded
-        && maga_init_params_.parallelism_config.prefill_cp_config.is_prefill_enabled()) {
-        const auto configured_prefill_cp_size = maga_init_params_.parallelism_config.prefill_cp_config.prefill_cp_size;
-        RTP_LLM_CHECK_WITH_INFO(configured_prefill_cp_size > 1,
-                                "decode PREFILL_CP sharded mode requires explicit PREFILL_CP_SIZE");
-        decode_context.prefill_cp_size = static_cast<int32_t>(configured_prefill_cp_size);
-    } else {
-        decode_context.prefill_cp_size = 1;
+    decode_context.prefill_cp_size    = allocate_request.prefill_cp_size();
+    decode_context.prefill_cp_sharded = allocate_request.prefill_cp_sharded();
+    decode_context.cache_store_geometry.assign(allocate_request.cache_store_geometry().begin(),
+                                                allocate_request.cache_store_geometry().end());
+    GRPC_RET_IF_ERROR(decode_context,
+                      decode_context.prefill_cp_size > 0
+                          && (!decode_context.prefill_cp_sharded || decode_context.prefill_cp_size > 1)
+                          && (decode_context.prefill_cp_size == 1
+                              || decode_context.peer_addrs.size()
+                                     == static_cast<size_t>(decode_context.prefill_cp_size)),
+                      grpc::StatusCode::INVALID_ARGUMENT,
+                      "invalid producer CP topology in ALLOCATE");
+    const auto& cp_hint = maga_init_params_.parallelism_config.prefill_cp_config;
+    if (cp_hint.is_prefill_enabled()) {
+        GRPC_RET_IF_ERROR(decode_context,
+                          cp_hint.kv_cache_sharded == decode_context.prefill_cp_sharded
+                              && (cp_hint.prefill_cp_size == 0
+                                  || cp_hint.prefill_cp_size == decode_context.prefill_cp_size),
+                          grpc::StatusCode::INVALID_ARGUMENT,
+                          "producer CP topology disagrees with decode PREFILL_CP configuration");
     }
     RTP_LLM_LOG_DEBUG("request [%s] prepare generate context done, prefill_cp_size=%d",
                       decode_context.request_key.c_str(),
@@ -756,13 +769,19 @@ BroadcastLoadRequestPB DecodeRpcServer::constructRemoteLoadRequestForMla(
     request.set_partition_count(1);
     request.set_partition_id(0);
     request.set_prefill_cp_size(load_context.prefill_cp_size);
+    request.set_prefill_cp_sharded(load_context.prefill_cp_sharded);
+    for (const auto& geometry : load_context.cache_store_geometry) {
+        request.add_cache_store_geometry()->CopyFrom(geometry);
+    }
 
-    if (load_context.prefill_cp_size > 1) {
+    if (load_context.prefill_cp_sharded) {
         // CP-sharded prefill: every decode rank must pull the shard owned by
         // every prefill CP peer.
         for (const auto& addr : peer_addrs) {
             request.add_peer_addrs(addr);
         }
+    } else if (load_context.prefill_cp_size > 1) {
+        request.add_peer_addrs(peer_addrs[index % peer_addrs.size()]);
     } else if (resource_.workers.size() % peer_addrs.size() == 0) {
         // D >= P
         int part_cnt = resource_.workers.size() / peer_addrs.size();
@@ -786,28 +805,47 @@ BroadcastLoadRequestPB DecodeRpcServer::constructRemoteLoadRequestForMla(
 
 BroadcastLoadRequestPB DecodeRpcServer::constructRemoteLoadRequest(const LoadKVCacheContext&       load_context,
                                                                    int                             index,
-                                                                   const std::vector<std::string>& peer_addrs) const {
+                                                                   const std::vector<std::string>& peer_addrs,
+                                                                   bool split_cp_heads) const {
     load_context.groupBlockIds().validate();
     BroadcastLoadRequestPB request;
     request.set_request_id(load_context.request_id);
     request.set_request_key(load_context.request_key);
     request.set_dp_rank(maga_init_params_.parallelism_config.dp_rank);
     request.set_prefill_cp_size(load_context.prefill_cp_size);
-    if (load_context.prefill_cp_size > 1) {
-        // CP-sharded prefill: each peer owns a page-level or in-page shard.
-        // Keep one logical partition and let loadCache route groups/blocks to
-        // the owning peer.
+    request.set_prefill_cp_sharded(load_context.prefill_cp_sharded);
+    for (const auto& geometry : load_context.cache_store_geometry) {
+        request.add_cache_store_geometry()->CopyFrom(geometry);
+    }
+    if (load_context.prefill_cp_sharded) {
+        // CP peers own token pages with all KV heads. Partition each selected
+        // page into the decode head groups, including GQA replicas.
         request.set_partition_count(1);
         request.set_partition_id(0);
+        if (split_cp_heads) {
+            const int workers = static_cast<int>(resource_.workers.size());
+            const int heads   = static_cast<int>(maga_init_params_.model_config_.attn_config.kv_head_num);
+            RTP_LLM_CHECK_WITH_INFO(workers > 0 && heads > 0 && index >= 0 && index < workers,
+                                    "invalid CP-to-TP head partition: workers=%d heads=%d index=%d",
+                                    workers,
+                                    heads,
+                                    index);
+            const int partitions = std::gcd(workers, heads);
+            request.set_partition_count(partitions);
+            request.set_partition_id(index / (workers / partitions));
+        }
         for (const auto& addr : peer_addrs) {
             request.add_peer_addrs(addr);
         }
-    } else if (maga_init_params_.parallelism_config.prefill_cp_config.is_prefill_enabled()) {
+    } else if (load_context.prefill_cp_size > 1) {
         // Prefill worker has full KV cache on each rank.
-        int part_cnt = resource_.workers.size();
+        const int heads = static_cast<int>(maga_init_params_.model_config_.attn_config.kv_head_num);
+        const int workers = static_cast<int>(resource_.workers.size());
+        RTP_LLM_CHECK_WITH_INFO(heads > 0 && workers > 0, "invalid producer CP head topology");
+        const int part_cnt = std::gcd(workers, heads);
         int peer_cnt = peer_addrs.size();
         request.set_partition_count(part_cnt);
-        request.set_partition_id(index % part_cnt);
+        request.set_partition_id(index / (workers / part_cnt));
         request.add_peer_addrs(peer_addrs[index % peer_cnt]);
     } else {
         if (resource_.workers.size() % peer_addrs.size() == 0) {
@@ -847,7 +885,8 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCacheForAllRank(DecodeGene
     const auto&                        cache_resource  = generate_stream->kvCachePtr()->cacheResource(0);
     auto                               group_block_ids = cache_resource.groupBlockIds();
 
-    const auto topology_error = validateRemoteLoadTopology(resource_.workers.size(), decode_context.peer_addrs.size());
+    const auto topology_error = decode_context.prefill_cp_size > 1 ? ErrorInfo::OkStatus() :
+        validateRemoteLoadTopology(resource_.workers.size(), decode_context.peer_addrs.size());
     if (!topology_error.ok()) {
         RTP_LLM_LOG_WARNING("request:[%s] invalid remote load topology: peer count=%zu worker count=%zu error=%s",
                             decode_context.request_key.c_str(),
@@ -882,7 +921,9 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCacheForAllRank(DecodeGene
                                     1,
                                     0,
                                     decode_context.server_context,
-                                    decode_context.prefill_cp_size};
+                                    decode_context.prefill_cp_size,
+                                    decode_context.prefill_cp_sharded,
+                                    decode_context.cache_store_geometry};
 
     // Prefill: TP = 1 && Decode: TP = 1
     if (resource_.workers.size() == 1 && decode_context.peer_addrs.size() == 1) {
@@ -901,7 +942,8 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCacheForAllRank(DecodeGene
 DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCacheAsyncForTp(DecodeGenerateContext& decode_context,
                                                                       LoadKVCacheContext&    load_context) {
     RTP_LLM_PROFILE_FUNCTION();
-    validateGroupTags(load_context, engine_->resourceContext().cache_manager->cacheConfig().topology());
+    const auto& cache_config = engine_->resourceContext().cache_manager->cacheConfig();
+    validateGroupTags(load_context, cache_config.topology());
     int64_t load_cache_begin_time_us = currentTimeUs();
 
     struct WorkerRpcContext {
@@ -943,10 +985,17 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCacheAsyncForTp(DecodeGene
         rpc_context.stub  = connect_status.value().stub;
         BroadcastLoadRequestPB load_request;
 
-        if (engine_->resourceContext().cache_manager->cacheConfig().use_mla) {
+        if (cache_config.use_mla) {
             load_request = constructRemoteLoadRequestForMla(load_context, i, decode_context.peer_addrs);
         } else {
-            load_request = constructRemoteLoadRequest(load_context, i, decode_context.peer_addrs);
+            // Opaque and hybrid records pack multiple state components;
+            // contiguous head partitioning applies to separate MHA K/V records.
+            load_request = constructRemoteLoadRequest(
+                load_context,
+                i,
+                decode_context.peer_addrs,
+                cache_config.groupNums() == 1 && !cache_config.use_opaque_kv_cache_store
+                    && cache_config.topology().groups().front().policy.group_type != CacheGroupType::LINEAR);
         }
         std::unique_ptr<ClientAsyncResponseReader<BroadcastLoadResponsePB>> reader(rpc_context.stub->AsyncRemoteLoad(
             rpc_context.client_context.get(), load_request, &completion_queues[i % completion_queues.size()]));
@@ -1081,6 +1130,135 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCacheAsyncForTp(DecodeGene
     return {ErrorInfo::OkStatus(), minLoadedCacheBlockCount(rank_loaded_cache_block_counts)};
 }
 
+bool DecodeRpcServer::usesMhaPageKeys(const CacheConfig& config) {
+    return config.groupNums() == 1 && !config.use_mla && !config.use_opaque_kv_cache_store
+           && config.topology().groups().front().spec->type == KVCacheSpecType::MultiHeadAttention
+           && config.topology().groups().front().policy.group_type != CacheGroupType::LINEAR;
+}
+
+ErrorInfo DecodeRpcServer::validateCacheStoreGeometry(const LoadKVCacheContext& context, const CacheConfig& config) {
+    auto invalid = [](const std::string& message) {
+        return ErrorInfo(ErrorCode::LOAD_KV_CACHE_FAILED, "invalid producer cache geometry: " + message);
+    };
+    if (context.prefill_cp_size <= 0 || context.partition_count <= 0 || context.partition_id < 0
+        || context.partition_id >= context.partition_count || (context.prefill_cp_sharded && context.prefill_cp_size <= 1)
+        || (context.prefill_cp_sharded
+            && context.peer_addrs.size() != static_cast<size_t>(context.prefill_cp_size))) {
+        return invalid("CP topology disagrees with prefill peers");
+    }
+    std::unordered_set<std::string> tags;
+    for (const auto& geometry : context.cache_store_geometry) {
+        const auto physical = geometry.physical_tokens_per_block();
+        const auto kernel   = geometry.kernel_tokens_per_block();
+        if (geometry.tag().empty() || !tags.insert(geometry.tag()).second || physical == 0 || kernel == 0
+            || physical > std::numeric_limits<uint32_t>::max() || kernel > physical || physical % kernel != 0) {
+            return invalid("missing, duplicate, or malformed tag=" + geometry.tag());
+        }
+    }
+    if (!usesMhaPageKeys(config)) {
+        return ErrorInfo::OkStatus();
+    }
+    const auto& group = config.topology().groups().front();
+    const auto  source = std::find_if(context.cache_store_geometry.begin(),
+                                     context.cache_store_geometry.end(),
+                                     [&](const auto& geometry) { return geometry.tag() == group.tag; });
+    if (source == context.cache_store_geometry.end()) {
+        return invalid("missing MHA tag=" + group.tag);
+    }
+    if (source->physical_tokens_per_block() != group.seqSizePerBlock()) {
+        return invalid("tag=" + group.tag + " physical_tokens_per_block source="
+                       + std::to_string(source->physical_tokens_per_block()) + " decode="
+                       + std::to_string(group.seqSizePerBlock()));
+    }
+    const size_t heads = group.localKvHeadNum();
+    const size_t tokens = group.seqSizePerBlock();
+    const size_t kernel = group.kernelSeqSizePerBlock();
+    const size_t kv_bytes = group.kvBlockStrideBytes();
+    const size_t scale_bytes = group.kvScaleStrideBytes();
+    if (heads == 0 || tokens == 0 || kernel == 0 || tokens % kernel != 0 || kv_bytes == 0 || kv_bytes % 2 != 0
+        || (kv_bytes / 2) % heads != 0 || (kv_bytes / 2 / heads) % tokens != 0 || scale_bytes % 2 != 0
+        || (scale_bytes != 0 && ((scale_bytes / 2) % heads != 0 || (scale_bytes / 2 / heads) % tokens != 0))) {
+        return invalid("tag=" + group.tag + " invalid decode MHA byte layout");
+    }
+    if (context.prefill_cp_size > 1) {
+        if (group.spec->global_kv_head_num == 0 || group.spec->global_kv_head_num % heads != 0) {
+            return invalid("tag=" + group.tag + " invalid CP-to-TP MHA heads");
+        }
+    } else if (context.peer_addrs.empty() || heads % context.peer_addrs.size() != 0) {
+        return invalid("tag=" + group.tag + " invalid source TP head groups");
+    }
+    return ErrorInfo::OkStatus();
+}
+
+void DecodeRpcServer::appendMhaPageBuffers(CacheLoadBuckets& buckets,
+                                           int64_t request_id,
+                                           const std::string& cache_key,
+                                           const GroupBase& group,
+                                           const CacheStoreGeometryPB& source_geometry,
+                                           const std::vector<BlockInfo>& physical_parts,
+                                           size_t source_heads,
+                                           size_t source_head_begin,
+                                           size_t destination_head_begin,
+                                           size_t head_count) {
+    const size_t tokens = group.seqSizePerBlock();
+    const size_t source_kernel = source_geometry.kernel_tokens_per_block();
+    const size_t destination_kernel = group.kernelSeqSizePerBlock();
+    const size_t destination_heads = group.localKvHeadNum();
+    RTP_LLM_CHECK_WITH_INFO(source_geometry.physical_tokens_per_block() == tokens && source_kernel > 0
+                                && destination_kernel > 0 && tokens % source_kernel == 0
+                                && tokens % destination_kernel == 0 && source_heads > 0 && head_count > 0
+                                && source_head_begin + head_count <= source_heads
+                                && destination_head_begin + head_count <= destination_heads,
+                            "invalid MHA page/head mapping for key=%s", cache_key.c_str());
+    RTP_LLM_CHECK_WITH_INFO(physical_parts.size() == (group.kvScaleStrideBytes() > 0 ? 2 : 1),
+                            "invalid MHA physical buffers for key=%s", cache_key.c_str());
+    const size_t fragment_tokens = std::gcd(source_kernel, destination_kernel);
+    const size_t source_fragments = source_kernel / fragment_tokens;
+    const bool same_kernel = source_kernel == destination_kernel;
+    RTP_LLM_CHECK_WITH_INFO(!same_kernel
+                                || (source_heads % head_count == 0 && source_head_begin % head_count == 0),
+                            "invalid MHA head group for key=%s", cache_key.c_str());
+    const size_t partition_count = same_kernel ? source_heads / head_count : source_heads * source_fragments;
+    RTP_LLM_CHECK_WITH_INFO(partition_count > 0 && partition_count <= std::numeric_limits<int>::max(),
+                            "MHA partition count overflow for key=%s", cache_key.c_str());
+
+    const char* prefixes[] = {"k_", "v_", "k_scale_", "v_scale_"};
+    for (size_t component = 0; component < physical_parts.size() * 2; ++component) {
+        const auto& physical = physical_parts[component / 2];
+        const size_t stride = component < 2 ? group.kvBlockStrideBytes() : group.kvScaleStrideBytes();
+        RTP_LLM_CHECK_WITH_INFO(physical.addr != nullptr && physical.size_bytes == stride && stride % 2 == 0
+                                    && (stride / 2) % destination_heads == 0
+                                    && (stride / 2 / destination_heads) % tokens == 0,
+                                "invalid MHA component stride for key=%s", cache_key.c_str());
+        const size_t vector_bytes = stride / 2 / destination_heads / tokens;
+        const size_t destination_page_bytes = stride / (tokens / destination_kernel);
+        const size_t heads_per_fragment = same_kernel ? head_count : 1;
+        for (size_t head = 0; head < head_count; head += heads_per_fragment) {
+            for (size_t token = 0; token < tokens; token += fragment_tokens) {
+                const size_t partition_id = same_kernel ? source_head_begin / head_count :
+                    (source_head_begin + head) * source_fragments + (token % source_kernel) / fragment_tokens;
+                const size_t offset = (token / destination_kernel) * destination_page_bytes
+                                      + (component % 2) * (destination_page_bytes / 2)
+                                      + ((destination_head_begin + head) * destination_kernel
+                                         + token % destination_kernel) * vector_bytes;
+                const size_t length = heads_per_fragment * fragment_tokens * vector_bytes;
+                RTP_LLM_CHECK_WITH_INFO(length > 0 && length <= std::numeric_limits<uint32_t>::max()
+                                            && offset <= stride && length <= stride - offset,
+                                        "invalid MHA destination slice for key=%s", cache_key.c_str());
+                auto& buffers = buckets[{static_cast<int>(partition_count), static_cast<int>(partition_id)}];
+                if (buffers.empty()) {
+                    buffers.push_back(std::make_shared<RequestBlockBuffer>(std::to_string(request_id)));
+                }
+                const auto key = prefixes[component] + makeCachePageKey(cache_key, token / source_kernel);
+                RTP_LLM_CHECK_WITH_INFO(buffers.front()->getBlock(key) == nullptr,
+                                        "duplicate MHA source key inside load bucket: %s", key.c_str());
+                std::shared_ptr<void> addr(static_cast<uint8_t*>(physical.addr) + offset, [](void*) {});
+                buffers.front()->addBlock(key, addr, static_cast<uint32_t>(length), physical.is_cuda, true);
+            }
+        }
+    }
+}
+
 DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
     RTP_LLM_PROFILE_FUNCTION();
     AtomicGuard request_guard(onflight_load_cache_requests_);
@@ -1089,16 +1267,39 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
     const auto& cache_config  = cache_manager->cacheConfig();
     auto        layer_num     = maga_init_params_.model_config_.num_layers;
     validateGroupTags(load_context, cache_config.topology());
+    auto geometry_error = validateCacheStoreGeometry(load_context, cache_config);
+    if (!geometry_error.ok()) {
+        return {geometry_error, 0};
+    }
+    const auto mtp_load_plan = engine_->isMTPEagle() ? makeMTPModuleLoadPlan(propose_maga_init_params_) :
+                                                    std::vector<MTPModuleLoadPlan>{};
+    if (engine_->isMTPEagle() && mtp_load_plan.empty()) {
+        return {ErrorInfo(ErrorCode::LOAD_KV_CACHE_FAILED, "active MTP module0 is missing"), 0};
+    }
+    for (const auto& module : mtp_load_plan) {
+        geometry_error = validateCacheStoreGeometry(
+            load_context, cache_manager->getMTPModuleCacheConfig(static_cast<int>(module.module_index)));
+        if (!geometry_error.ok()) {
+            return {geometry_error, 0};
+        }
+    }
 
     const int peer_cnt = static_cast<int>(load_context.peer_addrs.size());
     RTP_LLM_CHECK_WITH_INFO(peer_cnt > 0, "peer_addrs is empty");
+    for (const auto& peer_addr : load_context.peer_addrs) {
+        if (autil::StringUtil::split(peer_addr, ":").size() != 3) {
+            logReadFailures(load_context.request_id, peer_addr, ErrorCode::LOAD_KV_CACHE_FAILED, "invalid_peer", {});
+            return {ErrorInfo(ErrorCode::LOAD_KV_CACHE_FAILED, "invalid peer ip"), 0};
+        }
+    }
 
-    const bool use_mla             = cache_config.use_mla;
-    const bool use_hybrid          = cache_config.groupNums() > 1;
-    const bool use_opaque_kv_store = cache_config.use_opaque_kv_cache_store;
+    const bool use_hybrid = cache_config.groupNums() > 1;
 
-    auto cancel_check_func  = [&load_context]() -> bool { return load_context.server_context->IsCancelled(); };
+    auto cancel_check_func  = [&load_context]() -> bool {
+        return load_context.server_context != nullptr && load_context.server_context->IsCancelled();
+    };
     auto start_load_time_us = currentTimeUs();
+    ErrorInfo load_error = ErrorInfo::OkStatus();
     std::vector<std::pair<std::string, std::shared_ptr<LoadContext>>> load_contexts;
     std::vector<size_t> required_cache_key_counts(load_context.cache_keys.size(), 0);
     std::vector<size_t> transferred_cache_key_counts(load_context.cache_keys.size(), 0);
@@ -1110,7 +1311,7 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
         }
         return debug_infos;
     };
-    const bool is_page_level_rr = load_context.prefill_cp_size > 1
+    const bool is_page_level_rr = load_context.prefill_cp_sharded
                                   && static_cast<int>(load_context.peer_addrs.size()) == load_context.prefill_cp_size;
     auto layerGroupTags = [](const CacheConfig& cfg, bool use_hybrid, size_t layer_id) {
         std::vector<std::string> layer_tags;
@@ -1186,9 +1387,51 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
                                       group.seqSizePerBlock(),
                                       cfg.seq_size_per_block);
         };
+    auto addMhaPages = [&](CacheLoadBuckets& buckets,
+                           const CacheConfig& cfg,
+                           size_t layer_id,
+                           const std::string& tag,
+                           const std::string& cache_key,
+                           const std::vector<BlockInfo>& physical_parts,
+                           size_t peer_index) {
+        const auto& group = cfg.groupForLayer(static_cast<int>(layer_id), tag);
+        const auto source = std::find_if(load_context.cache_store_geometry.begin(),
+                                         load_context.cache_store_geometry.end(),
+                                         [&](const auto& geometry) { return geometry.tag() == tag; });
+        const size_t destination_heads = group.localKvHeadNum();
+        size_t source_heads = destination_heads * static_cast<size_t>(load_context.partition_count) / peer_cnt;
+        size_t head_count = destination_heads / peer_cnt;
+        size_t source_head_begin = static_cast<size_t>(load_context.partition_id) * destination_heads;
+        size_t destination_head_begin = peer_index * head_count;
+        if (load_context.prefill_cp_size > 1) {
+            source_heads = group.spec->global_kv_head_num;
+            const auto& parallelism = maga_init_params_.parallelism_config;
+            const size_t tp_size = static_cast<size_t>(parallelism.get_attn_tp_size());
+            const size_t tp_rank = static_cast<size_t>(parallelism.get_attn_tp_rank());
+            RTP_LLM_CHECK_WITH_INFO(source_heads > 0 && destination_heads > 0
+                                        && source_heads % destination_heads == 0 && tp_size > 0 && tp_rank < tp_size
+                                        && tp_size % (source_heads / destination_heads) == 0,
+                                    "invalid CP-to-TP MHA heads for tag=%s", tag.c_str());
+            const size_t replicas = tp_size / (source_heads / destination_heads);
+            source_head_begin = (tp_rank / replicas) * destination_heads;
+            destination_head_begin = 0;
+            head_count = destination_heads;
+        }
+        appendMhaPageBuffers(buckets,
+                             load_context.request_id,
+                             cache_key,
+                             group,
+                             *source,
+                             physical_parts,
+                             source_heads,
+                             source_head_begin,
+                             destination_head_begin,
+                             head_count);
+    };
     for (int i = 0; i < load_context.peer_addrs.size(); i++) {
         auto&                                            peer_addr = load_context.peer_addrs[i];
         std::vector<std::shared_ptr<RequestBlockBuffer>> layer_caches;
+        CacheLoadBuckets                                load_buckets;
         RTP_LLM_LOG_DEBUG("load context request id is %d", load_context.request_id);
 
         for (size_t layer_id = 0; layer_id < layer_num; layer_id++) {
@@ -1229,14 +1472,20 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
                     auto cache_key =
                         makeCacheKey(model_id, std::to_string(load_context.cache_keys[cache_key_index]), layer_id, tag);
 
-                    const bool             use_kv_key_prefix  = use_mla || use_opaque_kv_store || use_hybrid;
-                    const bool             use_whole_kv_block = is_page_level_rr || use_kv_key_prefix;
-                    std::vector<BlockInfo> parts;
-                    if (use_whole_kv_block) {
-                        parts = cache_manager->convertIndexToBuffer(layer_id, tag, block_id);
-                    } else {
-                        parts = cache_manager->convertIndexToBuffer(layer_id, tag, block_id, peer_cnt, i);
+                    if (usesMhaPageKeys(cache_config)) {
+                        addMhaPages(load_buckets,
+                                    cache_config,
+                                    layer_id,
+                                    tag,
+                                    cache_key,
+                                    cache_manager->convertIndexToBuffer(layer_id, tag, block_id),
+                                    i);
+                        markCacheKeyRange(
+                            transferred_cache_key_counts, cache_key_index, block_pos, cache_keys_per_physical_block);
+                        continue;
                     }
+
+                    auto parts = cache_manager->convertIndexToBuffer(layer_id, tag, block_id);
 
                     parts            = sliceCpDestinationForPeer(std::move(parts), cache_config, tag, i);
                     auto addBufBlock = [&](const std::string& key, const BlockInfo& block) {
@@ -1262,40 +1511,25 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
                             key, addr, static_cast<uint32_t>(block.size_bytes), block.is_cuda, true);
                     };
 
-                    if (use_kv_key_prefix) {
-                        RTP_LLM_CHECK_WITH_INFO(parts.size() == 1 || parts.size() == 2,
-                                                "unexpected mla convertIndexToBuffer parts size=%zu",
-                                                parts.size());
-                        addBufBlock("kv_" + cache_key, parts[0]);
-                        if (parts.size() == 2) {
-                            addBufBlock("kv_scale_" + cache_key, parts[1]);
-                        }
-                    } else {
-                        RTP_LLM_CHECK_WITH_INFO(parts.size() == 2 || parts.size() == 4,
-                                                "unexpected convertIndexToBuffer parts size=%zu",
-                                                parts.size());
-                        addBufBlock("k_" + cache_key, parts[0]);
-                        addBufBlock("v_" + cache_key, parts[1]);
-                        if (parts.size() == 4) {
-                            addBufBlock("k_scale_" + cache_key, parts[2]);
-                            addBufBlock("v_scale_" + cache_key, parts[3]);
-                        }
+                    RTP_LLM_CHECK_WITH_INFO(parts.size() == 1 || parts.size() == 2,
+                                            "unexpected mla convertIndexToBuffer parts size=%zu",
+                                            parts.size());
+                    addBufBlock("kv_" + cache_key, parts[0]);
+                    if (parts.size() == 2) {
+                        addBufBlock("kv_scale_" + cache_key, parts[1]);
                     }
                     markCacheKeyRange(
                         transferred_cache_key_counts, cache_key_index, block_pos, cache_keys_per_physical_block);
                 }
-                layer_caches.push_back(load_layer_cache);
+                if (load_layer_cache->getBlocksCount() > 0) {
+                    layer_caches.push_back(load_layer_cache);
+                }
             }
         }
 
         if (engine_->isMTPEagle()) {
             if (propose_maga_init_params_ && propose_maga_init_params_->mtp_model_params_
                 && !propose_maga_init_params_->mtp_model_params_->empty()) {
-                const auto mtp_load_plan = makeMTPModuleLoadPlan(propose_maga_init_params_);
-                if (mtp_load_plan.empty()) {
-                    return {ErrorInfo(ErrorCode::LOAD_KV_CACHE_FAILED, "active MTP module0 is missing"), 0};
-                }
-
                 for (const auto& module_plan : mtp_load_plan) {
                     const size_t            mtp_model_id           = module_plan.module_index;
                     const EngineInitParams* mtp_engine_init_params = module_plan.engine_init_params;
@@ -1309,8 +1543,7 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
                                                 + " (mtp_model_id=" + std::to_string(mtp_model_id) + ")");
 
                     for (size_t layer_id = 0; layer_id < layer_num; layer_id++) {
-                        const bool mtp_use_hybrid          = mtp_cache_cfg.groupNums() > 1;
-                        const bool mtp_use_opaque_kv_store = mtp_cache_cfg.use_opaque_kv_cache_store;
+                        const bool mtp_use_hybrid = mtp_cache_cfg.groupNums() > 1;
 
                         // Same multi-group iteration as the main path.
                         std::vector<std::string> mtp_layer_tags =
@@ -1363,17 +1596,21 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
                                 }
                                 auto cache_key = makeCacheKey(
                                     model_id, std::to_string(load_context.cache_keys[cache_key_index]), layer_id, tag);
-                                const bool mtp_use_mla = mtp_cache_cfg.use_mla;
-                                const bool mtp_use_kv_key_prefix =
-                                    mtp_use_mla || mtp_use_opaque_kv_store || mtp_use_hybrid;
-                                const bool mtp_use_whole_kv_block = is_page_level_rr || mtp_use_kv_key_prefix;
-                                std::vector<BlockInfo> parts;
-                                if (mtp_use_whole_kv_block) {
-                                    parts = cache_manager->convertIndexToBuffer(global_layer_id, tag, block_id);
-                                } else {
-                                    parts = cache_manager->convertIndexToBuffer(
-                                        global_layer_id, tag, block_id, peer_cnt, i);
+                                if (usesMhaPageKeys(mtp_cache_cfg)) {
+                                    addMhaPages(load_buckets,
+                                                mtp_cache_cfg,
+                                                layer_id,
+                                                tag,
+                                                cache_key,
+                                                cache_manager->convertIndexToBuffer(global_layer_id, tag, block_id),
+                                                i);
+                                    markCacheKeyRange(transferred_cache_key_counts,
+                                                      cache_key_index,
+                                                      block_pos,
+                                                      cache_keys_per_physical_block);
+                                    continue;
                                 }
+                                auto parts = cache_manager->convertIndexToBuffer(global_layer_id, tag, block_id);
 
                                 parts            = sliceCpDestinationForPeer(std::move(parts), mtp_cache_cfg, tag, i);
                                 auto addBufBlock = [&](const std::string& key, const BlockInfo& block) {
@@ -1403,31 +1640,21 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
                                         key, addr, static_cast<uint32_t>(block.size_bytes), block.is_cuda, true);
                                 };
 
-                                if (mtp_use_kv_key_prefix) {
-                                    RTP_LLM_CHECK_WITH_INFO(parts.size() == 1 || parts.size() == 2,
-                                                            "unexpected mtp mla convertIndexToBuffer parts size=%zu",
-                                                            parts.size());
-                                    addBufBlock("kv_" + cache_key, parts[0]);
-                                    if (parts.size() == 2) {
-                                        addBufBlock("kv_scale_" + cache_key, parts[1]);
-                                    }
-                                } else {
-                                    RTP_LLM_CHECK_WITH_INFO(parts.size() == 2 || parts.size() == 4,
-                                                            "unexpected mtp convertIndexToBuffer parts size=%zu",
-                                                            parts.size());
-                                    addBufBlock("k_" + cache_key, parts[0]);
-                                    addBufBlock("v_" + cache_key, parts[1]);
-                                    if (parts.size() == 4) {
-                                        addBufBlock("k_scale_" + cache_key, parts[2]);
-                                        addBufBlock("v_scale_" + cache_key, parts[3]);
-                                    }
+                                RTP_LLM_CHECK_WITH_INFO(parts.size() == 1 || parts.size() == 2,
+                                                        "unexpected mtp mla convertIndexToBuffer parts size=%zu",
+                                                        parts.size());
+                                addBufBlock("kv_" + cache_key, parts[0]);
+                                if (parts.size() == 2) {
+                                    addBufBlock("kv_scale_" + cache_key, parts[1]);
                                 }
                                 markCacheKeyRange(transferred_cache_key_counts,
                                                   cache_key_index,
                                                   block_pos,
                                                   cache_keys_per_physical_block);
                             }
-                            layer_caches.push_back(load_layer_cache);
+                            if (load_layer_cache->getBlocksCount() > 0) {
+                                layer_caches.push_back(load_layer_cache);
+                            }
                         }
                     }
                 }
@@ -1437,33 +1664,36 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
         }
 
         auto ip_parts = autil::StringUtil::split(peer_addr, ":");
-        if (ip_parts.size() != 3) {
-            logReadFailures(load_context.request_id,
-                            peer_addr,
-                            ErrorCode::LOAD_KV_CACHE_FAILED,
-                            "invalid_peer",
-                            buffersDebugInfos(layer_caches));
-            return {ErrorInfo(ErrorCode::LOAD_KV_CACHE_FAILED, "invalid peer ip"), 0};
-        }
 
-        auto layer_cache_load_context =
-            resource_.cache_store->loadBuffers(layer_caches,
-                                               ip_parts[0],
-                                               autil::StringUtil::strToInt32WithDefault(ip_parts[1].c_str(), 0),
-                                               autil::StringUtil::strToInt32WithDefault(ip_parts[2].c_str(), 0),
-                                               load_context.timeout_ms,
-                                               cancel_check_func,
-                                               load_context.partition_count,
-                                               load_context.partition_id);
-        if (!layer_cache_load_context) {
-            logReadFailures(load_context.request_id,
-                            peer_addr,
-                            ErrorCode::LOAD_KV_CACHE_FAILED,
-                            "null_load_context",
-                            buffersDebugInfos(layer_caches));
-            return {ErrorInfo(ErrorCode::LOAD_KV_CACHE_FAILED, "load kv cache failed"), 0};
+        if (!layer_caches.empty()) {
+            auto& buffers = load_buckets[{load_context.partition_count, load_context.partition_id}];
+            buffers.insert(buffers.end(), layer_caches.begin(), layer_caches.end());
         }
-        load_contexts.emplace_back(peer_addr, layer_cache_load_context);
+        for (const auto& [partition, buffers] : load_buckets) {
+            auto layer_cache_load_context = resource_.cache_store->loadBuffers(buffers,
+                                                                                ip_parts[0],
+                                                                                autil::StringUtil::strToInt32WithDefault(
+                                                                                    ip_parts[1].c_str(), 0),
+                                                                                autil::StringUtil::strToInt32WithDefault(
+                                                                                    ip_parts[2].c_str(), 0),
+                                                                                load_context.timeout_ms,
+                                                                                cancel_check_func,
+                                                                                partition.first,
+                                                                                partition.second);
+            if (!layer_cache_load_context) {
+                logReadFailures(load_context.request_id,
+                                peer_addr,
+                                ErrorCode::LOAD_KV_CACHE_FAILED,
+                                "null_load_context",
+                                buffersDebugInfos(buffers));
+                load_error = ErrorInfo(ErrorCode::LOAD_KV_CACHE_FAILED, "load kv cache failed");
+                break;
+            }
+            load_contexts.emplace_back(peer_addr, layer_cache_load_context);
+        }
+        if (!load_error.ok()) {
+            break;
+        }
     }
 
     for (auto& [peer_addr, layer_cache_load_context] : load_contexts) {
@@ -1483,8 +1713,13 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
                                 request_key.c_str(),
                                 layer_cache_load_context->getErrorInfoString().c_str(),
                                 (load_done_time_us - start_load_time_us) / 1000);
-            return {error_info, 0};
+            if (load_error.ok()) {
+                load_error = error_info;
+            }
         }
+    }
+    if (!load_error.ok()) {
+        return {load_error, 0};
     }
 
     const size_t already_reused_blocks = static_cast<size_t>(std::max<int64_t>(load_context.reuse_block_size, 0));
@@ -1520,7 +1755,10 @@ grpc::Status DecodeRpcServer::RemoteLoad(grpc::ServerContext*          server_co
                                   request->partition_count(),
                                   request->partition_id(),
                                   server_context,
-                                  request->prefill_cp_size() > 0 ? request->prefill_cp_size() : 1});
+                                  request->prefill_cp_size(),
+                                  request->prefill_cp_sharded(),
+                                  std::vector<CacheStoreGeometryPB>(request->cache_store_geometry().begin(),
+                                                                    request->cache_store_geometry().end())});
     response->mutable_error_info()->set_error_code(transErrorCodeToRPC(load_result.error_info.code()));
     response->mutable_error_info()->set_error_message(load_result.error_info.ToString());
     response->set_loaded_cache_block_count(static_cast<int64_t>(load_result.loaded_cache_block_count));

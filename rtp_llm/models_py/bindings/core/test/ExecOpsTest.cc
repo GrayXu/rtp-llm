@@ -1,7 +1,7 @@
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include "rtp_llm/models_py/bindings/OpDefs.h"
 #include "rtp_llm/cpp/cache/CacheConfig.h"
-#include "rtp_llm/cpp/cache/test/TestLayoutSpec.h"
+#include "rtp_llm/cpp/cache/test/CacheConfigTestUtils.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/disaggregate/cache_store/CacheStore.h"
 #include "rtp_llm/cpp/testing/TestLogCapture.h"
@@ -16,8 +16,8 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
-#include <tuple>
 #include <unordered_map>
+#include <utility>
 
 using namespace rtp_llm;
 
@@ -25,8 +25,11 @@ using namespace rtp_llm;
 class MockCacheStore: public rtp_llm::CacheStore {
 public:
     struct BlockRecord {
-        void*    addr{nullptr};
-        uint32_t len{0};
+        void*                 addr{nullptr};
+        uint32_t              len{0};
+        std::shared_ptr<void> owner;
+        bool                  gpu_mem{true};
+        bool                  adopted{false};
     };
 
     struct StoreRecord {
@@ -49,7 +52,8 @@ public:
         record.request_id  = buf->getRequestId();
         record.block_count = buf->getBlocksCount();
         for (const auto& [key, block] : buf->getBlocks()) {
-            record.blocks.emplace(key, BlockRecord{block->addr.get(), block->len});
+            record.blocks.emplace(
+                key, BlockRecord{block->addr.get(), block->len, block->addr, block->gpu_mem, block->adopted});
             record.block_keys.push_back(key);
         }
         records.push_back(std::move(record));
@@ -694,58 +698,164 @@ TEST_F(ExecOpsTest, testWriteCacheStoreMlaFp8PackedPhysicalViewUsesExplicitStrid
     expectMlaPhysicalViewUsesExplicitStride(kv_cache_base);
 }
 
-TEST_F(ExecOpsTest, testWriteCacheStoreMhaKernelViewKeepsExplicitKvAndScaleStrides) {
-    constexpr size_t physical_block_num         = 4;
-    constexpr size_t physical_tokens_per_block  = 8;
-    constexpr size_t kernel_tokens_per_block    = 2;
-    constexpr size_t kernel_blocks_per_physical = physical_tokens_per_block / kernel_tokens_per_block;
+TEST_F(ExecOpsTest, testWriteCacheStoreMhaPagesFollowSpecAndByteLayout) {
+    constexpr size_t physical_block_num        = 4;
+    constexpr size_t physical_tokens_per_block = 8;
+    constexpr size_t head_num                  = 3;
+    constexpr size_t head_dim                  = 4;
+    constexpr int    cp_size                   = 2;
+    constexpr int    cp_rank                   = 1;
+    const auto sentinel = [](size_t block, size_t page, size_t kv, size_t head, size_t token, size_t byte, bool scale) {
+        return static_cast<uint8_t>(block * 53 + page * 29 + kv * 101 + head * 11 + token * 5 + byte + (scale ? 127 : 1));
+    };
 
-    auto physical_kv = torch::zeros(
-        {static_cast<int64_t>(physical_block_num), 2, 1, static_cast<int64_t>(physical_tokens_per_block), 4},
-        torch::kUInt8);
-    auto kernel_kv      = physical_kv.reshape({static_cast<int64_t>(physical_block_num * kernel_blocks_per_physical),
-                                          2,
-                                          1,
-                                          static_cast<int64_t>(kernel_tokens_per_block),
-                                          4});
-    auto physical_scale = torch::zeros({static_cast<int64_t>(physical_block_num), 32}, torch::kUInt8);
-    auto kernel_scale =
-        physical_scale.reshape({static_cast<int64_t>(physical_block_num * kernel_blocks_per_physical), 8});
+    // FP8 uses raw byte storage; the CacheStore interface does not convert values.
+    for (const auto& [dtype, storage_type] : std::vector<std::pair<DataType, c10::ScalarType>>{
+             {DataType::TYPE_FP16, torch::kFloat16},
+             {DataType::TYPE_BF16, torch::kBFloat16},
+             {DataType::TYPE_INT8, torch::kInt8},
+#if defined(ENABLE_FP8) || USING_ROCM
+             {DataType::TYPE_FP8_E4M3, torch::kUInt8},
+#endif
+         }) {
+        for (const size_t kernel_tokens_per_block : {size_t(2), physical_tokens_per_block}) {
+            SCOPED_TRACE(static_cast<int>(dtype));
+            SCOPED_TRACE(kernel_tokens_per_block);
+            const size_t kernel_pages = physical_tokens_per_block / kernel_tokens_per_block;
+            const bool   has_scale    = dtype == DataType::TYPE_INT8 || dtype == DataType::TYPE_FP8_E4M3;
+            auto physical_kv = torch::empty({static_cast<int64_t>(physical_block_num),
+                                              static_cast<int64_t>(kernel_pages),
+                                              2,
+                                              static_cast<int64_t>(head_num),
+                                              static_cast<int64_t>(kernel_tokens_per_block),
+                                              static_cast<int64_t>(head_dim)},
+                                             torch::TensorOptions().dtype(storage_type));
+            auto physical_scale = has_scale ?
+                                      torch::empty({static_cast<int64_t>(physical_block_num),
+                                                     static_cast<int64_t>(kernel_pages),
+                                                     2,
+                                                     static_cast<int64_t>(head_num),
+                                                     static_cast<int64_t>(kernel_tokens_per_block)},
+                                                    torch::kFloat32) :
+                                      torch::Tensor();
+            const size_t kv_width     = head_dim * physical_kv.element_size();
+            const size_t kv_stride    = static_cast<size_t>(physical_kv.nbytes()) / physical_block_num;
+            const size_t scale_stride = has_scale ? static_cast<size_t>(physical_scale.nbytes()) / physical_block_num : 0;
+            const auto   kv_base      = reinterpret_cast<uintptr_t>(physical_kv.data_ptr());
+            const auto   scale_base   = has_scale ? reinterpret_cast<uintptr_t>(physical_scale.data_ptr()) : 0;
 
-    const size_t kv_stride    = static_cast<size_t>(physical_kv.nbytes()) / physical_block_num;
-    const size_t scale_stride = static_cast<size_t>(physical_scale.nbytes()) / physical_block_num;
-    auto         cache_store  = std::make_shared<MockCacheStore>();
-    auto         inputs       = makePyCacheStoreInputs(physical_tokens_per_block, physical_block_num);
-    auto         config       = makeCacheConfig(physical_tokens_per_block, kv_stride, scale_stride, physical_block_num);
+            for (const bool scale : {false, true}) {
+                if (scale && !has_scale) {
+                    continue;
+                }
+                auto*        bytes = static_cast<uint8_t*>(scale ? physical_scale.data_ptr() : physical_kv.data_ptr());
+                const size_t width = scale ? sizeof(float) : kv_width;
+                for (size_t block = 0; block < physical_block_num; ++block) {
+                    for (size_t page = 0; page < kernel_pages; ++page) {
+                        for (size_t kv = 0; kv < 2; ++kv) {
+                            for (size_t head = 0; head < head_num; ++head) {
+                                for (size_t token = 0; token < kernel_tokens_per_block; ++token) {
+                                    const size_t offset =
+                                        ((((block * kernel_pages + page) * 2 + kv) * head_num + head)
+                                             * kernel_tokens_per_block
+                                         + token)
+                                        * width;
+                                    for (size_t byte = 0; byte < width; ++byte) {
+                                        bytes[offset + byte] = sentinel(block, page, kv, head, token, byte, scale);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
-    torch_ext::LayerKVCache layer_cache;
-    layer_cache.kv_cache_base      = kernel_kv;
-    layer_cache.kv_scale_base      = kernel_scale;
-    layer_cache.seq_size_per_block = kernel_tokens_per_block;
-    layer_cache.layer_id           = 0;
-    layer_cache.tag                = "default";
+            auto cache_store = std::make_shared<MockCacheStore>();
+            auto inputs      = makePyCacheStoreInputs(physical_tokens_per_block, physical_block_num * cp_size);
+            inputs.host_kv_cache_offset =
+                torch::arange(static_cast<int64_t>(physical_block_num), torch::kInt32).reshape({1, -1});
+            auto config = makeCacheConfig(physical_tokens_per_block, kv_stride, scale_stride, physical_block_num);
+            auto groups = config.topology().groups();
+            auto spec = test::makeResolvedMhaSpec(dtype, head_num, head_dim, physical_tokens_per_block);
+            spec->kernel_seq_size_per_block = kernel_tokens_per_block;
+            groups.front().spec = std::move(spec);
+            config.setTopology(std::move(groups), config.topology().layers());
 
-    ASSERT_NO_THROW(runtimeWriteCacheStore(
-        inputs, layer_cache, config, cache_store, /*cache_model_id=*/0, /*cp_rank=*/0, /*cp_size=*/1, nullptr));
+            // Neither this physical tensor view nor its legacy token hint describes the kernel pages.
+            torch_ext::LayerKVCache layer_cache;
+            layer_cache.kv_cache_base      = physical_kv.reshape({static_cast<int64_t>(physical_block_num), -1});
+            layer_cache.kv_scale_base      =
+                has_scale ? physical_scale.reshape({static_cast<int64_t>(physical_block_num), -1}) : torch::Tensor();
+            layer_cache.seq_size_per_block = physical_tokens_per_block;
+            layer_cache.layer_id           = 0;
+            layer_cache.tag                = "default";
+            size_t               registrar_calls = 0;
+            std::vector<int64_t> leased_keys;
+            std::vector<int32_t> leased_blocks;
+            ASSERT_NO_THROW(runtimeWriteCacheStore(
+                inputs,
+                layer_cache,
+                config,
+                cache_store,
+                /*cache_model_id=*/0,
+                cp_rank,
+                cp_size,
+                nullptr,
+                [&](const std::vector<int64_t>& keys, const std::vector<int32_t>& blocks, const std::string& tag) {
+                    ++registrar_calls;
+                    leased_keys   = keys;
+                    leased_blocks = blocks;
+                    EXPECT_EQ(tag, "default");
+                    return CacheStoreCompletionCallback{};
+                }));
+            EXPECT_EQ(registrar_calls, 1u);
+            ASSERT_EQ(leased_keys.size(), physical_block_num);
+            ASSERT_EQ(leased_blocks.size(), physical_block_num);
+            // The captured BlockBuffers must keep both backing allocations alive.
+            layer_cache.kv_cache_base = torch::Tensor();
+            layer_cache.kv_scale_base = torch::Tensor();
+            physical_kv              = torch::Tensor();
+            physical_scale           = torch::Tensor();
 
-    ASSERT_EQ(cache_store->records.size(), 1u);
-    const auto& record = cache_store->records.front();
-    ASSERT_EQ(record.block_count, physical_block_num * 4);
-    for (size_t block_id = 0; block_id < physical_block_num; ++block_id) {
-        const auto cache_key  = cacheKeyAt(inputs, block_id, 0);
-        const auto kv_base    = reinterpret_cast<uintptr_t>(physical_kv.data_ptr()) + block_id * kv_stride;
-        const auto scale_base = reinterpret_cast<uintptr_t>(physical_scale.data_ptr()) + block_id * scale_stride;
-        const std::vector<std::tuple<std::string, uintptr_t, uint32_t>> expected = {
-            {"k_" + cache_key, kv_base, static_cast<uint32_t>(kv_stride / 2)},
-            {"v_" + cache_key, kv_base + kv_stride / 2, static_cast<uint32_t>(kv_stride / 2)},
-            {"k_scale_" + cache_key, scale_base, static_cast<uint32_t>(scale_stride / 2)},
-            {"v_scale_" + cache_key, scale_base + scale_stride / 2, static_cast<uint32_t>(scale_stride / 2)},
-        };
-        for (const auto& [key, addr, len] : expected) {
-            const auto it = record.blocks.find(key);
-            ASSERT_NE(it, record.blocks.end()) << "missing block " << key;
-            EXPECT_EQ(reinterpret_cast<uintptr_t>(it->second.addr), addr);
-            EXPECT_EQ(it->second.len, len);
+            ASSERT_EQ(cache_store->records.size(), 1u);
+            const auto& record = cache_store->records.front();
+            ASSERT_EQ(record.block_count, physical_block_num * kernel_pages * (has_scale ? 4 : 2));
+            for (size_t block = 0; block < physical_block_num; ++block) {
+                const size_t key_index = block * cp_size + cp_rank;
+                EXPECT_EQ(leased_keys[block], inputs.cache_keys.data_ptr<int64_t>()[key_index]);
+                EXPECT_EQ(leased_blocks[block], static_cast<int32_t>(block));
+                for (size_t page = 0; page < kernel_pages; ++page) {
+                    const auto page_key = cacheKeyAt(inputs, key_index, 0) + "_page_" + std::to_string(page);
+                    for (const bool scale : {false, true}) {
+                        if (scale && !has_scale) {
+                            continue;
+                        }
+                        const size_t width = scale ? sizeof(float) : kv_width;
+                        const size_t half  = head_num * kernel_tokens_per_block * width;
+                        const auto   base  = (scale ? scale_base : kv_base) + block * (scale ? scale_stride : kv_stride);
+                        for (size_t kv = 0; kv < 2; ++kv) {
+                            const auto key = std::string(kv == 0 ? "k_" : "v_") + (scale ? "scale_" : "") + page_key;
+                            const auto it  = record.blocks.find(key);
+                            ASSERT_NE(it, record.blocks.end()) << "missing block " << key;
+                            EXPECT_EQ(reinterpret_cast<uintptr_t>(it->second.addr), base + (page * 2 + kv) * half);
+                            EXPECT_EQ(it->second.len, half);
+                            EXPECT_EQ(it->second.owner.get(), it->second.addr);
+                            EXPECT_FALSE(it->second.gpu_mem);
+                            EXPECT_TRUE(it->second.adopted);
+                            const auto* bytes = static_cast<const uint8_t*>(it->second.addr);
+                            for (size_t head = 0; head < head_num; ++head) {
+                                for (size_t token = 0; token < kernel_tokens_per_block; ++token) {
+                                    for (size_t byte = 0; byte < width; ++byte) {
+                                        EXPECT_EQ(bytes[(head * kernel_tokens_per_block + token) * width + byte],
+                                                  sentinel(block, page, kv, head, token, byte, scale))
+                                            << key << " head=" << head << " token=" << token << " byte=" << byte;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

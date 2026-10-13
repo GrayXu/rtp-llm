@@ -13,7 +13,11 @@ py_test(
 py_test(
     name = "openai_comparer_test",
     srcs = ["openai_comparer_test.py"],
-    data = ["//rtp_llm/test/smoke:smoke_framework_srcs"],
+    data = [
+        "//rtp_llm/test/smoke:smoke_framework_srcs",
+        "//rtp_llm/test/smoke:data/model/qwen25/q_r_l20_remote_cache_pd_asymmetric_tp.json",
+        "//rtp_llm/test/smoke:data/model/qwen25/q_r_l20_remote_cache_pd_asymmetric_cp.json",
+    ],
     imports = ["../.."],
     legacy_create_init = 0,
     deps = SMOKE_FRAMEWORK_DEPS,

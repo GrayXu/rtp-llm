@@ -213,6 +213,10 @@ void runtimeWriteCacheStore(const torch_ext::PyCacheStoreInputs& cache_store_inp
     const size_t kv_block_transfer_bytes         = group.kvBlockStrideBytes();
     const size_t kv_scale_transfer_bytes         = group.kvScaleStrideBytes();
     const bool   use_group_cache_transfer_policy = cache_config.topology().groups().size() > 1;
+    const bool   use_opaque_key_prefix = cache_config.use_opaque_kv_cache_store || use_group_cache_transfer_policy
+                                        || group.spec->type != KVCacheSpecType::MultiHeadAttention
+                                        || group.policy.group_type == CacheGroupType::LINEAR;
+    const size_t kernel_pages_per_block = use_opaque_key_prefix ? 1 : group.kernelBlocksPerKvBlock();
 
     RTP_LLM_CHECK_WITH_INFO(
         seq_size_per_block > 0, "cache-store tag=%s has zero tokens_per_block", layer_kv.tag.c_str());
@@ -389,8 +393,6 @@ void runtimeWriteCacheStore(const torch_ext::PyCacheStoreInputs& cache_store_inp
                 // full row. Dividing here would slice an already-sliced row.
             }
 
-            const bool use_opaque_key_prefix = cache_config.use_opaque_kv_cache_store || use_group_cache_transfer_policy
-                                               || group.spec->type == KVCacheSpecType::MultiHeadLatentAttention;
             void*                 kv_addr = kv_cache_data + static_cast<size_t>(block_id) * kv_block_stride_bytes;
             std::shared_ptr<void> kv_block_addr(kv_cache_owner, kv_addr);
             RTP_LLM_LOG_DEBUG("PD_CACHE_KEY_WRITE_BLOCK key=kv_%s request_id=%ld tag=%s layer=%d cp_rank=%d "
@@ -413,13 +415,23 @@ void runtimeWriteCacheStore(const torch_ext::PyCacheStoreInputs& cache_store_inp
                 request_blocks->addBlock(
                     "kv_" + cache_key, kv_block_addr, static_cast<uint32_t>(kv_block_transfer_bytes), kv_gpu_mem, true);
             } else {
-                RTP_LLM_CHECK_WITH_INFO(kv_block_transfer_bytes % 2 == 0,
-                                        "KV transfer bytes must split evenly into K/V");
-                const auto            kv_half = static_cast<uint32_t>(kv_block_transfer_bytes / 2);
-                std::shared_ptr<void> k_block_addr(kv_cache_owner, kv_addr);
-                std::shared_ptr<void> v_block_addr(kv_cache_owner, static_cast<uint8_t*>(kv_addr) + kv_half);
-                request_blocks->addBlock("k_" + cache_key, k_block_addr, kv_half, kv_gpu_mem, true);
-                request_blocks->addBlock("v_" + cache_key, v_block_addr, kv_half, kv_gpu_mem, true);
+                RTP_LLM_CHECK_WITH_INFO(kv_block_transfer_bytes % 2 == 0
+                                            && (kv_block_transfer_bytes / 2) % kernel_pages_per_block == 0,
+                                        "cache-store tag=%s KV bytes=%zu must split evenly into %zu kernel pages of K/V",
+                                        layer_kv.tag.c_str(),
+                                        kv_block_transfer_bytes,
+                                        kernel_pages_per_block);
+                const size_t kv_page_bytes = kv_block_transfer_bytes / kernel_pages_per_block;
+                const auto   kv_page_half  = static_cast<uint32_t>(kv_page_bytes / 2);
+                // Each kernel page contains full-head K followed by full-head V.
+                for (size_t page = 0; page < kernel_pages_per_block; ++page) {
+                    const auto page_key  = makeCachePageKey(cache_key, page);
+                    auto*      page_addr = static_cast<uint8_t*>(kv_addr) + page * kv_page_bytes;
+                    std::shared_ptr<void> k_block_addr(kv_cache_owner, page_addr);
+                    std::shared_ptr<void> v_block_addr(kv_cache_owner, page_addr + kv_page_half);
+                    request_blocks->addBlock("k_" + page_key, k_block_addr, kv_page_half, kv_gpu_mem, true);
+                    request_blocks->addBlock("v_" + page_key, v_block_addr, kv_page_half, kv_gpu_mem, true);
+                }
             }
 
             if (kv_scale_data) {
@@ -432,16 +444,25 @@ void runtimeWriteCacheStore(const torch_ext::PyCacheStoreInputs& cache_store_inp
                                              kv_scale_gpu_mem,
                                              true);
                 } else {
-                    RTP_LLM_CHECK_WITH_INFO(kv_scale_transfer_bytes % 2 == 0,
-                                            "scale transfer bytes must split evenly into K/V");
-                    const auto            sc_half = static_cast<uint32_t>(kv_scale_transfer_bytes / 2);
-                    std::shared_ptr<void> k_scale_block_addr(kv_scale_owner, kv_scale_addr);
-                    std::shared_ptr<void> v_scale_block_addr(kv_scale_owner,
-                                                             static_cast<uint8_t*>(kv_scale_addr) + sc_half);
-                    request_blocks->addBlock(
-                        "k_scale_" + cache_key, k_scale_block_addr, sc_half, kv_scale_gpu_mem, true);
-                    request_blocks->addBlock(
-                        "v_scale_" + cache_key, v_scale_block_addr, sc_half, kv_scale_gpu_mem, true);
+                    RTP_LLM_CHECK_WITH_INFO(kv_scale_transfer_bytes % 2 == 0
+                                                && (kv_scale_transfer_bytes / 2) % kernel_pages_per_block == 0,
+                                            "cache-store tag=%s scale bytes=%zu must split evenly into %zu "
+                                            "kernel pages of K/V",
+                                            layer_kv.tag.c_str(),
+                                            kv_scale_transfer_bytes,
+                                            kernel_pages_per_block);
+                    const size_t scale_page_bytes = kv_scale_transfer_bytes / kernel_pages_per_block;
+                    const auto   scale_page_half  = static_cast<uint32_t>(scale_page_bytes / 2);
+                    for (size_t page = 0; page < kernel_pages_per_block; ++page) {
+                        const auto page_key  = makeCachePageKey(cache_key, page);
+                        auto*      page_addr = static_cast<uint8_t*>(kv_scale_addr) + page * scale_page_bytes;
+                        std::shared_ptr<void> k_scale_block_addr(kv_scale_owner, page_addr);
+                        std::shared_ptr<void> v_scale_block_addr(kv_scale_owner, page_addr + scale_page_half);
+                        request_blocks->addBlock(
+                            "k_scale_" + page_key, k_scale_block_addr, scale_page_half, kv_scale_gpu_mem, true);
+                        request_blocks->addBlock(
+                            "v_scale_" + page_key, v_scale_block_addr, scale_page_half, kv_scale_gpu_mem, true);
+                    }
                 }
             }
         };

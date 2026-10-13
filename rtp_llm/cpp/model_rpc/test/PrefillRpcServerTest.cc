@@ -125,7 +125,10 @@ private:
 
 class TestEngineBase final: public EngineBase {
 public:
-    explicit TestEngineBase(bool is_mtp_eagle): EngineBase(EngineInitParams()), is_mtp_eagle_(is_mtp_eagle) {}
+    explicit TestEngineBase(bool is_mtp_eagle, std::shared_ptr<KVCacheManager> cache_manager):
+        EngineBase(EngineInitParams()), is_mtp_eagle_(is_mtp_eagle) {
+        resource_context_.cache_manager = std::move(cache_manager);
+    }
 
     std::shared_ptr<GenerateStream> enqueue(const std::shared_ptr<GenerateInput>&) override {
         return nullptr;
@@ -163,8 +166,12 @@ public:
         process_id_ = process_id;
     }
 
-    void setEngineForTest(bool is_mtp_eagle) {
-        engine_ = std::make_shared<TestEngineBase>(is_mtp_eagle);
+    void setEngineForTest(bool is_mtp_eagle, std::shared_ptr<KVCacheManager> cache_manager = nullptr) {
+        if (cache_manager == nullptr) {
+            cache_manager = std::make_shared<KVCacheManager>(
+                test::makeSimpleMhaCacheConfig(1, 8, 64, DataType::TYPE_FP16));
+        }
+        engine_ = std::make_shared<TestEngineBase>(is_mtp_eagle, std::move(cache_manager));
     }
 
     void prepareGenerateInputForTest(PrefillGenerateContext& context) {
@@ -469,6 +476,7 @@ TEST_F(PrefillRpcServerTest, downstreamRetriesReuseOriginalAbsoluteDeadline) {
 
     TestPrefillRpcServer server;
     server.setProcessIdForTest("prefill-client");
+    server.setEngineForTest(/*is_mtp_eagle=*/false);
     server.remoteAllocateResourceForTest(*context);
     ASSERT_TRUE(context->hasError());
     ASSERT_NE(context->client_context, nullptr);
@@ -502,6 +510,7 @@ TEST_F(PrefillRpcServerTest, downstreamWithoutRequestDeadlineKeepsMaxRpcTimeout)
     TestPrefillRpcServer server;
     server.setProcessIdForTest("prefill-client");
     server.setMaxRpcTimeoutForTest(250);
+    server.setEngineForTest(/*is_mtp_eagle=*/false);
     const auto before = std::chrono::system_clock::now();
     server.remoteAllocateResourceForTest(*context);
     ASSERT_FALSE(context->hasError());
@@ -530,6 +539,7 @@ TEST_F(PrefillRpcServerTest, downstreamClientContextIgnoresAllocationRetryDeadli
     TestPrefillRpcServer server;
     server.setProcessIdForTest("prefill-client");
     server.setMaxRpcTimeoutForTest(0);
+    server.setEngineForTest(/*is_mtp_eagle=*/false);
     server.remoteAllocateResourceForTest(*context);
 
     ASSERT_FALSE(context->hasError());
@@ -561,6 +571,7 @@ TEST_F(PrefillRpcServerTest, downstreamDomainErrorOverridesTransportFallback) {
 
     TestPrefillRpcServer server;
     server.setProcessIdForTest("prefill-client");
+    server.setEngineForTest(/*is_mtp_eagle=*/false);
     server.remoteAllocateResourceForTest(*context);
 
     ASSERT_TRUE(context->hasError());
@@ -938,7 +949,8 @@ TEST_F(PrefillRpcServerTest, textOnlyProcessIsRetainedAcrossRetryReset) {
     context->generate_input->input_ids = torch::tensor({10, 20}, torch::kInt32);
     auto original_input                = context->generate_input;
 
-    PrefillRpcServer server;
+    TestPrefillRpcServer server;
+    server.setEngineForTest(/*is_mtp_eagle=*/false);
     server.multimodalProcess(*context);
 
     EXPECT_TRUE(context->multimodalProcessed());
@@ -1146,7 +1158,8 @@ TEST_F(PrefillRpcServerTest, allocateRequestUsesExpandedTokenIds) {
     auto context            = makeContext(&request);
     context->generate_input = makeMultimodalInput();
 
-    PrefillRpcServer server;
+    TestPrefillRpcServer server;
+    server.setEngineForTest(/*is_mtp_eagle=*/false);
     server.mm_processor_ = std::make_shared<TestMultimodalProcessor>(ErrorCode::NONE_ERROR);
     server.multimodalProcess(*context);
 
@@ -1173,6 +1186,7 @@ TEST_F(PrefillRpcServerTest, allocateRequestKeepsOriginalIdsWithoutExpansion) {
 
     TestPrefillRpcServer server;
     server.setProcessIdForTest("prefill-client");
+    server.setEngineForTest(/*is_mtp_eagle=*/false);
     auto alloc_request = server.buildAllocateRequest(*context);
 
     EXPECT_EQ(alloc_request.stage(), RemoteStage::ALLOCATE);
@@ -1185,6 +1199,130 @@ TEST_F(PrefillRpcServerTest, allocateRequestKeepsOriginalIdsWithoutExpansion) {
     ASSERT_EQ(alloc_request.peer_addrs_size(), 2);
     EXPECT_EQ(alloc_request.peer_addrs(0), "a:1");
     EXPECT_EQ(alloc_request.peer_addrs(1), "b:2");
+}
+
+TEST_F(PrefillRpcServerTest, allocateRequestUsesActualSourceCpAndKernelGeometry) {
+    auto spec                      = test::makeMhaSpec("full", 64, DataType::TYPE_FP16, 4, 8);
+    spec->kernel_seq_size_per_block = 16;
+    auto source_config             = test::makeSingleGroupCacheConfig(spec, CacheGroupType::FULL, 1, 8);
+
+    GenerateInputPB request;
+    request.set_request_id(1);
+    auto context                             = makeContext(&request);
+    context->prefill_worker_cache_store_addrs = {"a:1", "b:2", "c:3", "d:4"};
+
+    TestPrefillRpcServer server;
+    server.setEngineForTest(/*is_mtp_eagle=*/false, std::make_shared<KVCacheManager>(source_config));
+    auto& parallelism   = server.maga_init_params_.parallelism_config;
+    parallelism.tp_size = 4;
+    // This decode hint and model setting must not replace the source cache geometry.
+    parallelism.prefill_cp_config.prefill_cp_size                       = 99;
+    server.maga_init_params_.model_config_.attn_config.tokens_per_block = 32;
+
+    for (auto method : {CPRotateMethod::ALL_GATHER, CPRotateMethod::ALL_GATHER_WITH_OVERLAP, CPRotateMethod::ALLTOALL}) {
+        parallelism.prefill_cp_config.method = method;
+        for (bool sharded : {false, true}) {
+            parallelism.prefill_cp_config.kv_cache_sharded = sharded;
+            const auto allocate = server.buildAllocateRequest(*context);
+            EXPECT_EQ(allocate.prefill_cp_size(), 4);
+            EXPECT_EQ(allocate.prefill_cp_sharded(), sharded);
+            ASSERT_EQ(allocate.cache_store_geometry_size(), 1);
+            EXPECT_EQ(allocate.cache_store_geometry(0).tag(), "full");
+            EXPECT_EQ(allocate.cache_store_geometry(0).physical_tokens_per_block(), 64);
+            EXPECT_EQ(allocate.cache_store_geometry(0).kernel_tokens_per_block(), 16);
+
+            if (method == CPRotateMethod::ALL_GATHER && sharded) {
+                GenerateRequestPB decoded;
+                ASSERT_TRUE(decoded.ParseFromString(allocate.SerializeAsString()));
+                EXPECT_EQ(decoded.prefill_cp_size(), 4);
+                EXPECT_TRUE(decoded.prefill_cp_sharded());
+                ASSERT_EQ(decoded.cache_store_geometry_size(), 1);
+                EXPECT_EQ(decoded.cache_store_geometry(0).SerializeAsString(),
+                          allocate.cache_store_geometry(0).SerializeAsString());
+            }
+        }
+    }
+
+    for (auto method : {CPRotateMethod::DISABLED, CPRotateMethod::UNKNOWN, CPRotateMethod::PREFILL_CP}) {
+        parallelism.prefill_cp_config.method = method;
+        const auto allocate = server.buildAllocateRequest(*context);
+        EXPECT_EQ(allocate.prefill_cp_size(), 1);
+        EXPECT_FALSE(allocate.prefill_cp_sharded());
+    }
+    parallelism.tp_size                      = 1;
+    parallelism.prefill_cp_config.method      = CPRotateMethod::ALL_GATHER;
+    context->prefill_worker_cache_store_addrs = {"a:1"};
+    const auto allocate                      = server.buildAllocateRequest(*context);
+    EXPECT_EQ(allocate.prefill_cp_size(), 1);
+    EXPECT_FALSE(allocate.prefill_cp_sharded());
+}
+
+TEST_F(PrefillRpcServerTest, allocateRequestUsesTaggedSourceAndMtpPhysicalGeometry) {
+    auto full                      = test::makeMhaSpec("full", 64, DataType::TYPE_FP16, 4, 8);
+    full->kernel_seq_size_per_block = 16;
+    auto wider                      = test::makeMhaSpec("wider", 128, DataType::TYPE_FP16, 4, 8);
+    wider->kernel_seq_size_per_block = 32;
+    auto mla                      = test::makeResolvedMlaSpec(DataType::TYPE_FP16, 64, 8, 64, "mla");
+    mla->kernel_seq_size_per_block = 16;
+    auto opaque                      = test::makeResolvedOpaqueSpec(false, "draft", DataType::TYPE_FP16, 1024, 64);
+    opaque->kernel_seq_size_per_block = 16;
+    auto linear = test::makeResolvedLinearSpec(DataType::TYPE_FP16, 1, 1, 8, 8, 2, 64);
+
+    CacheConfig source_config;
+    source_config.dtype              = DataType::TYPE_FP16;
+    source_config.layer_num          = 5;
+    source_config.seq_size_per_block = 32;
+    source_config.fromGroupedSpecs({full, wider, mla, opaque, linear},
+                                    {{0}, {1}, {2}, {3}, {4}},
+                                    {CacheGroupType::FULL,
+                                     CacheGroupType::FULL,
+                                     CacheGroupType::FULL,
+                                     CacheGroupType::FULL,
+                                     CacheGroupType::LINEAR});
+    source_config.finalizeBlockNums(8, RuntimeConfig{});
+
+    auto mtp_spec                      = test::makeMhaSpec("draft", 64, DataType::TYPE_FP16, 2, 4);
+    mtp_spec->kernel_seq_size_per_block = 16;
+    auto mtp_config                    = test::makeSingleGroupCacheConfig(mtp_spec, CacheGroupType::FULL, 1, 8);
+    source_config.mtp_sub_configs.push_back(source_config.mergeMTPModule(mtp_config, 0, source_config.layer_num));
+
+    GenerateInputPB request;
+    request.set_request_id(1);
+    auto context = makeContext(&request);
+    TestPrefillRpcServer server;
+    server.setEngineForTest(/*is_mtp_eagle=*/false, std::make_shared<KVCacheManager>(source_config));
+    const auto allocate = server.buildAllocateRequest(*context);
+
+    ASSERT_EQ(allocate.cache_store_geometry_size(), 3);
+    EXPECT_EQ(allocate.cache_store_geometry(0).tag(), "full");
+    EXPECT_EQ(allocate.cache_store_geometry(0).physical_tokens_per_block(), 64);
+    EXPECT_EQ(allocate.cache_store_geometry(0).kernel_tokens_per_block(), 16);
+    EXPECT_EQ(allocate.cache_store_geometry(1).tag(), "wider");
+    EXPECT_EQ(allocate.cache_store_geometry(1).physical_tokens_per_block(), 128);
+    EXPECT_EQ(allocate.cache_store_geometry(1).kernel_tokens_per_block(), 32);
+    EXPECT_EQ(allocate.cache_store_geometry(2).tag(), "draft");
+    EXPECT_EQ(allocate.cache_store_geometry(2).physical_tokens_per_block(), 64);
+    EXPECT_EQ(allocate.cache_store_geometry(2).kernel_tokens_per_block(), 16);
+}
+
+TEST_F(PrefillRpcServerTest, allocateRequestRejectsInvalidSourceCpTopology) {
+    GenerateInputPB request;
+    request.set_request_id(1);
+    auto context                             = makeContext(&request);
+    context->prefill_worker_cache_store_addrs = {"a:1", "b:2"};
+    TestPrefillRpcServer server;
+    server.setEngineForTest(/*is_mtp_eagle=*/false);
+    auto& parallelism                             = server.maga_init_params_.parallelism_config;
+    parallelism.prefill_cp_config.method          = CPRotateMethod::ALL_GATHER;
+    parallelism.prefill_cp_config.kv_cache_sharded = true;
+    parallelism.tp_size                           = 4;
+    EXPECT_THROW(server.buildAllocateRequest(*context), RTPException);
+    parallelism.tp_size = 1;
+    EXPECT_THROW(server.buildAllocateRequest(*context), RTPException);
+    parallelism.tp_size = 0;
+    EXPECT_THROW(server.buildAllocateRequest(*context), RTPException);
+    parallelism.tp_size = static_cast<int64_t>(std::numeric_limits<int32_t>::max()) + 1;
+    EXPECT_THROW(server.buildAllocateRequest(*context), RTPException);
 }
 
 }  // namespace rtp_llm

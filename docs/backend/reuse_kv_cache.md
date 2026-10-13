@@ -180,6 +180,33 @@ retains its window policy and supports TP head conversion. Canonical GPU and exp
 CPU IOV writes use the same logical shard slicing. Remote reads target GPU memory, with the
 transfer strategy selected by SDK/PACE.
 
+#### MHA kernel-page transfers in P/D
+
+For ordinary MHA/GQA/MQA, P/D CacheStore publishes K, V and independent scales for each kernel
+page, covering its full head range. Keys use the `_page_<index>` suffix. Communicating Prefill,
+Decode and worker processes must use the same build version. Source tensor ownership and
+physical-block publication leases retain their existing lifetimes.
+
+Prefill's ALLOCATE request carries its actual CP size, sharding mode, and physical/kernel token
+spans for each MHA tag. Decode forwards them to all loading workers and selects physical
+blocks by the source CP owner. `PREFILL_CP` checks the producer topology. The main model and
+participating MTP modules share token spans for the same tag; byte slices use each model's
+own physical buffers and head counts.
+
+The two sides must have the same physical token span. Equal kernel-page sizes use contiguous
+head-group partitions within each page. Different sizes use the greatest common divisor of
+the two kernel token spans to select a contiguous token segment from one source head and
+write it directly to the destination page/head/token address. Each `(partition_count,
+partition_id)` bucket uses a separate `loadBuffers` call through the existing TCP/RDMA
+contiguous-partition protocol. Source keys are unique within a call; repeated source page
+keys belong to different load contexts.
+
+Missing or invalid source geometry, conflicting CP topology, and different physical token
+spans fail before load submission. Only success of all required load contexts contributes
+to completion counts, measured in the original physical blocks/groups. Multiple groups,
+opaque layouts, MLA and LINEAR retain the existing whole-component route. KVCM canonical
+uses its own page-based IOV slices.
+
 ### Ignoring request cache switches
 
 Setting `RTP_LLM_IGNORE_REQUEST_CACHE_SWITCHES=1` (default off) ignores the request's

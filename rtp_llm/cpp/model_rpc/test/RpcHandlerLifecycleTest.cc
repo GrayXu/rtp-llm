@@ -341,6 +341,7 @@ protected:
         auto              rpc      = stub->RemoteGenerate(&client);
         GenerateRequestPB request;
         request.set_stage(RemoteStage::ALLOCATE);
+        request.set_prefill_cp_size(1);
         request.set_request_id(kRequestId);
         request.set_client_id("lifecycle");
         *request.mutable_input() = lifecycleRequest();

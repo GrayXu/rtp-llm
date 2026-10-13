@@ -70,7 +70,9 @@ public:
     GenerateRequestPB         allocate_request;
     DecodeStatInfo            stat_info;
     const std::atomic<size_t>* loading_cache_requests = nullptr;
-    int32_t                    prefill_cp_size        = 1;  // CP size used by prefill; >1 means sharded KV cache
+    int32_t                    prefill_cp_size        = 1;  // Actual sender CP size, independent of KV sharding.
+    bool                       prefill_cp_sharded     = false;
+    std::vector<CacheStoreGeometryPB> cache_store_geometry;
     // Guards meta_->finishTask() early-failure reporting: at most once per request.
     bool early_finish_reported = false;
 

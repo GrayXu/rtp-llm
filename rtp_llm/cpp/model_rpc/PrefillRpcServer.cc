@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -374,6 +375,40 @@ GenerateRequestPB PrefillRpcServer::buildAllocateRequest(PrefillGenerateContext&
     alloc_request.set_stage(RemoteStage::ALLOCATE);
     alloc_request.set_client_id(process_id_);
     alloc_request.set_request_id(prefill_context.request_id);
+
+    const auto& parallelism     = maga_init_params_.parallelism_config;
+    const auto& cp              = parallelism.prefill_cp_config;
+    const auto  prefill_cp_size = cp.is_enabled() ? parallelism.tp_size : 1;
+    RTP_LLM_CHECK_WITH_INFO(prefill_cp_size > 0 && prefill_cp_size <= std::numeric_limits<int32_t>::max(),
+                            "invalid source prefill CP size=%ld",
+                            prefill_cp_size);
+    RTP_LLM_CHECK_WITH_INFO(!cp.is_enabled()
+                                || prefill_context.prefill_worker_cache_store_addrs.size()
+                                       == static_cast<size_t>(prefill_cp_size),
+                            "source prefill CP size=%ld does not match peer count=%zu",
+                            prefill_cp_size,
+                            prefill_context.prefill_worker_cache_store_addrs.size());
+    alloc_request.set_prefill_cp_size(static_cast<int32_t>(prefill_cp_size));
+    alloc_request.set_prefill_cp_sharded(cp.is_enabled() && cp.kv_cache_sharded && parallelism.tp_size > 1);
+
+    RTP_LLM_CHECK_WITH_INFO(engine_ != nullptr, "prefill allocation requires an initialized source engine");
+    const auto& cache_manager = engine_->resourceContext().cache_manager;
+    RTP_LLM_CHECK_WITH_INFO(cache_manager != nullptr, "prefill allocation requires a source cache manager");
+    const auto& cache_config = cache_manager->cacheConfig();
+    for (const auto& group : cache_config.groups()) {
+        const auto layer_ids = cache_config.layerIdsForGroup(group.tag);
+        const bool has_mha   = std::any_of(layer_ids.begin(), layer_ids.end(), [&](int layer_id) {
+            return cache_config.physicalGroupForLayer(layer_id, group.tag).spec->type
+                   == KVCacheSpecType::MultiHeadAttention;
+        });
+        if (has_mha) {
+            // MTP merging requires identical physical/kernel token spans for a shared tag.
+            auto* geometry = alloc_request.add_cache_store_geometry();
+            geometry->set_tag(group.tag);
+            geometry->set_physical_tokens_per_block(group.seqSizePerBlock());
+            geometry->set_kernel_tokens_per_block(group.kernelSeqSizePerBlock());
+        }
+    }
 
     GenerateInputPB* new_request = alloc_request.mutable_input();
     new_request->CopyFrom(*prefill_context.rpc_context.request);
