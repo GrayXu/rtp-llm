@@ -878,6 +878,18 @@ void PyWrappedModel::updateKVCacheKernelBlockId(const GptModelInputs& inputs) {
 
 GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
     RTP_LLM_PROFILE_SCOPE("py_model.forward");
+    // Cache I/O on worker mirrors must finish before another GPU forward can
+    // access the spans. SDK-side device sync covers work enqueued before this lease.
+    auto worker_cache_access = cache_manager_ ? cache_manager_->lockWorkerCacheCompute() : WorkerCacheIOFence::Lease{};
+    struct CacheComputeCompletion {
+        KVCacheManager* manager;
+        bool            active;
+        ~CacheComputeCompletion() {
+            if (active) {
+                manager->recordWorkerCacheCompute();
+            }
+        }
+    } cache_completion{cache_manager_.get(), worker_cache_access.owns_lock()};
 
     // Establish the cleanup guard before touching inputs: both the performance
     // wrapper and host-buffer retention can throw. A failed async prepare must

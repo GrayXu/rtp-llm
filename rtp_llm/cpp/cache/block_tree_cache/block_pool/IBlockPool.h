@@ -67,6 +67,7 @@ public:
 
     bool validBlock(BlockIdxType block) const;
     bool isAllocated(BlockIdxType block) const;
+    uint64_t blockAllocationGeneration(BlockIdxType block) const;
 
     size_t totalBlocksNum() const;
     size_t freeBlocksNum() const;
@@ -139,6 +140,7 @@ protected:
     void     freeAllocatedBlockNoLock(BlockIdxType block);
 
     mutable std::mutex mutex_;
+    std::vector<uint64_t> allocation_generations_;
 
     template<typename ConfigT>
     const ConfigT& configAs(BlockPoolType expected_type) const {

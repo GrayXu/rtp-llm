@@ -776,6 +776,30 @@ public:
 
 class MtpCacheStrideTest: public MtpExecutorTest, public ::testing::WithParamInterface<int> {};
 
+TEST_F(MtpExecutorTest, testEmptyRoundsSkipTargetAndDraftModels) {
+    for (const auto role : {RoleType::PREFILL, RoleType::DECODE, RoleType::PDFUSION}) {
+        SCOPED_TRACE(static_cast<int>(role));
+        MtpExecutorTestConfig test_config;
+        test_config.role_type = role;
+        auto components = createMtpExecutorComponents(test_config);
+        auto* target_model = components.fake_target_model.get();
+        auto* draft_model = components.fake_draft_model.get();
+        auto* draft_prefill_model = components.fake_draft_prefill_model.get();
+        setupFakeModels(components.executor.get(),
+                        std::move(components.fake_target_model),
+                        std::move(components.fake_draft_model),
+                        std::move(components.fake_fast_topk_sampler),
+                        std::move(components.fake_speculative_sampler),
+                        std::move(components.fake_sampler),
+                        std::move(components.fake_draft_prefill_model));
+
+        EXPECT_TRUE(components.executor->process({}).ok());
+        EXPECT_EQ(target_model->forwardCount(), 0);
+        EXPECT_EQ(draft_model->forwardCount(), 0);
+        EXPECT_EQ(draft_prefill_model->forwardCount(), 0);
+    }
+}
+
 TEST_P(MtpCacheStrideTest, ForwardAndPrepareUseSingleGroupStrideOnly) {
     const bool multiple_groups  = GetParam() != 0;
     const bool draft_has_linear = GetParam() == 2;

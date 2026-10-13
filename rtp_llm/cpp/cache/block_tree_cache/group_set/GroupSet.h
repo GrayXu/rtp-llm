@@ -2,10 +2,12 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 #include "rtp_llm/cpp/cache/CacheTopology.h"
@@ -75,6 +77,8 @@ public:
     std::shared_ptr<HostBlockPool> hostPool() const {
         return host_pool_;
     }
+    // Resolve a model-global layer in the packed DeviceHostTransfer payload.
+    std::vector<BlockInfo> convertHostIndexToBuffer(int layer_id, const std::string& tag, BlockIdxType block) const;
     std::shared_ptr<BlockTreeDiskBlockPool> diskPool() const {
         return disk_pool_;
     }
@@ -92,6 +96,13 @@ public:
     void                       releaseSingleBlock(Tier tier, BlockIdxType block, BlockTreeRefType ref_type) const;
 
 private:
+    struct HostBufferRegion {
+        size_t    offset;
+        BlockInfo info;
+    };
+    using HostBufferLayouts = std::unordered_map<std::string, std::unordered_map<int, std::vector<HostBufferRegion>>>;
+    mutable std::mutex                      host_layout_mutex_;
+    mutable HostBufferLayouts               host_buffer_layouts_;
     std::vector<DeviceBlockPoolPtr>         device_pools_;
     std::shared_ptr<HostBlockPool>          host_pool_;
     std::shared_ptr<BlockTreeDiskBlockPool> disk_pool_;

@@ -14,6 +14,7 @@
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/DevicePin.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
+#include "rtp_llm/cpp/utils/RemoteCacheConfig.h"
 #include "rtp_llm/cpp/utils/TorchCudaOom.h"
 #include "autil/TimeUtility.h"
 #include "rtp_llm/cpp/normal_engine/speculative/MtpExecutor.h"
@@ -54,16 +55,20 @@ void releaseHostMemoryCache() {
 #endif
 }
 
-bool shouldUseDeviceMallocKVCacheBacking(const PDSepConfig& pd_sep_config, const CacheStoreConfig& cache_store_config) {
-    // Only PD cache-store RDMA registers KV cache as user MR.  Keep the
-    // raw device allocation backing out of direct KVCacheManager users and non-RDMA
-    // paths so PyTorch allocator behavior is unchanged elsewhere.
+bool shouldUseDeviceMallocKVCacheBacking(const PDSepConfig&      pd_sep_config,
+                                         const CacheStoreConfig& cache_store_config,
+                                         const KVCacheConfig&    kv_cache_config) {
+    const bool remote_cache_gdr = kv_cache_config.enable_remote_cache && remoteCacheGdrEnabled();
+    // Raw device allocation is required by PD cache-store RDMA and by the
+    // KVCM RemoteCache GDR backend. Keep the PyTorch allocator for deployments
+    // where neither registered-memory path is active.
     const bool pd_role = pd_sep_config.role_type == RoleType::PREFILL || pd_sep_config.role_type == RoleType::DECODE;
     const bool has_cache_store_server = pd_sep_config.cache_store_listen_port > 0
                                         || pd_sep_config.cache_store_rdma_listen_port > 0
                                         || pd_sep_config.remote_rpc_server_port > 0;
-    return pd_role && pd_sep_config.cache_store_rdma_mode
-           && (cache_store_config.cache_store_rdma_mode || has_cache_store_server);
+    const bool cache_store_rdma = pd_role && pd_sep_config.cache_store_rdma_mode
+                                  && (cache_store_config.cache_store_rdma_mode || has_cache_store_server);
+    return cache_store_rdma || remote_cache_gdr;
 }
 
 bool cacheStatusSnapshotEnabled() {
@@ -284,7 +289,25 @@ void NormalEngine::initExecutor(const EngineInitParams&                        p
     }
 }
 
+bool NormalEngine::shouldPollIdleRemoteCache(const ParallelismConfig& parallelism_config,
+                                            bool                     remote_cache_enabled,
+                                            bool                     remote_cache_gdr_enabled,
+                                            bool                     enable_ffn_disaggregate) {
+    // Cross-node TP workers may have an outstanding shape-header receive. Keep
+    // sending empty skip_run rounds so a remote GDR device sync can complete.
+    // DP and FFN disaggregation do not use the same no-model empty-round contract.
+    return parallelism_config.dp_size == 1 && parallelism_config.tp_rank == 0
+           && parallelism_config.tp_size > parallelism_config.local_world_size && remote_cache_enabled
+           && remote_cache_gdr_enabled && !enable_ffn_disaggregate;
+}
+
 void NormalEngine::initScheduler() {
+    const auto block_tree_cache = resource_context_.cache_manager ? resource_context_.cache_manager->blockTreeCache() :
+                                                                   nullptr;
+    const bool need_idle_control = shouldPollIdleRemoteCache(parallelism_config,
+                                                            block_tree_cache && block_tree_cache->isRemoteCacheEnabled(),
+                                                            remoteCacheGdrEnabled(),
+                                                            ffn_disaggregate_config.enable_ffn_disaggregate);
     const auto pdfusion_scheduler_mode =
         parsePDFusionSchedulerMode(runtime_config.fifo_scheduler_config.pdfusion_scheduler_mode);
     if (pdfusion_scheduler_mode == PDFusionSchedulerMode::UNKNOWN) {
@@ -292,8 +315,11 @@ void NormalEngine::initScheduler() {
                             runtime_config.fifo_scheduler_config.pdfusion_scheduler_mode.c_str());
     }
     if (runtime_config.use_batch_decode_scheduler) {
-        scheduler_.reset(new BatchDecodeScheduler(
-            runtime_config, resource_context_.cache_manager, metrics_reporter_, parallelism_config.dp_rank));
+        scheduler_.reset(new BatchDecodeScheduler(runtime_config,
+                                                  resource_context_.cache_manager,
+                                                  metrics_reporter_,
+                                                  parallelism_config.dp_rank,
+                                                  need_idle_control));
         RTP_LLM_LOG_INFO("create batch decode scheduler done");
     } else if (pdfusion_scheduler_mode == PDFusionSchedulerMode::RATIO
                && pd_sep_config.role_type == RoleType::PDFUSION) {
@@ -303,7 +329,9 @@ void NormalEngine::initScheduler() {
                                                     parallelism_config,
                                                     model_specific_config,
                                                     resource_context_.cache_manager,
-                                                    metrics_reporter_));
+                                                    metrics_reporter_,
+                                                    /*max_score_len=*/1,
+                                                    need_idle_control));
         RTP_LLM_LOG_INFO("create pdfusion ratio scheduler done");
     } else {
         if (pdfusion_scheduler_mode == PDFusionSchedulerMode::RATIO) {
@@ -316,7 +344,9 @@ void NormalEngine::initScheduler() {
                                            parallelism_config,
                                            model_specific_config,
                                            resource_context_.cache_manager,
-                                           metrics_reporter_));
+                                           metrics_reporter_,
+                                           /*max_score_len=*/1,
+                                           need_idle_control));
         RTP_LLM_LOG_INFO("create fifo scheduler done");
     }
 }
@@ -623,7 +653,8 @@ void NormalEngine::initializeAndPublishCacheManager(ResourceContext&            
 
 void NormalEngine::initCacheManager(std::optional<WarmUpResult> warm_up_result) {
     normalizeSystemPromptCacheConfig();
-    const bool use_device_malloc_block_pool = shouldUseDeviceMallocKVCacheBacking(pd_sep_config, cache_store_config);
+    const bool use_device_malloc_block_pool =
+        shouldUseDeviceMallocKVCacheBacking(pd_sep_config, cache_store_config, kv_cache_config);
     const ModelConfig* draft_model_config   = propose_params_ && propose_params_->draftModel() ?
                                                   &propose_params_->getEngineInitParams().model_config_ :
                                                   nullptr;

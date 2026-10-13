@@ -48,6 +48,10 @@ public:
 
 private:
     void                            initScheduler();
+    static bool                     shouldPollIdleRemoteCache(const ParallelismConfig& parallelism_config,
+                                                              bool                     remote_cache_enabled,
+                                                              bool                     remote_cache_gdr_enabled,
+                                                              bool                     enable_ffn_disaggregate);
     std::shared_ptr<GenerateStream> createMinFakeStream(int32_t max_new_tokens);
     WarmUpResult                    warmUp(const EngineInitParams& params);
     WarmUpResult                    prefillWarmUp(const EngineInitParams& params);

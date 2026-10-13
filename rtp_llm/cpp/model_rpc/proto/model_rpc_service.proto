@@ -409,6 +409,14 @@ enum RemoteStage {
     PREFILL_COMPLETE = 3;
 }
 
+// Source token spans for the tagged MHA CacheStore kernel-page layout.
+// All participating P/D workers must use the matching page-key protocol.
+message CacheStoreGeometryPB {
+    string tag = 1;
+    uint64 physical_tokens_per_block = 2;
+    uint64 kernel_tokens_per_block = 3;
+}
+
 message GenerateRequestPB {
     RemoteStage stage = 1;
     int64 request_id = 2;
@@ -421,6 +429,10 @@ message GenerateRequestPB {
     repeated int32 position_ids = 9;
     TensorPB propose_probs = 10;
     TensorPB propose_hidden = 11;
+    // Actual source CP size; PREFILL_CP on decode is only a configuration hint.
+    int32 prefill_cp_size = 12;
+    bool prefill_cp_sharded = 13;
+    repeated CacheStoreGeometryPB cache_store_geometry = 14;
 }
 
 // In the TP case, the decode master broadcasts to decode workers.
@@ -444,7 +456,8 @@ message BroadcastLoadRequestPB {
     reserved "group_block_ids";
     int32 prefill_cp_size = 13;
     repeated TaggedBlockIdsPB tagged_group_block_ids = 14;
-
+    repeated CacheStoreGeometryPB cache_store_geometry = 15;
+    bool prefill_cp_sharded = 16;
 }
 
 message BroadcastLoadResponsePB {
@@ -838,6 +851,17 @@ message RemoteOperationRequestPB {
     repeated string group_tags = 6;
     // Metadata operations are served by TP rank 0 for this backend's instance.
     RemoteMetadataRequestPB metadata = 7;
+    // Write-only HOST source; omission preserves DEVICE buffers.
+    bool host_source = 8;
+    repeated uint32 coordinate_ids = 9;
+    // Full key path for HOST writes; each coordinate indexes this sequence.
+    repeated int64 cache_keys = 10;
+    // TP0 allocation generation for each tag/block/URI, preventing late worker I/O after reuse.
+    // HOST writes resolve and pin local blocks by key instead of consulting these generations.
+    repeated uint64 block_generations = 11;
+    // canonical_v1: one logical head/state shard per tag/block/URI entry.
+    repeated int32 logical_shards = 12;
+    string storage_layout = 13;
 }
 
 message RemoteMetadataRequestPB {
@@ -876,6 +900,14 @@ message RemoteHostCacheMatchPB {
     int64 p2p_1_total_match = 4;
 }
 
+enum RemoteTransferStatusPB {
+    REMOTE_TRANSFER_STATUS_UNSPECIFIED = 0;
+    REMOTE_TRANSFER_STATUS_SUCCESS = 1;
+    REMOTE_TRANSFER_STATUS_FAILED = 2;
+    REMOTE_TRANSFER_STATUS_TIMEOUT = 3;
+    REMOTE_TRANSFER_STATUS_COMPLETION_UNKNOWN = 4;
+}
+
 message RemoteOperationResponsePB {
     RemoteBlockMaskPB succeed_block = 1;  // for read/write, TODO
     repeated string actual_uris = 2; // only for write
@@ -883,6 +915,9 @@ message RemoteOperationResponsePB {
     reserved "matched_blocks", "locations", "metas";
     repeated RemoteBackendKeyLocationsPB backend_locations = 6;
     repeated RemoteHostCacheMatchPB hosts = 7;
+    // Application-level transfer result. UNSPECIFIED is accepted as success
+    // from an older TP worker when the RPC itself completed successfully.
+    RemoteTransferStatusPB transfer_status = 8;
 }
 
 message FunctionResponsePB {

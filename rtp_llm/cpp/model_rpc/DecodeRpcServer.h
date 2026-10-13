@@ -8,6 +8,7 @@
 #include "rtp_llm/cpp/cache/CacheGroupType.h"
 
 #include <utility>
+#include <map>
 
 namespace rtp_llm {
 
@@ -37,7 +38,9 @@ public:
                            int                      partition_count,
                            int                      partition_id,
                            grpc::ServerContext*     server_context,
-                           int32_t                  prefill_cp_size = 1):
+                           int32_t                  prefill_cp_size = 1,
+                           bool                     prefill_cp_sharded = false,
+                           std::vector<CacheStoreGeometryPB> cache_store_geometry = {}):
             request_id(request_id),
             request_key(std::move(request_key)),
             peer_addrs(std::move(peer_addrs)),
@@ -48,6 +51,8 @@ public:
             partition_id(partition_id),
             server_context(server_context),
             prefill_cp_size(prefill_cp_size),
+            prefill_cp_sharded(prefill_cp_sharded),
+            cache_store_geometry(std::move(cache_store_geometry)),
             group_block_ids_(std::move(group_block_ids)) {
             group_block_ids_.validate();
         }
@@ -71,12 +76,30 @@ public:
 
         grpc::ServerContext* server_context;
         int32_t              prefill_cp_size;
+        bool                 prefill_cp_sharded;
+        std::vector<CacheStoreGeometryPB> cache_store_geometry;
 
     private:
         GroupBlockIds group_block_ids_;
     };
 
 private:
+    using CacheLoadBuckets =
+        std::map<std::pair<int, int>, std::vector<std::shared_ptr<RequestBlockBuffer>>>;
+
+    static bool usesMhaPageKeys(const CacheConfig& config);
+    static ErrorInfo validateCacheStoreGeometry(const LoadKVCacheContext& context, const CacheConfig& config);
+    static void appendMhaPageBuffers(CacheLoadBuckets& buckets,
+                                     int64_t request_id,
+                                     const std::string& cache_key,
+                                     const GroupBase& group,
+                                     const CacheStoreGeometryPB& source_geometry,
+                                     const std::vector<BlockInfo>& physical_parts,
+                                     size_t source_heads,
+                                     size_t source_head_begin,
+                                     size_t destination_head_begin,
+                                     size_t head_count);
+
     struct LoadCacheResult {
         ErrorInfo error_info;
         size_t    loaded_cache_block_count = 0;
@@ -108,7 +131,8 @@ private:
     LoadCacheResult        loadCacheAsyncForTp(DecodeGenerateContext& decode_context, LoadKVCacheContext& load_context);
     BroadcastLoadRequestPB constructRemoteLoadRequest(const LoadKVCacheContext&       load_context,
                                                       int                             index,
-                                                      const std::vector<std::string>& peer_ips) const;
+                                                      const std::vector<std::string>& peer_ips,
+                                                      bool                            split_cp_heads = true) const;
     BroadcastLoadRequestPB constructRemoteLoadRequestForMla(const LoadKVCacheContext&       load_context,
                                                             int                             index,
                                                             const std::vector<std::string>& peer_ips) const;

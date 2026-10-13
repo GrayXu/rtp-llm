@@ -138,6 +138,14 @@ size_t HostBlockPool::blockSizeBytes() const {
     return payloadBytes();
 }
 
+void HostBlockPool::markUncertainRemoteIo() {
+    uncertain_remote_io_.store(true, std::memory_order_release);
+}
+
+bool HostBlockPool::hasUncertainRemoteIo() const {
+    return uncertain_remote_io_.load(std::memory_order_acquire);
+}
+
 std::string HostBlockPool::debugString() const {
     std::ostringstream oss;
     oss << "HostBlockPool{" << IBlockPool::debugString() << ", payload_bytes=" << payloadBytes()

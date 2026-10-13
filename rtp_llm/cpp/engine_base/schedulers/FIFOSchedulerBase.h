@@ -26,7 +26,8 @@ public:
                                const ParallelismConfig&               parallelism_config,
                                const ModelSpecificConfig&             model_specific_config,
                                const std::shared_ptr<KVCacheManager>& cache_manager,
-                               const kmonitor::MetricsReporterPtr     metrics_reporter = nullptr);
+                               const kmonitor::MetricsReporterPtr     metrics_reporter = nullptr,
+                               const bool                             need_idle_control = false);
 
     ~FIFOSchedulerBase() override = default;
 
@@ -86,6 +87,7 @@ protected:
     size_t                          max_generate_batch_size_ = 1;
     size_t                          max_inited_kv_cache_streams_ = 0;
     bool                            need_fill_fake_stream_   = false;
+    bool                            need_idle_control_       = false;
     std::atomic<bool>               stop_                    = false;
     bool                            schedule_trigger_        = false;
     std::mutex                      lock_;

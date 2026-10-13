@@ -28,7 +28,9 @@ public:
     BatchDecodeScheduler(const RuntimeConfig&                   runtime_config,
                          const std::shared_ptr<KVCacheManager>& cache_manager,
                          const kmonitor::MetricsReporterPtr     metrics_reporter,
-                         int                                    dp_rank = 0) {
+                         int                                    dp_rank           = 0,
+                         bool                                   need_idle_control = false):
+        need_idle_control_(need_idle_control) {
         cache_manager_    = cache_manager;
         metrics_reporter_ = metrics_reporter;
         batch_size_       = runtime_config.batch_decode_scheduler_config.batch_decode_scheduler_batch_size;
@@ -191,7 +193,8 @@ public:
 
     absl::StatusOr<std::list<GenerateStreamPtr>> schedule() override {
         std::unique_lock<std::mutex> lock(lock_);
-        cond_.wait_for(lock, std::chrono::seconds(30), [this] {
+        const auto wait_duration = need_idle_control_ ? std::chrono::milliseconds(10) : std::chrono::milliseconds(30000);
+        cond_.wait_for(lock, wait_duration, [this] {
             return waiting_streams_.size() >= batch_size_ || running_streams_.size() > 0
                    || !loading_cache_streams_.empty();
         });
@@ -241,6 +244,7 @@ private:
     uint32_t                     batch_size_;
     bool                         reorder_request_;
     uint32_t                     current_step_ = 0;
+    const bool                   need_idle_control_ = false;
 
     std::shared_ptr<KVCacheManager> cache_manager_;
     kmonitor::MetricsReporterPtr    metrics_reporter_;

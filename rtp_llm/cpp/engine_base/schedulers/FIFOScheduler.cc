@@ -19,14 +19,16 @@ FIFOScheduler::FIFOScheduler(const RuntimeConfig&                   runtime_conf
                              const ModelSpecificConfig&             model_specific_config,
                              const std::shared_ptr<KVCacheManager>& cache_manager,
                              const kmonitor::MetricsReporterPtr     metrics_reporter,
-                             const int                              max_score_len):
+                             const int                              max_score_len,
+                             const bool                             need_idle_control):
     FIFOSchedulerBase(runtime_config,
                       model_config,
                       pd_sep_config,
                       parallelism_config,
                       model_specific_config,
                       cache_manager,
-                      metrics_reporter),
+                      metrics_reporter,
+                      need_idle_control),
     cp_force_single_prefill_(parallelism_config.prefill_cp_config.is_enabled()
                              && runtime_config.fifo_scheduler_config.cp_force_single_prefill),
     max_batch_tokens_without_cache_(static_cast<size_t>(
@@ -571,8 +573,8 @@ void FIFOScheduler::evaluateWaitingGroupQueue() {
 
 absl::StatusOr<list<GenerateStreamPtr>> FIFOScheduler::schedule() {
     unique_lock<mutex> lock(lock_);
-    if (need_fill_fake_stream_ || !loading_cache_streams_.empty() || !loading_cache_group_queue_.empty()
-        || !waiting_group_queue_.empty()) {
+    if (need_fill_fake_stream_ || need_idle_control_ || !loading_cache_streams_.empty()
+        || !loading_cache_group_queue_.empty() || !waiting_group_queue_.empty()) {
         cond_.wait_for(lock, std::chrono::milliseconds(10), [this] { return waitPredicate(); });
     } else if (!waiting_streams_.empty()) {
         // No running work can release capacity. Poll PD-held block releases without turning a

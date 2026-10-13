@@ -4,6 +4,7 @@
 #include <typeinfo>
 #include <limits>
 #include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/GroupPolicy.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/CanonicalCacheLayout.h"
 #include "rtp_llm/cpp/cache/Types.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/Logger.h"
@@ -24,7 +25,9 @@ std::string genLocationSpecName(int tp_rank, const std::string& group_name) {
     return "tp" + std::to_string(tp_rank) + "_" + group_name;
 }
 
-bool GroupPolicy::buildLocationSpecGroups(int tp_size, LocationSpecGroups& location_spec_groups) {
+bool GroupPolicy::buildLocationSpecGroups(int                               tp_size,
+                                          LocationSpecGroups&               location_spec_groups,
+                                          const std::map<std::string, int>* logical_shards) {
     if (tp_size <= 0 || groups_.empty()) {
         RTP_LLM_LOG_ERROR("cannot build KVCM location groups: tp_size=%d groups=%zu", tp_size, groups_.size());
         return false;
@@ -39,11 +42,13 @@ bool GroupPolicy::buildLocationSpecGroups(int tp_size, LocationSpecGroups& locat
             return false;
         }
         new_location_spec_group_map[group.group_name_bithash] = group.group_name;
-        for (int rank = 0; rank < tp_size; ++rank) {
-            const std::string spec_name = genLocationSpecName(rank, group.group_name);
+        const int count = logical_shards ? logical_shards->at(group.tag) : tp_size;
+        for (int rank = 0; rank < count; ++rank) {
+            const std::string spec_name = logical_shards ? genCanonicalSpecName(rank, group.group_name) :
+                                                           genLocationSpecName(rank, group.group_name);
             group_it->second.push_back(spec_name);
-            const auto [unused_it, spec_inserted] =
-                new_spec_name_to_info.emplace(spec_name, SpecInfo{group_id, rank, group.tag});
+            const auto [unused_it, spec_inserted] = new_spec_name_to_info.emplace(
+                spec_name, SpecInfo{group_id, logical_shards ? -1 : rank, group.tag, logical_shards ? rank : -1});
             (void)unused_it;
             if (!spec_inserted) {
                 RTP_LLM_LOG_ERROR("duplicate KVCM location spec [%s]", spec_name.c_str());
@@ -108,6 +113,10 @@ bool GroupPolicy::validateLocationSpecs(const kv_cache_manager::Location& locati
     std::vector<std::string_view> actual_specs;
     actual_specs.reserve(location.size());
     for (const auto& unit : location) {
+        if (unit.uri.empty()) {
+            RTP_LLM_LOG_WARNING("KVCM %s spec [%s] has an empty URI", kind, unit.spec_name.c_str());
+            return false;
+        }
         actual_specs.emplace_back(unit.spec_name);
     }
     std::sort(actual_specs.begin(), actual_specs.end());
@@ -123,6 +132,25 @@ bool GroupPolicy::validateLocationSpecs(const kv_cache_manager::Location& locati
         }
     }
     return true;
+}
+
+bool GroupPolicy::validateWriteLocation(const kv_cache_manager::Location& location,
+                                        const std::string&                location_spec_group_name) const {
+    if (location_spec_group_name.empty()) {
+        return validateLocationSpecs(location, all_spec_names_, "write");
+    }
+    const auto mask = std::find_if(location_spec_group_map_.begin(), location_spec_group_map_.end(),
+                                   [&](const auto& entry) { return entry.second == location_spec_group_name; });
+    if (mask == location_spec_group_map_.end()) {
+        return false;
+    }
+    SpecNames expected_specs;
+    for (const auto& [name, info] : spec_name_to_info_) {
+        if ((groups_.at(info.group_id).group_name_bithash & mask->first) != 0) {
+            expected_specs.push_back(name);
+        }
+    }
+    return validateLocationSpecs(location, expected_specs, "write");
 }
 
 bool GroupPolicy::setLocationView(const kv_cache_manager::Location& location,
@@ -176,6 +204,13 @@ bool DefaultLayerGroupPolicy::init() {
                             "remote cache group byte-size table has %zu entries but topology has %zu groups",
                             group_block_size_bytes_.size(),
                             topology_.groups().size());
+    for (const auto& [tag, bytes] : group_block_size_bytes_) {
+        const auto& tags = topology_.groupTags();
+        if (std::find(tags.begin(), tags.end(), tag) == tags.end()) {
+            RTP_LLM_LOG_ERROR("invalid remote cache group byte size: tag=%s bytes=%zu", tag.c_str(), bytes);
+            return false;
+        }
+    }
     std::vector<std::string> intersection;
     std::set_intersection(full_group_tags_.begin(),
                           full_group_tags_.end(),
@@ -251,6 +286,10 @@ bool DefaultLayerGroupPolicy::init() {
                 const size_t      block_size_bytes = exact_bytes == group_block_size_bytes_.end() ?
                                                          topology_.blockSizeBytesForGroup(cache_tag) :
                                                          exact_bytes->second;
+                if (block_size_bytes == 0 || block_size_bytes > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+                    RTP_LLM_LOG_ERROR("invalid remote cache payload size for tag=%s", cache_tag.c_str());
+                    return false;
+                }
                 pending_groups[group_idx] =
                     Group{is_full_group, group_name_bithash, group_name, cache_tag, block_size_bytes};
                 pending_group_to_layer_ids[group_idx] = {};
@@ -336,10 +375,17 @@ bool DefaultLayerGroupPolicy::getNeedWriteGroups(const StorageRequest&     reque
 
 bool DefaultLayerGroupPolicy::genBlockBuffers(const std::vector<std::string>& group_tags,
                                               const std::vector<int32_t>&     block_ids,
-                                              kv_cache_manager::BlockBuffers& block_buffers) const {
+                                              kv_cache_manager::BlockBuffers& block_buffers,
+                                              Tier                            source_tier) const {
     static auto push_iov = [](std::vector<kv_cache_manager::Iov>& iovs, const BlockInfo& block_info) {
-        iovs.push_back({kv_cache_manager::MemoryType::GPU, block_info.addr, block_info.size_bytes, false});
+        const auto type = block_info.is_cuda ? kv_cache_manager::MemoryType::GPU : kv_cache_manager::MemoryType::CPU;
+        iovs.push_back({type, block_info.addr, block_info.size_bytes, false});
     };
+    RTP_LLM_CHECK(source_tier == Tier::DEVICE || source_tier == Tier::HOST);
+    if (!buffer_resolver_) {
+        RTP_LLM_LOG_WARNING("remote cache has no %s buffer resolver", tierName(source_tier));
+        return false;
+    }
     RTP_LLM_CHECK_WITH_INFO(group_tags.size() == block_ids.size(),
                             "remote cache group/block count mismatch: groups=%zu blocks=%zu",
                             group_tags.size(),
@@ -365,20 +411,31 @@ bool DefaultLayerGroupPolicy::genBlockBuffers(const std::vector<std::string>& gr
         iovs.reserve(layer_ids.size() * 2);
         for (size_t j = 0; j < layer_ids.size(); ++j) {
             // if support scale, block_infos: {kv_info, scale_info}
-            const auto block_infos = buffer_resolver_(layer_ids[j], tag, block_ids[i]);
+            const auto block_infos = buffer_resolver_(layer_ids[j], tag, block_ids[i], source_tier);
             if (block_infos.empty()) {
                 RTP_LLM_LOG_WARNING("convertIndexToBuffer returned empty for layer_id [%d] group_id [%d] block_id[%d]",
                                     layer_ids[j],
                                     group_id,
                                     block_ids[i]);
+                return false;
             }
             for (size_t idx = 0; idx < block_infos.size(); ++idx) {
+                if (block_infos[idx].is_cuda != (source_tier == Tier::DEVICE)) {
+                    RTP_LLM_LOG_WARNING("remote cache buffer device does not match %s source for tag=%s",
+                                        tierName(source_tier),
+                                        tag.c_str());
+                    return false;
+                }
                 CHECK_BLOCK_INFO_VALID(
                     block_infos[idx],
                     "convertIndexToBuffer failed layer_id [%d] group_id [%d] block_id[%d], block_info.addr or block_info.size_bytes is invalid",
                     layer_ids[j],
                     group_id,
                     block_ids[i]);
+                if (block_infos[idx].size_bytes > groups_.at(group_id).block_size_bytes - actual_block_bytes) {
+                    RTP_LLM_LOG_WARNING("remote cache buffer exceeds payload size for tag=%s", tag.c_str());
+                    return false;
+                }
                 actual_block_bytes += block_infos[idx].size_bytes;
                 push_iov(iovs, block_infos[idx]);
             }

@@ -234,6 +234,7 @@ struct KVCacheConfig {
     std::string kvcm_vipserver_domain                = "";
     std::string kvcm_server_address                  = "";
     std::string kvcm_instance_group                  = "default";
+    std::string kvcm_remote_layout                   = "legacy";  // legacy | canonical_v1
     int32_t     kvcm_read_backend_type               = 0;  // 0 uses MatchLocation
     int32_t     kvcm_min_replica_count               = 0;  // server interprets 0 as 1
     uint32_t    kvcm_meta_channel_retry_time         = 3;

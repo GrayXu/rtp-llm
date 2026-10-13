@@ -45,6 +45,7 @@ struct MHAKVCacheSpec: public KVCacheSpec {
         const uint32_t kv             = static_cast<uint32_t>(attn.kv_head_num);
         const uint32_t local_kv_heads = (kv % tp == 0) ? kv / tp : kv / std::gcd(kv, tp);
         auto           spec           = std::make_shared<MHAKVCacheSpec>(desc.tag, seq, kernel, local_kv_heads);
+        spec->global_kv_head_num      = kv;
         spec->dtype_                  = desc.dtype != DataType::TYPE_INVALID ? desc.dtype : ctx.dtype;
         RTP_LLM_CHECK_WITH_INFO(spec->dtype_ != DataType::TYPE_INVALID,
                                 "KVCacheSpecDesc tag=%s cache_type=%d requires valid dtype",

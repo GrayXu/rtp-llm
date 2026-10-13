@@ -265,8 +265,10 @@ inline std::string ErrorCodeToString(ErrorCode code) {
 class ErrorInfo {
 public:
     ErrorInfo() {}
-    ErrorInfo(ErrorCode code, const std::string& message): code_(code), message_(message) {}
-    ErrorInfo(ErrorCode code, std::string&& message): code_(code), message_(std::move(message)) {}
+    ErrorInfo(ErrorCode code, const std::string& message, bool completion_unknown = false):
+        code_(code), message_(message), completion_unknown_(completion_unknown) {}
+    ErrorInfo(ErrorCode code, std::string&& message, bool completion_unknown = false):
+        code_(code), message_(std::move(message)), completion_unknown_(completion_unknown) {}
     ErrorInfo(const ErrorInfo& other)            = default;
     ErrorInfo(ErrorInfo&& other)                 = default;
     ErrorInfo& operator=(const ErrorInfo& other) = default;
@@ -292,6 +294,10 @@ public:
         return code_;
     }
 
+    bool completionUnknown() const {
+        return completion_unknown_;
+    }
+
     void setErrorCode(ErrorCode ec) {
         code_ = ec;
     }
@@ -299,6 +305,7 @@ public:
 private:
     ErrorCode   code_ = ErrorCode::NONE_ERROR;
     std::string message_;
+    bool        completion_unknown_{false};
 };
 
 template<typename T>

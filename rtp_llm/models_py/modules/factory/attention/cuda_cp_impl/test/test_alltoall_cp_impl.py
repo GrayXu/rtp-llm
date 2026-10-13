@@ -19,6 +19,8 @@ from rtp_llm.models_py.modules.factory.attention.cuda_cp_impl.prefill_mha.alltoa
     PCPAll2AllAttnOp,
 )
 from rtp_llm.models_py.modules.factory.attention.cuda_cp_impl.test.cp_test_utils import (
+    CPAttnTestBase,
+    ShardedCPAttnTestMixin,
     build_cp_attn_inputs,
     compute_rank_positions,
     extract_kv_from_paged_cache,
@@ -43,6 +45,19 @@ def _sleep_us(us: int = _COMM_DELAY_US) -> None:
     end = time.perf_counter() + us * 1e-6
     while time.perf_counter() < end:
         pass
+
+
+class TestPCPAll2AllSharded(ShardedCPAttnTestMixin, CPAttnTestBase):
+    OP_CLASS = PCPAll2AllAttnOp
+    AG_MODULE = _A2A_MODULE
+
+    def _extra_patches(self, stack):
+        stack.enter_context(patch(f"{_A2A_MODULE}.get_user_buffers_communicator", return_value=None))
+        stack.enter_context(patch(f"{_A2A_MODULE}.send", side_effect=lambda *args, **kwargs: None))
+        stack.enter_context(patch(
+            f"{_A2A_MODULE}.recv",
+            side_effect=lambda tensor, src, group=None: tensor.copy_(self._test_ring_kv[src]),
+        ))
 
 
 class TestPCPAll2AllAttnOp(unittest.TestCase):
@@ -77,7 +92,7 @@ class TestPCPAll2AllAttnOp(unittest.TestCase):
         indices: List[int] = []
         for new_len, pl in zip(new_lengths, prefix_lengths):
             positions = zigzag_positions_for_rank(new_len, cp_size, rank)
-            indices.extend(p + pl for p in positions)
+            indices.extend(positions)
         return torch.tensor(indices, dtype=torch.int32, device=device)
 
     # ---- mock builders ----

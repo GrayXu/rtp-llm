@@ -28,6 +28,48 @@ class NormalEngineTest: public DeviceTestBase {
 public:
 };
 
+TEST(NormalEnginePolicyTest, IdleRemoteCachePollingRequiresCrossNodeGdrWithDpOneWithoutFfnDisaggregation) {
+    ParallelismConfig parallelism_config;
+    parallelism_config.tp_size          = 16;
+    parallelism_config.local_world_size = 8;
+    EXPECT_TRUE(NormalEngine::shouldPollIdleRemoteCache(parallelism_config, true, true, false));
+    EXPECT_FALSE(NormalEngine::shouldPollIdleRemoteCache(parallelism_config, false, true, false));
+    EXPECT_FALSE(NormalEngine::shouldPollIdleRemoteCache(parallelism_config, true, false, false));
+    EXPECT_FALSE(NormalEngine::shouldPollIdleRemoteCache(parallelism_config, true, true, true));
+
+    parallelism_config.dp_size = 2;
+    EXPECT_FALSE(NormalEngine::shouldPollIdleRemoteCache(parallelism_config, true, true, false));
+    parallelism_config.dp_size = 1;
+    EXPECT_TRUE(NormalEngine::shouldPollIdleRemoteCache(parallelism_config, true, true, false));
+    parallelism_config.tp_size = 8;
+    EXPECT_FALSE(NormalEngine::shouldPollIdleRemoteCache(parallelism_config, true, true, false));
+    parallelism_config.tp_size = 1;
+    EXPECT_FALSE(NormalEngine::shouldPollIdleRemoteCache(parallelism_config, true, true, false));
+    parallelism_config.tp_size = 16;
+    parallelism_config.tp_rank = 1;
+    EXPECT_FALSE(NormalEngine::shouldPollIdleRemoteCache(parallelism_config, true, true, false));
+}
+
+TEST_F(NormalEngineTest, testEmptyExecutorSkipsModel) {
+    CustomConfig  config;
+    ModelConfig   model_config;
+    RuntimeConfig runtime_config;
+    KVCacheConfig kv_cache_config;
+    auto params = createEngineInitParams(config, model_config, runtime_config, kv_cache_config);
+    auto cache_config = CacheConfigCreator::createConfig(model_config, params.parallelism_config, kv_cache_config);
+    cache_config.finalizeBlockNums(4, runtime_config);
+    auto cache_manager = std::make_shared<KVCacheManager>(cache_config);
+    ASSERT_TRUE(cache_manager->init());
+
+    NormalExecutor executor(params, cache_manager, false);
+    bool           forwarded = false;
+    executor.setModel(std::make_unique<MockModel>(model_config.vocab_size, [&](const GptModelInputs&) {
+        forwarded = true;
+    }));
+    EXPECT_TRUE(executor.process({}).ok());
+    EXPECT_FALSE(forwarded);
+}
+
 TEST_F(NormalEngineTest, testExecutorDecodesCopyRowsUsingPayloadTags) {
     class CopyPayloadProcessor: public NormalBatchStreamProcessor {
     public:

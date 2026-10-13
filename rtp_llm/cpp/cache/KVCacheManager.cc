@@ -10,6 +10,10 @@
 #include <numeric>
 
 #include "rtp_llm/cpp/cache/BatchKVCacheResource.h"
+#include "rtp_llm/models_py/bindings/core/OpData.h"
+#if USING_CUDA || USING_ROCM
+#include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
+#endif
 #include "rtp_llm/cpp/cache/CPSlotMapper.h"
 #include "rtp_llm/cpp/cache/CacheGroupType.h"
 #include "rtp_llm/cpp/cache/CacheTier.h"
@@ -18,6 +22,7 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCacheFactory.h"
 #ifdef RTP_LLM_USE_REMOTE_KV_CACHE
 #include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/KVCMStorageBackend.h"
+#include "rtp_llm/cpp/utils/RemoteCacheConfig.h"
 #endif
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeTaskPool.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/transfer/BlockTransferRequestConverter.h"
@@ -224,7 +229,18 @@ KVCacheManager::KVCacheManager(const CacheConfig&                 config,
     }
 
     const auto& cp_cfg = parallelism_config_.prefill_cp_config;
-    if (cp_cfg.kv_cache_sharded && parallelism_config_.tp_size > 1) {
+    if (kv_cache_config_.enable_remote_cache && !isAllocatorOwner()) {
+        const int64_t budget   = std::max<int64_t>({30000,
+                                                    kv_cache_config_.kvcm_put_timeout_ms,
+                                                    kv_cache_config_.kvcm_get_timeout_ms,
+                                                    kv_cache_config_.kvcm_put_broadcast_timeout,
+                                                    kv_cache_config_.kvcm_get_broadcast_timeout});
+        worker_cache_io_fence_ = std::make_shared<WorkerCacheIOFence>(std::chrono::milliseconds(2 * budget));
+    }
+    // PREFILL_CP on decode describes the producer's topology. Canonical remote
+    // FULL blocks on the decode worker still use its ordinary attention TP layout.
+    const bool canonical_producer_hint = kv_cache_config_.kvcm_remote_layout == "canonical_v1" && !cp_cfg.is_enabled();
+    if (cp_cfg.kv_cache_sharded && parallelism_config_.tp_size > 1 && !canonical_producer_hint) {
         cp_slot_mapper_ = std::make_shared<CPSlotMapper>(static_cast<int>(parallelism_config_.tp_rank),
                                                          static_cast<int>(parallelism_config_.tp_size),
                                                          static_cast<int>(config_.seq_size_per_block));
@@ -288,7 +304,7 @@ bool KVCacheManager::init() {
                                                                      pd_sep_config_.role_type);
 
     if (use_device_malloc_block_pool_) {
-        RTP_LLM_LOG_INFO("RDMA cache store enabled for PD role, use raw device malloc KV cache block-pool backing");
+        RTP_LLM_LOG_INFO("use raw device malloc KV cache block-pool backing");
         coordinator_manager_->setUseDeviceMallocBlockPool(true);
     }
 
@@ -313,7 +329,16 @@ bool KVCacheManager::init() {
     if (kv_cache_config_.enable_remote_cache) {
 #ifdef RTP_LLM_USE_REMOTE_KV_CACHE
         storage_backend = std::make_shared<KVCMStorageBackend>(
-            config_, kv_cache_config_, runtime_config_, parallelism_config_, sp_config_, broadcast_manager);
+            config_,
+            kv_cache_config_,
+            runtime_config_,
+            parallelism_config_,
+            sp_config_,
+            broadcast_manager,
+            kv_cache_config_.enable_remote_cache && remoteCacheGdrEnabled(),
+            metrics_reporter_,
+            nullptr,
+            worker_cache_io_fence_);
 #else
         RTP_LLM_LOG_ERROR("remote cache was requested, but this build does not include the KVCM client");
         return false;
@@ -510,28 +535,149 @@ int KVCacheManager::estimatePeakNeedBlocks(const BatchKVCacheResourcePtr& batch_
 // 块操作相关
 
 void KVCacheManager::blockCopy(int src_block_index, int dest_block_index) {
-    return coordinator_manager_->blockCopy(src_block_index, dest_block_index);
+    auto worker_access = lockWorkerCacheCompute();
+    coordinator_manager_->blockCopy(src_block_index, dest_block_index);
+    recordWorkerCacheCompute();
+}
+
+WorkerCacheIOFence::Lease KVCacheManager::lockWorkerCacheCompute() const {
+    return worker_cache_io_fence_ ? worker_cache_io_fence_->lockCompute() : WorkerCacheIOFence::Lease{};
+}
+
+void KVCacheManager::recordWorkerCacheCompute() const {
+#if USING_CUDA || USING_ROCM
+    if (worker_cache_io_fence_) {
+        auto event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+        event->record(cuda_graph::graphGetCurrentStream());
+        worker_cache_io_fence_->setGpuCompletion([event] { event->synchronize(); });
+    }
+#endif
+}
+
+void KVCacheManager::prepareWorkerCacheIO(GptModelInputs& inputs) {
+    if (!kv_cache_config_.enable_remote_cache || parallelism_config_.tp_size <= 1) {
+        return;
+    }
+    const auto& tags      = config_.groupTags();
+    auto        wire_tags = tags;
+    std::sort(wire_tags.begin(), wire_tags.end());
+    if (!isAllocatorOwner()) {
+        if (!inputs.worker_cache_block_generations.defined()) {
+            return;
+        }
+        const auto table = inputs.worker_cache_block_generations.contiguous();
+        RTP_LLM_CHECK(table.device().is_cpu() && table.scalar_type() == torch::kInt64 && table.dim() == 2
+                      && table.size(1) == 3);
+        const auto*                       rows = table.data_ptr<int64_t>();
+        std::vector<CacheBlockGeneration> generations;
+        for (int64_t row = 0; row < table.size(0); ++row) {
+            const int64_t group = rows[row * 3];
+            RTP_LLM_CHECK(group >= 0 && group < static_cast<int64_t>(tags.size()) && rows[row * 3 + 2] > 0);
+            generations.push_back(
+                {wire_tags[group], static_cast<int32_t>(rows[row * 3 + 1]), static_cast<uint64_t>(rows[row * 3 + 2])});
+        }
+        worker_cache_io_fence_->observe(generations);
+        return;
+    }
+    inputs.worker_cache_block_generations = torch::Tensor();
+    if (inputs.skip_run || inputs.warmup || inputs.is_fake_stream) {
+        return;
+    }
+    const auto&                                         pools = coordinator_manager_->groupBlockPools();
+    std::map<std::pair<size_t, BlockIdxType>, uint64_t> generations;
+    const auto                                          append = [&](const std::string& tag, BlockIdxType block) {
+        if (block <= 0 || isNullBlockIdx(block)) {
+            return;
+        }
+        const auto found = std::find(tags.begin(), tags.end(), tag);
+        RTP_LLM_CHECK_WITH_INFO(found != tags.end(), "cache allocation generation has unknown tag");
+        const size_t local_group = std::distance(tags.begin(), found);
+        const size_t wire_group  =
+            std::distance(wire_tags.begin(), std::lower_bound(wire_tags.begin(), wire_tags.end(), tag));
+        const auto key = std::make_pair(wire_group, block);
+        if (generations.count(key) == 0) {
+            generations.emplace(key, pools.at(local_group)->blockAllocationGeneration(block));
+        }
+    };
+    if (inputs.kv_cache_block_id.defined() && inputs.kv_cache_block_id.numel() > 0) {
+        const bool published_host_pair = inputs.cache_generation_host_blocks.defined()
+                                         && inputs.cache_generation_published_blocks.defined()
+                                         && inputs.cache_generation_published_blocks.unsafeGetTensorImpl()
+                                                == inputs.kv_cache_block_id.unsafeGetTensorImpl();
+        const auto blocks =
+            (published_host_pair ? inputs.cache_generation_host_blocks : inputs.kv_cache_block_id.cpu()).contiguous();
+        RTP_LLM_CHECK(blocks.scalar_type() == torch::kInt32 && (blocks.dim() == 2 || blocks.dim() == 3));
+        auto input_tags = inputs.kv_cache_group_tags;
+        if (input_tags.empty()) {
+            RTP_LLM_CHECK(tags.size() == 1 && blocks.dim() == 2);
+            input_tags = tags;
+        }
+        const size_t group_count = blocks.dim() == 3 ? blocks.size(0) : 1;
+        RTP_LLM_CHECK(input_tags.size() == group_count);
+        const size_t per_group = blocks.numel() / group_count;
+        const auto*  ids       = blocks.data_ptr<int32_t>();
+        for (size_t group = 0; group < group_count; ++group) {
+            for (size_t i = 0; i < per_group; ++i) {
+                append(input_tags[group], ids[group * per_group + i]);
+            }
+        }
+    }
+    if (inputs.kv_cache_update_mapping.defined() && inputs.kv_cache_update_mapping.numel() > 0) {
+        const auto copies = inputs.kv_cache_update_mapping.cpu().contiguous();
+        RTP_LLM_CHECK(copies.scalar_type() == torch::kInt32 && copies.dim() == 2 && copies.size(1) == 3);
+        const auto* rows = copies.data_ptr<int32_t>();
+        for (int64_t row = 0; row < copies.size(0); ++row) {
+            RTP_LLM_CHECK_WITH_INFO(rows[row * 3] >= 0
+                                        && static_cast<size_t>(rows[row * 3]) < inputs.kv_cache_group_tags.size(),
+                                    "cache generation copy mapping requires a valid group tag row");
+            const auto& tag = inputs.kv_cache_group_tags.at(rows[row * 3]);
+            append(tag, rows[row * 3 + 1]);
+            append(tag, rows[row * 3 + 2]);
+        }
+    }
+    if (!generations.empty()) {
+        inputs.worker_cache_block_generations =
+            torch::empty({static_cast<int64_t>(generations.size()), 3}, torch::kInt64).pin_memory();
+        auto*  rows = inputs.worker_cache_block_generations.data_ptr<int64_t>();
+        size_t row  = 0;
+        for (const auto& [key, generation] : generations) {
+            rows[row * 3]     = key.first;
+            rows[row * 3 + 1] = key.second;
+            rows[row * 3 + 2] = generation;
+            ++row;
+        }
+    }
 }
 
 void KVCacheManager::blockBatchCopy(const std::vector<BlockIdPair>& copy_mapping) {
-    return coordinator_manager_->blockBatchCopy(copy_mapping);
+    auto worker_access = lockWorkerCacheCompute();
+    coordinator_manager_->blockBatchCopy(copy_mapping);
+    recordWorkerCacheCompute();
 }
 
 void KVCacheManager::blockBatchCopy(const torch::Tensor& copy_mapping) {
-    return coordinator_manager_->blockBatchCopy(copy_mapping);
+    auto worker_access = lockWorkerCacheCompute();
+    coordinator_manager_->blockBatchCopy(copy_mapping);
+    recordWorkerCacheCompute();
 }
 
 void KVCacheManager::blockBatchCopy(const BlockIdPair* copy_mapping_begin, const BlockIdPair* copy_mapping_end) {
-    return coordinator_manager_->blockBatchCopy(copy_mapping_begin, copy_mapping_end);
+    auto worker_access = lockWorkerCacheCompute();
+    coordinator_manager_->blockBatchCopy(copy_mapping_begin, copy_mapping_end);
+    recordWorkerCacheCompute();
 }
 
 void KVCacheManager::blockBatchCopyByGroup(const std::vector<TaggedBlockIdPair>& copy_mapping) {
-    return coordinator_manager_->blockBatchCopyByGroup(copy_mapping);
+    auto worker_access = lockWorkerCacheCompute();
+    coordinator_manager_->blockBatchCopyByGroup(copy_mapping);
+    recordWorkerCacheCompute();
 }
 
 void KVCacheManager::blockBatchCopyForForward(const torch::Tensor&            copy_mapping,
                                               const std::vector<std::string>& group_tags) {
+    auto worker_access = lockWorkerCacheCompute();
     coordinator_manager_->blockBatchCopyForForward(copy_mapping, group_tags);
+    recordWorkerCacheCompute();
 }
 
 bool KVCacheManager::updateKVBlock(const BatchKVCacheResourcePtr&  batch_kv_cache_resource,
@@ -539,8 +685,10 @@ bool KVCacheManager::updateKVBlock(const BatchKVCacheResourcePtr&  batch_kv_cach
                                    bool                            copy_last_block,
                                    std::vector<TaggedBlockIdPair>& block_update_mapping) {
     RTP_LLM_PROFILE_FUNCTION();
+    auto       worker_access = lockWorkerCacheCompute();
     const bool updated = coordinator_manager_->updateKVBlock(
         batch_kv_cache_resource, block_src_batch, copy_last_block, block_update_mapping);
+    recordWorkerCacheCompute();
     return updated;
 }
 
@@ -720,7 +868,10 @@ bool KVCacheManager::executeFunction(const FunctionRequestPB& request, FunctionR
             RTP_LLM_LOG_WARNING("KVCacheManager::executeFunction: KVCM storage backend is not initialized");
             return false;
         }
-        return backend->execute(request.remote_request(), *response.mutable_remote_response());
+        // Deliver handled transfer failures to the coordinator while preserving
+        // metadata and unsupported-operation failures at the RPC boundary.
+        const bool success = backend->execute(request.remote_request(), *response.mutable_remote_response());
+        return success || response.remote_response().transfer_status() != REMOTE_TRANSFER_STATUS_UNSPECIFIED;
 #else
         RTP_LLM_LOG_WARNING("KVCacheManager::executeFunction: KVCM support is not compiled in");
         return false;

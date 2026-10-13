@@ -42,6 +42,45 @@ TEST(GroupSetTest, StoresOrderedTagMembershipAndLogicalPayload) {
     EXPECT_EQ(group_set->groupType(), CacheGroupType::FULL);
 }
 
+TEST(GroupSetTest, ResolvesPackedHostGroupsLayersAndScalesWithPhysicalOrLogicalGeometry) {
+    const auto topology = makeTestTopology({makeGroupBase({0, 1}), makeGroupBase({0})});
+    const auto pool_a   = makeTestDevicePool({{80, 16}, {96, 24}}, 4, "host_geometry_a");
+    const auto pool_b   = makeTestDevicePool({{128, 32}}, 4, "host_geometry_b");
+    for (bool physical : {false, true}) {
+        const size_t payload_bytes = physical ? 376 : 240;
+        const auto   host_pool     = makeHostPool(payload_bytes, 2);
+        auto         group =
+            std::make_shared<FullGroupSet>(std::vector<DeviceBlockPoolPtr>{pool_b, pool_a}, host_pool, nullptr);
+        group->initialize(0, topology, {"group1", "group0"}, physical ? payload_bytes : 0);
+        const auto block = group->allocateSingleBlock(Tier::HOST, BlockTreeRefType::STORE);
+        ASSERT_FALSE(isNullBlockIdx(block));
+        auto*      base  = static_cast<uint8_t*>(host_pool->blockBuffer(block).addr);
+        const auto first = group->convertHostIndexToBuffer(0, "group1", block);
+        const auto last  = group->convertHostIndexToBuffer(1, "group0", block);
+        ASSERT_EQ(first.size(), 2u);
+        ASSERT_EQ(last.size(), 2u);
+        EXPECT_FALSE(first[0].is_cuda);
+        EXPECT_FALSE(last[0].is_cuda);
+        EXPECT_EQ(first[0].addr, base);
+        EXPECT_EQ(first[0].size_bytes, physical ? 128u : 64u);
+        EXPECT_EQ(first[1].addr, base + (physical ? 128 : 64));
+        EXPECT_EQ(first[1].size_bytes, physical ? 32u : 16u);
+        EXPECT_EQ(last[0].addr, base + (physical ? 256 : 160));
+        EXPECT_EQ(last[0].size_bytes, physical ? 96u : 64u);
+        EXPECT_EQ(last[1].addr, base + (physical ? 352 : 224));
+        EXPECT_EQ(last[1].size_bytes, physical ? 24u : 16u);
+        EXPECT_EQ(static_cast<uint8_t*>(last[1].addr) + last[1].size_bytes, base + payload_bytes);
+        const auto second = group->allocateSingleBlock(Tier::HOST, BlockTreeRefType::STORE);
+        ASSERT_FALSE(isNullBlockIdx(second));
+        const auto second_last = group->convertHostIndexToBuffer(1, "group0", second);
+        auto*      second_base = static_cast<uint8_t*>(host_pool->blockBuffer(second).addr);
+        EXPECT_EQ(second_last[0].addr, second_base + (physical ? 256 : 160));
+        EXPECT_NE(second_last[0].addr, last[0].addr);
+        group->releaseSingleBlock(Tier::HOST, second, BlockTreeRefType::STORE);
+        group->releaseSingleBlock(Tier::HOST, block, BlockTreeRefType::STORE);
+    }
+}
+
 TEST(GroupSetTest, KeepsTopologyAliveAfterCallerReleasesOwnership) {
     auto                               topology      = makeTestTopology({makeGroupBase({0})});
     std::weak_ptr<const CacheTopology> weak_topology = topology;

@@ -140,14 +140,16 @@ PDFusionRatioScheduler::PDFusionRatioScheduler(const RuntimeConfig&             
                                                const ModelSpecificConfig&             model_specific_config,
                                                const std::shared_ptr<KVCacheManager>& cache_manager,
                                                const kmonitor::MetricsReporterPtr     metrics_reporter,
-                                               const int                              max_score_len):
+                                               const int                              max_score_len,
+                                               const bool                             need_idle_control):
     FIFOSchedulerBase(runtime_config,
                       model_config,
                       pd_sep_config,
                       parallelism_config,
                       model_specific_config,
                       cache_manager,
-                      metrics_reporter),
+                      metrics_reporter,
+                      need_idle_control),
     decode_prefill_step_(parseDecodePrefillRatio(runtime_config.fifo_scheduler_config.decode_prefill_ratio)),
     decode_since_prefill_(0),
     prefill_since_decode_(0) {
@@ -199,7 +201,7 @@ bool PDFusionRatioScheduler::waitPredicate() {
 
 absl::StatusOr<list<GenerateStreamPtr>> PDFusionRatioScheduler::schedule() {
     unique_lock<mutex> lock(lock_);
-    if (need_fill_fake_stream_) {
+    if (need_fill_fake_stream_ || need_idle_control_) {
         cond_.wait_for(lock, std::chrono::milliseconds(10), [this] { return waitPredicate(); });
     } else {
         cond_.wait(lock, [this] { return waitPredicate(); });

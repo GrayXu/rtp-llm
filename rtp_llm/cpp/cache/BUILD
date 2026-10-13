@@ -2,6 +2,12 @@ load("//:def.bzl", "copts")
 load("//bazel:arch_select.bzl", "torch_deps")
 
 cc_library(
+    name = "worker_cache_io_fence",
+    hdrs = ["WorkerCacheIOFence.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "cache_async_context",
     srcs = ["AsyncContext.cc"],
     hdrs = [
@@ -368,6 +374,8 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//rtp_llm/cpp/cache/events:kv_cache_event_publisher",
+        ":worker_cache_io_fence",
+        "//rtp_llm/cpp/cuda_graph:cuda_graph_hdrs_lib",
         ":cache_async_context",
         ":cache_core",
         ":cp_slot_mapper",
@@ -380,6 +388,7 @@ cc_library(
     ] + torch_deps() + select({
         "//:using_remote_kv_cache": [
             "//rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm:kvcm_storage_backend",
+            "//rtp_llm/cpp/utils:core_utils",
         ],
         "//conditions:default": [],
     }),

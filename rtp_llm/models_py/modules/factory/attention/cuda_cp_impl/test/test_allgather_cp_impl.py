@@ -13,6 +13,7 @@ from rtp_llm.models_py.modules.factory.attention.cuda_cp_impl.prefill_mha.allgat
 )
 from rtp_llm.models_py.modules.factory.attention.cuda_cp_impl.test.cp_test_utils import (
     CPAttnTestBase,
+    ShardedCPAttnTestMixin,
 )
 
 _AG_MODULE = (
@@ -21,7 +22,7 @@ _AG_MODULE = (
 )
 
 
-class TestPCPAllGatherAttnOp(CPAttnTestBase):
+class TestPCPAllGatherAttnOp(ShardedCPAttnTestMixin, CPAttnTestBase):
     OP_CLASS = PCPAllGatherAttnOp
     AG_MODULE = _AG_MODULE
 
