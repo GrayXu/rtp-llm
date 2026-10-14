@@ -16,6 +16,9 @@ struct TreeNode {
     std::unordered_map<CacheKeyType, TreeNode*> children;
     TreeNode*                                   parent{nullptr};
     std::vector<GroupSetResource>               group_set_resources;
+    // Original full CP keys for this local canonical node, when remote storage
+    // is enabled. Empty means the node key is already the remote key.
+    CacheKeysType                               remote_key_group;
     bool                                        is_resident{false};  // Must never change from true to false.
 };
 

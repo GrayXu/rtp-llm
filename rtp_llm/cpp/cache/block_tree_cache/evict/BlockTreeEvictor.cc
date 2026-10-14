@@ -13,6 +13,7 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeTaskPool.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/ScopeRollback.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/evict/EvictionTaskRunner.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/StorageBackend.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/utils/TimeUtil.h"
@@ -31,8 +32,12 @@ BlockTreeEvictor::BlockTreeEvictor(BlockTree*                     tree,
                                    int                            disk_timeout_ms,
                                    size_t                         max_descriptors_per_batch,
                                    IsTierEnabledFn                is_tier_enabled,
-                                   SettledFn                      settled):
+                                   SettledFn                      settled,
+                                   StorageBackend*                storage_backend,
+                                   bool                           remote_host_eviction_owner):
     tree_(tree),
+    storage_backend_(storage_backend),
+    remote_host_eviction_owner_(remote_host_eviction_owner),
     task_pool_(task_pool),
     metrics_reporter_(&metrics_reporter),
     mutex_(&mutex),
@@ -219,6 +224,68 @@ std::vector<TreeNode*> BlockTreeEvictor::candidateNodes(size_t group_set_id, Tie
     return heap == nullptr ? std::vector<TreeNode*>{} : heap->nodes();
 }
 
+bool BlockTreeEvictor::reserveRemoteHostWriteLocked(TreeNode* node,
+                                                    size_t group_set_id,
+                                                    uint64_t lease_id,
+                                                    bool& newly_reserved) {
+    newly_reserved = false;
+    if (node == nullptr || group_set_id >= tree_->groupSets().size() || lease_id == 0) {
+        return false;
+    }
+    GroupSetResource& resource = node->group_set_resources[group_set_id];
+    if (!resource.hasTier(Tier::HOST)) {
+        return false;
+    }
+    if (resource.transfer_state == GroupSetTransferState::DEMOTING) {
+        return resource.host_eviction_lease_id == lease_id;
+    }
+    if (resource.transfer_state != GroupSetTransferState::IDLE) {
+        return false;
+    }
+    const TransferDescriptor desc(node, group_set_id, 0, Tier::HOST, Tier::NONE, {resource.host_block});
+    reserveSource({desc}, lease_id);
+    newly_reserved = true;
+    return true;
+}
+
+bool BlockTreeEvictor::settleRemoteHostWriteLocked(TreeNode*                    node,
+                                                   size_t                       group_set_id,
+                                                   uint64_t                     lease_id,
+                                                   HostWriteSettlementOutcome outcome,
+                                                   bool&                        tree_data_mutated) {
+    if (node == nullptr || group_set_id >= tree_->groupSets().size() || lease_id == 0) {
+        return false;
+    }
+    GroupSetResource& resource = node->group_set_resources[group_set_id];
+    if (!resource.hasTier(Tier::HOST) || isNullBlockIdx(resource.host_block)) {
+        return resource.transfer_state == GroupSetTransferState::IDLE;
+    }
+    const bool leased_source = resource.transfer_state == GroupSetTransferState::DEMOTING
+                               && resource.host_eviction_lease_id == lease_id;
+    if (outcome == HostWriteSettlementOutcome::ROLLBACK) {
+        if (!leased_source) {
+            return true;
+        }
+        const TransferDescriptor desc(node, group_set_id, 0, Tier::HOST, Tier::NONE, {resource.host_block});
+        rollbackTransferLocked({desc});
+        tree_data_mutated = true;
+        return true;
+    }
+    if (outcome == HostWriteSettlementOutcome::UNKNOWN) {
+        // A writer can only pin this source after the transaction lease is
+        // recorded. An idle resource cannot belong to this in-flight write.
+        return true;
+    }
+    if (!leased_source) {
+        return true;
+    }
+    const TransferDescriptor desc(node, group_set_id, 0, Tier::HOST, Tier::NONE, {resource.host_block});
+    completeDrop(desc);
+    settleEviction({desc});
+    tree_data_mutated = true;
+    return true;
+}
+
 bool BlockTreeEvictor::dropLocked(size_t group_set_id, Tier source_tier, bool notify_settled) {
     std::optional<TransferDescriptor> eviction_desc = chooseVictim(group_set_id, source_tier, /*force_drop=*/true);
     if (!eviction_desc.has_value()) {
@@ -226,6 +293,26 @@ bool BlockTreeEvictor::dropLocked(size_t group_set_id, Tier source_tier, bool no
     }
     runDropTask(std::move(*eviction_desc), notify_settled);
     return true;
+}
+
+bool BlockTreeEvictor::reclaimCapacityLocked(size_t group_set_id, Tier source_tier, size_t max_victim_count) {
+    if (source_tier == Tier::HOST) {
+        max_victim_count = std::min(max_victim_count, max_descriptors_per_batch_);
+        if (is_tier_enabled_(Tier::REMOTE) && !remote_host_eviction_owner_) {
+            return false;
+        }
+    }
+    if (source_tier == Tier::HOST) {
+        const auto& host_pool = tree_->groupSets()[group_set_id]->hostPool();
+        if (host_pool) {
+            std::lock_guard<std::mutex> lock(pending_release_mutex_);
+            const auto pending = pending_release_counts_.find(host_pool.get());
+            if (pending != pending_release_counts_.end() && pending->second > 0) {
+                return true;
+            }
+        }
+    }
+    return batchEvictLocked(group_set_id, source_tier, max_victim_count, /*capacity_reclaim=*/true).madeProgress();
 }
 
 bool BlockTreeEvictor::batchDropLocked(size_t  group_set_id,
@@ -274,13 +361,14 @@ bool BlockTreeEvictor::batchDropLocked(size_t  group_set_id,
 }
 
 bool BlockTreeEvictor::submitEvictionTask(std::vector<TransferDescriptor>     descriptors,
-                                          std::vector<EvictionTimingSnapshot> timings) {
+                                          std::vector<EvictionTimingSnapshot> timings,
+                                          std::shared_ptr<StorageWriteTask>    host_remote_write) {
     const TransferDescriptor& descriptor = descriptors.front();
     const auto                timeout    = std::chrono::milliseconds(
         descriptor.source_tier == Tier::DISK || descriptor.target_tier == Tier::DISK ? disk_timeout_ms_ :
                                                                                        host_timeout_ms_);
-    auto task_ptr =
-        std::make_shared<EvictionTransferTask>(TransferTask(std::move(descriptors), timeout), std::move(timings));
+    auto task_ptr = std::make_shared<EvictionTransferTask>(
+        TransferTask(std::move(descriptors), timeout), std::move(timings), std::move(host_remote_write));
     updatePendingRelease(task_ptr->descriptors(), true);
     const int64_t queue_begin = currentTimeUs();
     auto          on_timeout  = [this, task_ptr, queue_begin]() {
@@ -294,7 +382,8 @@ bool BlockTreeEvictor::submitEvictionTask(std::vector<TransferDescriptor>     de
                             tierName(task_ptr->descriptors().front().source_tier),
                             tierName(task_ptr->descriptors().front().target_tier),
                             task_ptr->descriptors().size());
-        scheduleEvictionSettlement(task_ptr, false);
+        scheduleEvictionSettlement(
+            task_ptr, ErrorInfo(ErrorCode::DEADLINE_EXCEEDED, "eviction expired in business queue"));
     };
     const auto deadline  = task_ptr->transfer_task.deadline();
     const bool submitted = task_pool_->submit(
@@ -318,13 +407,94 @@ bool BlockTreeEvictor::submitEvictionTask(std::vector<TransferDescriptor>     de
     return true;
 }
 
+std::shared_ptr<StorageWriteTask>
+BlockTreeEvictor::prepareHostRemoteWrite(const std::vector<TransferDescriptor>& descriptors) {
+    if (!storage_backend_ || descriptors.empty()) {
+        return nullptr;
+    }
+
+    StorageRequest              request;
+    auto                        keys = std::make_shared<CacheKeysType>();
+    request.source_tier             = Tier::HOST;
+    request.keys_are_global         = true;
+    request.handles.reserve(descriptors.size());
+    std::vector<HostWriteSourcePath> source_paths;
+    for (const TransferDescriptor& desc : descriptors) {
+        if (desc.source_tier != Tier::HOST || desc.source_blocks.size() != 1
+            || isNullBlockIdx(desc.source_blocks.front())) {
+            RTP_LLM_LOG_ERROR("invalid HOST remote eviction source: %s", desc.debugString().c_str());
+            return nullptr;
+        }
+        const GroupSetPtr& group_set = tree_->groupSets()[desc.group_set_id];
+        const auto&       host_pool = group_set->hostPool();
+        if (!host_pool || host_pool->hasUncertainRemoteIo()) {
+            return nullptr;
+        }
+
+        const CacheKeysType remote_keys = desc.node->remote_key_group.empty() ?
+                                              CacheKeysType{desc.node->cache_key} :
+                                              desc.node->remote_key_group;
+        if (remote_keys.empty()) {
+            return nullptr;
+        }
+        HostWriteSourcePath source_path;
+        for (const TreeNode* node = desc.node; node != nullptr && node != tree_->root(); node = node->parent) {
+            source_path.local_cache_keys.push_back(node->cache_key);
+        }
+        std::reverse(source_path.local_cache_keys.begin(), source_path.local_cache_keys.end());
+        if (source_path.local_cache_keys.empty()) {
+            return nullptr;
+        }
+        source_path.coordinate = static_cast<uint32_t>(source_path.local_cache_keys.size() - 1);
+        source_path.host_eviction_lease_id =
+            desc.node->group_set_resources[desc.group_set_id].host_eviction_lease_id;
+        if (source_path.host_eviction_lease_id == 0) {
+            return nullptr;
+        }
+        const size_t first_key_index = group_set->groupType() == CacheGroupType::FULL ? 0 : remote_keys.size() - 1;
+        for (size_t key_index = first_key_index; key_index < remote_keys.size(); ++key_index) {
+            keys->push_back(remote_keys[key_index]);
+            source_paths.push_back(source_path);
+            auto& key_handles = request.handles.emplace_back();
+            for (const std::string& tag : group_set->groupTags()) {
+                key_handles.push_back({tag, desc.source_blocks.front()});
+            }
+        }
+    }
+    request.keys = std::move(keys);
+    request.host_write_source_paths = std::move(source_paths);
+    try {
+        auto pins = storage_backend_->prepareWrite(std::move(request));
+        if (!pins) {
+            return nullptr;
+        }
+        return std::make_shared<StorageWriteTask>(std::move(pins));
+    } catch (const std::exception& error) {
+        RTP_LLM_LOG_WARNING("prepare HOST remote eviction failed: %s", error.what());
+    } catch (...) {
+        RTP_LLM_LOG_WARNING("prepare HOST remote eviction failed with unknown exception");
+    }
+    return nullptr;
+}
+
 BlockTreeEvictor::BatchEvictResult
-BlockTreeEvictor::batchEvictLocked(size_t group_set_id, Tier source_tier, size_t max_victim_count) {
+BlockTreeEvictor::batchEvictLocked(size_t group_set_id,
+                                   Tier   source_tier,
+                                   size_t max_victim_count,
+                                   bool   capacity_reclaim) {
     if (max_victim_count == 0) {
         return {};
     }
-    const Tier target_tier = watermarkTargetTier(source_tier);
-    if (target_tier == Tier::NONE) {
+    if (source_tier == Tier::HOST && is_tier_enabled_(Tier::REMOTE) && !remote_host_eviction_owner_) {
+        return {};
+    }
+    const GroupSetPtr& group_set = tree_->groupSets()[group_set_id];
+    const auto&       host_pool = group_set->hostPool();
+    const bool remote_upload = source_tier == Tier::HOST && is_tier_enabled_(Tier::REMOTE)
+                               && storage_backend_ != nullptr && host_pool && !host_pool->hasUncertainRemoteIo();
+    Tier target_tier = capacity_reclaim && source_tier == Tier::HOST && remote_upload ? Tier::NONE :
+                                                                                         watermarkTargetTier(source_tier);
+    if (target_tier == Tier::NONE && !remote_upload) {
         size_t     scheduled_count = 0;
         const bool direct_progress = batchDropLocked(group_set_id, source_tier, max_victim_count, scheduled_count);
         return {/*direct_progress=*/direct_progress,
@@ -339,46 +509,116 @@ BlockTreeEvictor::batchEvictLocked(size_t group_set_id, Tier source_tier, size_t
         if (!eviction_desc.has_value()) {
             break;
         }
+        eviction_desc->target_tier = target_tier;
         timings.emplace_back(eviction_desc->node->group_set_resources[eviction_desc->group_set_id].candidate_meta);
-        reserveSource({*eviction_desc});
+        reserveSource({*eviction_desc}, remote_upload ? nextHostEvictionLeaseId() : 0);
         descriptors.push_back(std::move(*eviction_desc));
     }
     if (descriptors.empty()) {
         return {};
     }
 
-    auto target_blocks =
-        tree_->groupSets()[group_set_id]->allocateBlocks(descriptors.size(), target_tier, BlockTreeRefType::EVICTION);
-    if (!target_blocks.has_value()) {
+    if (target_tier != Tier::NONE) {
+        auto target_blocks =
+            tree_->groupSets()[group_set_id]->allocateBlocks(descriptors.size(), target_tier, BlockTreeRefType::EVICTION);
+        if (!target_blocks.has_value()) {
+            if (source_tier == Tier::HOST && remote_upload && target_tier == Tier::DISK) {
+                target_tier = Tier::NONE;
+                for (TransferDescriptor& desc : descriptors) {
+                    desc.target_tier = Tier::NONE;
+                }
+            } else {
+                rollbackTransferLocked(descriptors);
+                return {};
+            }
+        }
+        if (target_blocks.has_value()) {
+            for (size_t desc_index = 0; desc_index < descriptors.size(); ++desc_index) {
+                descriptors[desc_index].target_blocks = {(*target_blocks)[desc_index]};
+            }
+        }
+    }
+
+    auto host_remote_write = remote_upload ? prepareHostRemoteWrite(descriptors) : nullptr;
+    if (remote_upload && !host_remote_write) {
         rollbackTransferLocked(descriptors);
         return {};
     }
-    for (size_t desc_index = 0; desc_index < descriptors.size(); ++desc_index) {
-        descriptors[desc_index].target_blocks = {(*target_blocks)[desc_index]};
-    }
+
     const size_t async_scheduled_count = descriptors.size();
-    const bool   submitted             = submitEvictionTask(std::move(descriptors), std::move(timings));
+    const bool submitted =
+        submitEvictionTask(std::move(descriptors), std::move(timings), std::move(host_remote_write));
     return {/*direct_progress=*/false,
             /*async_submitted=*/submitted,
             /*scheduled_count=*/submitted ? async_scheduled_count : 0};
 }
 
 void BlockTreeEvictor::runEvictionTask(std::shared_ptr<const EvictionTransferTask> task) noexcept {
+    if (task->host_remote_write) {
+        if (!storage_backend_) {
+            scheduleEvictionSettlement(
+                std::move(task), ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, "HOST remote eviction has no backend"));
+            return;
+        }
+        try {
+            auto write = std::move(*task->host_remote_write);
+            storage_backend_->write(std::move(write), [this, task](ErrorInfo error) mutable {
+                if (!error.ok()) {
+                    scheduleEvictionSettlement(task, std::move(error));
+                    return;
+                }
+                runLocalEvictionTransfer(task, /*remote_write_committed=*/true);
+            });
+            return;
+        } catch (const std::exception& error) {
+            RTP_LLM_LOG_ERROR("HOST remote eviction write threw: %s", error.what());
+            scheduleEvictionSettlement(
+                std::move(task), ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, error.what()));
+        } catch (...) {
+            RTP_LLM_LOG_ERROR("HOST remote eviction write threw an unknown exception");
+            scheduleEvictionSettlement(
+                std::move(task), ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, "unknown HOST remote write exception"));
+        }
+        return;
+    }
+    runLocalEvictionTransfer(std::move(task));
+}
+
+void BlockTreeEvictor::runLocalEvictionTransfer(std::shared_ptr<const EvictionTransferTask> task,
+                                                bool                                      remote_write_committed) noexcept {
+    if (task->descriptors().front().target_tier == Tier::NONE) {
+        scheduleEvictionSettlement(std::move(task), ErrorInfo::OkStatus(), remote_write_committed);
+        return;
+    }
     try {
         task_runner_->runTransfer(
-            task, *metrics_reporter_, [this, task](bool success) { scheduleEvictionSettlement(task, success); });
+            task, *metrics_reporter_, [this, task, remote_write_committed](bool success) {
+                scheduleEvictionSettlement(task,
+                                           success ? ErrorInfo::OkStatus() :
+                                                     ErrorInfo(ErrorCode::EXECUTION_EXCEPTION,
+                                                               "eviction transfer failed"),
+                                           remote_write_committed);
+            });
         return;
     } catch (const std::exception& error) {
         RTP_LLM_LOG_ERROR("eviction copy failed with exception: %s", error.what());
     } catch (...) {
         RTP_LLM_LOG_ERROR("eviction copy failed with unknown exception");
     }
-    scheduleEvictionSettlement(std::move(task), false);
+    scheduleEvictionSettlement(
+        std::move(task), ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, "eviction transfer threw"), remote_write_committed);
 }
 
 void BlockTreeEvictor::scheduleEvictionSettlement(std::shared_ptr<const EvictionTransferTask> task,
-                                                  bool                                        success) noexcept {
-    auto settle = [this, task = std::move(task), success]() noexcept {
+                                                  ErrorInfo                                   error,
+                                                  bool                                        remote_write_committed) noexcept {
+    auto settle = [this,
+                   task = std::move(task),
+                   error = std::move(error),
+                   remote_write_committed]() noexcept {
+        const bool success = error.ok();
+        const bool completion_unknown = error.completionUnknown();
+        bool       remote_only_fallback = false;
         bool                 any_detached     = false;
         bool                 any_not_detached = false;
         EvictionTransferTask settled_task(task->transfer_task.subtask({}));
@@ -394,8 +634,33 @@ void BlockTreeEvictor::scheduleEvictionSettlement(std::shared_ptr<const Eviction
             }
 
             if (success) {
-                completeEvict(task->descriptors());
+                if (task->descriptors().front().target_tier == Tier::NONE) {
+                    for (const TransferDescriptor& desc : task->descriptors()) {
+                        completeDrop(desc);
+                    }
+                } else {
+                    completeEvict(task->descriptors());
+                }
                 settleEviction(task->descriptors());
+            } else if (completion_unknown) {
+                // Keep every source in DEMOTING. StorageBackend has quarantined
+                // the matching STORE pins and HOST pool through process exit.
+                releaseTargetBlocks(task->descriptors());
+            } else if (remote_write_committed) {
+                // The remote copy is committed. If the optional local tier
+                // failed, settle this as a remote-only eviction on every rank.
+                releaseTargetBlocks(task->descriptors());
+                std::vector<TransferDescriptor> detached_descs;
+                for (const TransferDescriptor& desc : task->descriptors()) {
+                    if (desc.node->group_set_resources[desc.group_set_id].transfer_detached) {
+                        detached_descs.push_back(desc);
+                    } else {
+                        completeDrop(desc);
+                    }
+                }
+                discardDetachedTransfer(detached_descs);
+                settleEviction(task->descriptors());
+                remote_only_fallback = true;
             } else {
                 rollbackTransferLocked(task->descriptors());
             }
@@ -404,16 +669,17 @@ void BlockTreeEvictor::scheduleEvictionSettlement(std::shared_ptr<const Eviction
 
             for (size_t desc_index = 0; desc_index < task->descriptors().size(); ++desc_index) {
                 const TransferDescriptor& desc = task->descriptors()[desc_index];
-                if (success || detached[desc_index]) {
+                if (success || remote_only_fallback || detached[desc_index]) {
                     TransferDescriptor settled_desc = desc;
-                    if (detached[desc_index]) {
+                    if (detached[desc_index] || remote_only_fallback) {
                         settled_desc.target_tier = Tier::NONE;
                     }
                     settled_task.mutableDescriptorsForPreparation().push_back(std::move(settled_desc));
                     settled_task.timings.push_back(task->timings[desc_index]);
                 }
             }
-            settled_(success || any_detached, success && any_not_detached);
+            settled_(success || remote_only_fallback || any_detached,
+                     (success || remote_only_fallback) && any_not_detached);
             finishWatermarkRoundLocked(descriptor.group_set_id, descriptor.source_tier);
         }
         if (!settled_task.descriptors().empty()) {
@@ -515,6 +781,9 @@ size_t BlockTreeEvictor::watermarkLogicalBatchLimit(Tier source_tier, Tier targe
         return 1;
     }
     if (source_tier == Tier::HOST && target_tier == Tier::DISK) {
+        return max_descriptors_per_batch_;
+    }
+    if (source_tier == Tier::HOST && target_tier == Tier::NONE) {
         return max_descriptors_per_batch_;
     }
     return std::numeric_limits<size_t>::max();
@@ -708,6 +977,7 @@ void BlockTreeEvictor::completeDrop(const TransferDescriptor& desc) {
     group_set->unreferenceBlocks(source_holder, BlockTreeRefType::CACHE);
     resource.evictFromTier(desc.source_tier);
     resource.transfer_state = GroupSetTransferState::IDLE;
+    resource.host_eviction_lease_id = 0;
     tree_->refreshPublishedState(desc.node);
     RTP_LLM_CHECK_WITH_INFO(!resource.hasTier(Tier::DEVICE) || resource.hasCompleteDeviceValue(),
                             "drop settlement produced invalid steady state: group_set_id=%zu node_key=%ld",
@@ -762,6 +1032,7 @@ void BlockTreeEvictor::completeEvict(const std::vector<TransferDescriptor>& desc
         }
         resource.evictFromTier(desc.source_tier);
         resource.transfer_state       = GroupSetTransferState::IDLE;
+        resource.host_eviction_lease_id = 0;
         resource.setBlocks(desc.target_tier, desc.target_blocks);
         tree_->refreshPublishedState(desc.node);
         RTP_LLM_CHECK_WITH_INFO(!resource.hasTier(Tier::DEVICE) || resource.hasCompleteDeviceValue(),
@@ -785,13 +1056,21 @@ void BlockTreeEvictor::rollbackTransferLocked(const std::vector<TransferDescript
 // Reserve the source: remove it from its source heap and mark the in-flight state so
 // no other selector can pick it. The caller must first verify that the resource
 // is IDLE; assigning DEMOTING is not safe for an already reserved resource.
-void BlockTreeEvictor::reserveSource(const std::vector<TransferDescriptor>& eviction_descs) {
+void BlockTreeEvictor::reserveSource(const std::vector<TransferDescriptor>& eviction_descs,
+                                     uint64_t                                 host_eviction_lease_id) {
     for (const TransferDescriptor& desc : eviction_descs) {
         GroupSetResource& resource = desc.node->group_set_resources[desc.group_set_id];
         suspendCandidate(desc.node, desc.group_set_id, desc.source_tier);
         resource.transfer_state       = GroupSetTransferState::DEMOTING;
+        resource.host_eviction_lease_id = host_eviction_lease_id;
         tree_->refreshPublishedState(desc.node);
     }
+}
+
+uint64_t BlockTreeEvictor::nextHostEvictionLeaseId() {
+    RTP_LLM_CHECK_WITH_INFO(host_eviction_lease_seq_ != std::numeric_limits<uint64_t>::max(),
+                            "HOST eviction lease sequence exhausted");
+    return ++host_eviction_lease_seq_;
 }
 
 // Restore a reserved source after a failed/aborted move: clear the in-flight
@@ -810,6 +1089,7 @@ std::vector<TransferDescriptor> BlockTreeEvictor::restoreSource(const std::vecto
             continue;
         }
         resource.transfer_state       = GroupSetTransferState::IDLE;
+        resource.host_eviction_lease_id = 0;
         tree_->refreshPublishedState(desc.node);
         RTP_LLM_CHECK_WITH_INFO(!resource.hasTier(Tier::DEVICE) || resource.hasCompleteDeviceValue(),
                                 "eviction rollback produced invalid steady state: group_set_id=%zu node_key=%ld",
@@ -834,6 +1114,7 @@ void BlockTreeEvictor::discardDetachedTransfer(const std::vector<TransferDescrip
         group_set->unreferenceBlocks(source_holder, BlockTreeRefType::CACHE);
         resource.evictFromTier(desc.source_tier);
         resource.transfer_state       = GroupSetTransferState::IDLE;
+        resource.host_eviction_lease_id = 0;
         resource.transfer_detached    = false;
         tree_->refreshPublishedState(desc.node);
     }

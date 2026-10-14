@@ -509,7 +509,7 @@ TEST(ClientWrapperTest, RecreatesTransferClientForDifferentRegistrationSpan) {
     EXPECT_EQ(*second_destruction_count, 1);
 }
 
-TEST(ClientWrapperTest, RegistersAllGpuPoolsBeforeCreatingClientsAndDestroysOwnerLast) {
+TEST(ClientWrapperTest, RegistersAllHostAndGpuPoolsBeforeCreatingClientsAndDestroysOwnerLast) {
     for (int failure_mode : {0, 1, 2}) {
         GpuPoolClientTestState state;
         std::array<char, 64> second_device{}, third_device{};
@@ -518,10 +518,17 @@ TEST(ClientWrapperTest, RegistersAllGpuPoolsBeforeCreatingClientsAndDestroysOwne
             {reinterpret_cast<void*>(0x100000), 4096, 3},
             {reinterpret_cast<void*>(0x200000), 8192, 3},
             {reinterpret_cast<void*>(0x300000), 2048, 3}};
+        const std::vector<kv_cache_manager::SharedMemoryRegistration> host_regions{
+            {reinterpret_cast<void*>(0x400000), 4096, 11},
+            {reinterpret_cast<void*>(0x500000), 8192, 12},
+            {reinterpret_cast<void*>(0x600000), 2048, 13}};
         kv_cache_manager::ClientMemoryRegistrations first_memory, second_memory, third_memory;
         first_memory.gpu.push_back(gpu_spans[0]);
+        first_memory.host_regions.push_back(host_regions[0]);
         second_memory.gpu.push_back(gpu_spans[1]);
+        second_memory.host_regions.push_back(host_regions[1]);
         third_memory.gpu.push_back(gpu_spans[2]);
+        third_memory.host_regions.push_back(host_regions[2]);
         const std::vector<ClientWrapper::PoolRegistration> registrations{
             {{state.device.data(), state.device.size()}, "tp0_Ffull", std::move(first_memory)},
             {{second_device.data(), second_device.size()}, "tp0_Fsliding", std::move(second_memory)},
@@ -537,6 +544,12 @@ TEST(ClientWrapperTest, RegistersAllGpuPoolsBeforeCreatingClientsAndDestroysOwne
                 EXPECT_EQ(params.self_location_spec_name, "tp0_Ffull");
                 EXPECT_EQ(params.regist_span->base, state.device.data());
                 EXPECT_EQ(params.regist_span->size, state.device.size());
+                EXPECT_EQ(memory.host_regions.size(), host_regions.size());
+                for (size_t index = 0; index < memory.host_regions.size() && index < host_regions.size(); ++index) {
+                    EXPECT_EQ(memory.host_regions[index].base, host_regions[index].base);
+                    EXPECT_EQ(memory.host_regions[index].size, host_regions[index].size);
+                    EXPECT_EQ(memory.host_regions[index].fd, host_regions[index].fd);
+                }
                 EXPECT_EQ(memory.gpu.size(), gpu_spans.size());
                 for (size_t index = 0; index < memory.gpu.size() && index < gpu_spans.size(); ++index) {
                     EXPECT_EQ(memory.gpu[index].base, gpu_spans[index].base);

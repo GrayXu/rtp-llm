@@ -843,6 +843,51 @@ TEST(StorageBackendTest, ReadCompletionUnknownDoesNotMarkUndispatchedRequestsUns
     EXPECT_FALSE(pool->isAllocated(undispatched));
 }
 
+TEST(StorageBackendTest, WriteCompletionCallbackPreservesUnknownPinsAndRejectsNewIo) {
+    class UnknownWriteBackend final: public TestBackend {
+    public:
+        explicit UnknownWriteBackend(std::shared_ptr<StorageBackendExecutor> executor):
+            TestBackend(true, std::move(executor)) {}
+        size_t writeCalls() const {
+            return write_calls_;
+        }
+
+    protected:
+        void writeImpl(const StorageRequest&) override {
+            ++write_calls_;
+            throw StorageOperationCompletionUnknown("write completion unknown", false);
+        }
+
+    private:
+        size_t write_calls_{0};
+    };
+
+    auto pool  = std::make_shared<TestBlockPool>();
+    auto block = pool->malloc().value();
+    pool->incRef(block);
+    auto executor = std::make_shared<HoldingExecutor>();
+    UnknownWriteBackend backend(executor);
+    ASSERT_TRUE(initBackend(backend, pool));
+
+    ErrorInfo unknown;
+    EXPECT_TRUE(backend.write(backend.prepareWrite(makeRequest(block)),
+                              [&](ErrorInfo error) { unknown = std::move(error); }));
+    ASSERT_EQ(executor->runAll(), 1u);
+    EXPECT_EQ(unknown.code(), ErrorCode::EXECUTION_EXCEPTION);
+    EXPECT_TRUE(unknown.completionUnknown());
+    EXPECT_EQ(pool->refCount(block), 2u);
+
+    auto rejected = backend.prepareWrite(makeRequest(block));
+    EXPECT_FALSE(static_cast<bool>(rejected));
+    EXPECT_EQ(backend.writeCalls(), 1u);
+    EXPECT_EQ(pool->refCount(block), 2u);
+
+    pool->decRef(block);
+    backend.shutdown();
+    EXPECT_TRUE(pool->isAllocated(block));
+    EXPECT_EQ(pool->refCount(block), 1u);
+}
+
 TEST(StorageBackendTest, AsyncWritesReturnBeforeCompletionAndReleaseOnlyTheirOwnPins) {
     for (bool complete_first : {true, false}) {
         auto pool         = std::make_shared<TestBlockPool>();

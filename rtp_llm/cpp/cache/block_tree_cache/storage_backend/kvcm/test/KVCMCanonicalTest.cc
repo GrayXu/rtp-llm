@@ -102,6 +102,22 @@ TEST(KVCMCanonicalTest, CustomConfigAcceptsReorderedSpecs) {
     EXPECT_TRUE(initSingleRank(*backend.backend, environment));
 }
 
+TEST(KVCMCanonicalTest, RemoteDeviceOnlyInitializationDoesNotRequireHostPools) {
+    auto environment = makeBackendEnvironment("canonical_device_only");
+    auto client = std::make_shared<MockClientWrapper>();
+    EXPECT_CALL(*client, initForPools(_, _, _, _))
+        .WillOnce(Invoke([](const auto&, auto, const auto& registrations, const auto&) {
+            EXPECT_EQ(registrations.size(), 1u);
+            if (!registrations.empty()) {
+                EXPECT_FALSE(registrations.front().memory_registrations.has_value());
+            }
+            return true;
+        }));
+    EXPECT_CALL(*client, shutdown()).Times(1);
+    auto backend = canonicalBackend(environment, singleRankConfig(), client);
+    ASSERT_TRUE(initSingleRank(*backend.backend, environment));
+}
+
 TEST(KVCMCanonicalTest, CustomConfigRejectsMissingOrChangedGroups) {
     auto environment = makeBackendEnvironment("canonical_config_groups");
     const auto original = automaticCanonicalConfig(environment);
@@ -371,7 +387,7 @@ TEST(KVCMCanonicalTest, IncompleteStartWriteAndFailedWorkerNeverCommitReadableKe
         endpoints.states[1]->fail = !missing;
         auto client               = std::make_shared<MockClientWrapper>();
         EXPECT_CALL(*client, initForPools(_, _, _, _)).WillOnce(Return(true));
-        EXPECT_CALL(*client, shutdown()).Times(1);
+        EXPECT_CALL(*client, shutdown()).Times(missing ? 1 : 0);
         auto backend = canonicalBackend(environment, cpConfig(2), client, endpoints.manager);
         ASSERT_TRUE(initSingleRank(*backend.backend, environment));
         kv_cache_manager::WriteLocation location;
@@ -396,6 +412,11 @@ TEST(KVCMCanonicalTest, IncompleteStartWriteAndFailedWorkerNeverCommitReadableKe
         request.remote_keys = std::make_shared<const CacheKeysType>(CacheKeysType{101, 102});
         backend->write(backend->prepareWrite(request));
         ASSERT_TRUE(waitForBackendOperationsForTest(*backend.backend));
+        backend->shutdown();
+        EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(client.get()));
+        if (!missing) {
+            ::testing::Mock::AllowLeak(client.get());
+        }
     }
 }
 
@@ -476,7 +497,7 @@ TEST(KVCMCanonicalTest, RpcRejectsLegacyLayoutBeforeTransferringCanonicalBuffers
 
 class KVCMCanonicalTreeTest: public DeviceTestBase {
 protected:
-    void writeHostTree(int workers, bool cp) {
+    void writeHostTree(int workers, bool cp, bool eviction_source_paths = false, bool remote_exists = false) {
         const auto config = test::makeSimpleMhaCacheConfig(2, 8, 8, DataType::TYPE_INT8, 1, 2);
         const CacheKeysType original{191, 307, 419, 523, 631, 743, 857, 967, 1087};
         // CP input retains a partial tail outside the two ready HOST rounds.
@@ -484,6 +505,15 @@ protected:
         const CPSlotMapper mapper(0, cp ? workers : 1, config.seq_size_per_block);
         const auto local_keys = mapper.canonicalCacheKeys(global);
         const CacheKeysType published_keys(global.begin(), global.begin() + local_keys.size() * mapper.cpSize());
+        std::vector<CacheKeysType> remote_key_groups;
+        const std::vector<CacheKeysType> no_remote_key_groups;
+        if (cp) {
+            remote_key_groups.reserve(local_keys.size());
+            for (size_t local_index = 0; local_index < local_keys.size(); ++local_index) {
+                const size_t begin = local_index * static_cast<size_t>(workers);
+                remote_key_groups.emplace_back(global.begin() + begin, global.begin() + begin + workers);
+            }
+        }
         std::vector<std::atomic<size_t>> resolver_calls(workers);
         for (auto& count : resolver_calls) {
             count.store(0);
@@ -544,21 +574,37 @@ protected:
                 resources[rank].push_back({resource});
                 const auto buffer = host_pool->blockBuffer(resource.host_block);
                 std::memset(buffer.addr, 17 + rank * 37 + slot * 11, buffer.payload_bytes);
+                if (eviction_source_paths) {
+                    resource.candidate_meta.admission_seq = 1000 + slot;
+                    if (rank == 0) {
+                        resource.transfer_state = GroupSetTransferState::DEMOTING;
+                        resource.host_eviction_lease_id = 1000 + slot;
+                    }
+                }
             }
             group->releaseBlocks(Tier::HOST, unused_blocks, BlockTreeRefType::LOAD);
-            if (rank != 0) {
+            if (rank != 0 || eviction_source_paths) {
                 // Workers already hold their local pages under the shared round endpoint keys.
-                cache->tree()->insertNode(local_keys, resources[rank], true, false);
+                cache->tree()->insertNode(local_keys,
+                                          resources[rank],
+                                          true,
+                                          false,
+                                          eviction_source_paths ? remote_key_groups : no_remote_key_groups);
                 group->releaseBlocks(Tier::HOST, local_blocks[rank], BlockTreeRefType::LOAD);
-                EXPECT_NE(local_blocks[rank], local_blocks[0]);
+                if (rank != 0) {
+                    EXPECT_NE(local_blocks[rank], local_blocks[0]);
+                }
             }
             const auto factory_resolver = backend->hostWriteResolver();
             ASSERT_TRUE(static_cast<bool>(factory_resolver));
             backend->host_write_resolver_ = [factory_resolver, &resolver_calls, rank](
                 const CacheKeysType& keys, const std::vector<std::string>& tags,
-                const std::vector<uint32_t>& coordinates, int timeout_ms) {
+                const std::vector<uint32_t>& coordinates,
+                int timeout_ms,
+                bool keys_are_local,
+                uint64_t lease_id) {
                 resolver_calls[rank].fetch_add(1);
-                return factory_resolver(keys, tags, coordinates, timeout_ms);
+                return factory_resolver(keys, tags, coordinates, timeout_ms, keys_are_local, lease_id);
             };
             endpoints.states[rank]->execute = [backend](const auto& request, auto& response) {
                 const bool success = backend->execute(request, response);
@@ -567,14 +613,15 @@ protected:
                 return success;
             };
             kv_cache_manager::UriStrVec expected_uris;
-            if (cp || rank == 0) {
+            if (!remote_exists && (cp || rank == 0)) {
                 for (size_t slot = 0; slot < local_keys.size(); ++slot) {
                     expected_uris.push_back("uri_" + std::to_string(cp ? slot * workers + rank : slot));
                 }
                 EXPECT_CALL(*client, saveKvCachesForTag("default", expected_uris, _, _))
                     .WillOnce(Invoke([host_pool, blocks = local_blocks[rank], rank](
                                          const auto&, const auto& uris, const auto& buffers, const auto&) {
-                        EXPECT_EQ(host_pool->referencedBlocksNum(BlockTreeRefType::STORE), blocks.size());
+                        EXPECT_EQ(host_pool->referencedBlocksNum(BlockTreeRefType::STORE),
+                                  blocks.size());
                         EXPECT_EQ(buffers.size(), blocks.size());
                         if (buffers.size() != blocks.size()) {
                             return std::make_pair(false, kv_cache_manager::UriStrVec{});
@@ -615,13 +662,20 @@ protected:
 
         kv_cache_manager::WriteLocation allocation;
         allocation.write_session_id = "host_tree";
-        allocation.block_mask = kv_cache_manager::BlockMaskOffset{0};
-        allocation.locations = canonicalLocations(published_keys.size());
+        allocation.block_mask = kv_cache_manager::BlockMaskOffset{remote_exists ? published_keys.size() : 0};
+        if (!remote_exists) {
+            allocation.locations = canonicalLocations(published_keys.size());
+        }
         EXPECT_CALL(*clients[0], getWriteLocation(_, _, published_keys, _, _, _, _))
             .WillOnce(Return(std::make_pair(true, allocation)));
         EXPECT_CALL(*clients[0], finishWrite(_, _, "host_tree", _, _))
             .WillOnce(Invoke([&](const auto&, const auto&, const auto&,
                                  const kv_cache_manager::BlockMask& mask, const kv_cache_manager::Locations& actual) {
+                if (remote_exists) {
+                    EXPECT_EQ(std::get<kv_cache_manager::BlockMaskOffset>(mask), 0u);
+                    EXPECT_TRUE(actual.empty());
+                    return true;
+                }
                 EXPECT_EQ(std::get<kv_cache_manager::BlockMaskOffset>(mask), published_keys.size());
                 EXPECT_EQ(actual.size(), published_keys.size());
                 for (size_t i = 0; i < actual.size(); ++i) {
@@ -635,38 +689,104 @@ protected:
             }));
         auto remote_write = std::make_shared<StorageRequest>();
         remote_write->source_tier = Tier::HOST;
-        remote_write->keys = std::make_shared<const CacheKeysType>(local_keys);
-        remote_write->remote_keys = std::make_shared<const CacheKeysType>(global);
-        for (const auto block : local_blocks[0]) {
-            remote_write->handles.push_back({{"default", block}});
+        if (eviction_source_paths) {
+            remote_write->keys_are_global = true;
+            remote_write->keys = std::make_shared<const CacheKeysType>(published_keys);
+            remote_write->handles.resize(published_keys.size());
+            remote_write->host_write_source_paths.reserve(published_keys.size());
+            for (size_t global_index = 0; global_index < published_keys.size(); ++global_index) {
+                const size_t local_index = global_index / static_cast<size_t>(mapper.cpSize());
+                remote_write->handles[global_index].push_back({"default", local_blocks[0][local_index]});
+                HostWriteSourcePath source_path;
+                source_path.local_cache_keys.assign(local_keys.begin(), local_keys.begin() + local_index + 1);
+                source_path.coordinate = static_cast<uint32_t>(local_index);
+                source_path.host_eviction_lease_id = 1000 + local_index;
+                remote_write->host_write_source_paths.push_back(std::move(source_path));
+            }
+        } else {
+            remote_write->keys = std::make_shared<const CacheKeysType>(local_keys);
+            remote_write->remote_keys = std::make_shared<const CacheKeysType>(global);
+            for (const auto block : local_blocks[0]) {
+                remote_write->handles.push_back({{"default", block}});
+            }
         }
-        caches[0]->insert(local_keys, resources[0], Tier::HOST, remote_write);
-        caches[0]->groupSets().front()->releaseBlocks(Tier::HOST, local_blocks[0], BlockTreeRefType::LOAD);
+        if (eviction_source_paths) {
+            auto write_task = backends[0]->prepareWrite(*remote_write);
+            ASSERT_TRUE(static_cast<bool>(write_task));
+            ASSERT_TRUE(backends[0]->write(std::move(write_task)));
+        } else {
+            caches[0]->insert(local_keys, resources[0], Tier::HOST, remote_write);
+            caches[0]->groupSets().front()->releaseBlocks(Tier::HOST, local_blocks[0], BlockTreeRefType::LOAD);
+        }
         for (int rank = 0; rank < workers; ++rank) {
             ASSERT_TRUE(waitForBackendOperationsForTest(*backends[rank]));
             const auto requests = snapshotRequests(endpoints.states[rank]);
-            ASSERT_EQ(requests.size(), 1u);
-            const auto& rpc = requests.front();
-            EXPECT_EQ(rpc.op(), REMOTE_OPERATION_WRITE);
-            EXPECT_TRUE(rpc.host_source());
-            EXPECT_EQ(rpc.storage_layout(), "canonical_v1");
-            EXPECT_EQ(CacheKeysType(rpc.cache_keys().begin(), rpc.cache_keys().end()), published_keys);
-            const bool writer = cp || rank == 0;
-            const size_t count = writer ? local_keys.size() : 0;
-            ASSERT_EQ(rpc.group_tags_size(), count);
-            ASSERT_EQ(rpc.block_ids_size(), count);
-            ASSERT_EQ(rpc.uris_size(), count);
-            ASSERT_EQ(rpc.coordinate_ids_size(), count);
-            ASSERT_EQ(rpc.logical_shards_size(), count);
-            EXPECT_EQ(resolver_calls[rank].load(), writer ? 1u : 0u);
-            for (size_t slot = 0; slot < count; ++slot) {
-                EXPECT_EQ(rpc.group_tags(slot), "default");
-                EXPECT_EQ(rpc.block_ids(slot), local_blocks[0][slot]);
-                EXPECT_EQ(rpc.coordinate_ids(slot), cp ? slot * workers + rank : slot);
+            const bool control_rpcs = eviction_source_paths && workers > 1;
+            const size_t rpc_count = workers > 1 ? (control_rpcs ? 2u : 0u) + (remote_exists ? 0u : 1u) : 0u;
+            ASSERT_EQ(requests.size(), rpc_count);
+            if (!remote_exists && workers > 1) {
+                const auto& rpc = requests[control_rpcs ? 1 : 0];
+                EXPECT_EQ(rpc.op(), REMOTE_OPERATION_WRITE);
+                EXPECT_TRUE(rpc.host_source());
+                EXPECT_EQ(rpc.storage_layout(), "canonical_v1");
+                EXPECT_EQ(CacheKeysType(rpc.cache_keys().begin(), rpc.cache_keys().end()), published_keys);
+                const bool writer = cp || rank == 0;
+                const size_t count = writer ? local_keys.size() : 0;
+                ASSERT_EQ(rpc.group_tags_size(), count);
+                ASSERT_EQ(rpc.block_ids_size(), count);
+                ASSERT_EQ(rpc.uris_size(), count);
+                ASSERT_EQ(rpc.coordinate_ids_size(), count);
+                ASSERT_EQ(rpc.logical_shards_size(), count);
+                ASSERT_EQ(rpc.host_write_source_paths_size(), eviction_source_paths ? count : 0u);
+                EXPECT_EQ(resolver_calls[rank].load(), writer ? (eviction_source_paths ? count : 1u) : 0u);
+                for (size_t slot = 0; slot < count; ++slot) {
+                    EXPECT_EQ(rpc.group_tags(slot), "default");
+                    EXPECT_EQ(rpc.block_ids(slot), local_blocks[0][slot]);
+                    EXPECT_EQ(rpc.coordinate_ids(slot), cp ? slot * workers + rank : slot);
+                    if (eviction_source_paths) {
+                        const auto& source_path = rpc.host_write_source_paths(slot);
+                        EXPECT_EQ(source_path.local_cache_keys_size(), static_cast<int>(slot + 1));
+                        EXPECT_EQ(CacheKeysType(source_path.local_cache_keys().begin(),
+                                                source_path.local_cache_keys().end()),
+                                  CacheKeysType(local_keys.begin(), local_keys.begin() + slot + 1));
+                        EXPECT_EQ(source_path.coordinate(), slot);
+                        EXPECT_EQ(source_path.host_eviction_lease_id(), 1000 + slot);
+                    }
+                }
+            } else {
+                EXPECT_EQ(resolver_calls[rank].load(), 0u);
+            }
+            if (control_rpcs) {
+                const auto& reservation = requests.front();
+                EXPECT_EQ(reservation.op(), REMOTE_OPERATION_HOST_EVICTION_SETTLEMENT);
+                EXPECT_EQ(reservation.host_write_settlement(),
+                          rank == 0 ? REMOTE_HOST_WRITE_SETTLEMENT_UNSPECIFIED :
+                                      REMOTE_HOST_WRITE_SETTLEMENT_RESERVE);
+                EXPECT_EQ(reservation.host_write_source_paths_size(), rank == 0 ? 0 : local_keys.size());
+                const auto& settlement = requests.back();
+                EXPECT_EQ(settlement.op(), REMOTE_OPERATION_HOST_EVICTION_SETTLEMENT);
+                EXPECT_EQ(settlement.host_write_settlement(),
+                          rank == 0 ? REMOTE_HOST_WRITE_SETTLEMENT_UNSPECIFIED :
+                                      REMOTE_HOST_WRITE_SETTLEMENT_COMMIT);
+                EXPECT_EQ(settlement.host_write_source_paths_size(), rank == 0 ? 0 : local_keys.size());
+                if (rank != 0) {
+                    for (int index = 0; index < settlement.host_write_source_paths_size(); ++index) {
+                        const auto& source_path = settlement.host_write_source_paths(index);
+                        EXPECT_EQ(source_path.host_eviction_lease_id(), 1000 + index);
+                        EXPECT_EQ(source_path.group_tags_size(), 1);
+                        if (source_path.group_tags_size() == 1) {
+                            EXPECT_EQ(source_path.group_tags(0), "default");
+                        }
+                    }
+                }
             }
             const auto host_pool = caches[rank]->groupSets().front()->hostPool();
             EXPECT_EQ(host_pool->referencedBlocksNum(BlockTreeRefType::STORE), 0u);
-            EXPECT_EQ(host_pool->referencedBlocksNum(BlockTreeRefType::CACHE), local_keys.size());
+            const size_t expected_cache_refs = eviction_source_paths && rank != 0 ? 0u : local_keys.size();
+            EXPECT_EQ(host_pool->referencedBlocksNum(BlockTreeRefType::CACHE), expected_cache_refs);
+            if (eviction_source_paths && rank != 0) {
+                EXPECT_TRUE(caches[rank]->tree()->findNode(local_keys).empty());
+            }
             EXPECT_FALSE(host_pool->hasUncertainRemoteIo());
         }
     }
@@ -680,6 +800,24 @@ TEST_F(KVCMCanonicalTreeTest, CpHostInsertPublishesCompleteRoundsFromRankLocalTr
     for (int workers : {2, 4}) {
         SCOPED_TRACE(workers);
         writeHostTree(workers, true);
+    }
+}
+
+TEST_F(KVCMCanonicalTreeTest, HostEvictionUsesRankLocalCanonicalSourcePathsAndLeases) {
+    writeHostTree(1, false, true);
+    for (int workers : {2, 4}) {
+        SCOPED_TRACE(workers);
+        writeHostTree(workers, false, true);
+        writeHostTree(workers, true, true);
+    }
+}
+
+TEST_F(KVCMCanonicalTreeTest, HostEvictionSettlesWorkerSourcesWhenRemoteKeysAlreadyExist) {
+    writeHostTree(1, false, true, true);
+    for (int workers : {2, 4}) {
+        SCOPED_TRACE(workers);
+        writeHostTree(workers, false, true, true);
+        writeHostTree(workers, true, true, true);
     }
 }
 
@@ -715,7 +853,7 @@ protected:
         }
     }
 
-    void initialize(bool gdr = false) {
+    void initialize(bool gdr = false, bool retain_client = false) {
         EXPECT_CALL(*client_, initForPools(_, _, _, _))
             .WillOnce(Invoke([&](const auto&, auto, const auto& registrations, const auto& tags) {
                 EXPECT_EQ(registrations.size(), 1u);
@@ -727,7 +865,7 @@ protected:
                 }
                 return true;
             }));
-        EXPECT_CALL(*client_, shutdown()).Times(1);
+        EXPECT_CALL(*client_, shutdown()).Times(retain_client ? 0 : 1);
         KVCacheConfig options;
         options.kvcm_remote_layout = "canonical_v1";
         RuntimeConfig runtime;
@@ -745,7 +883,7 @@ protected:
                 return group_->convertHostIndexToBuffer(layer, tag, block);
             },
             [this](const CacheKeysType& keys, const std::vector<std::string>& tags,
-                   const std::vector<uint32_t>& coordinates, int) {
+                   const std::vector<uint32_t>& coordinates, int, bool, uint64_t) {
                 StorageRequest request;
                 request.source_tier = Tier::HOST;
                 request.keys = std::make_shared<CacheKeysType>(tags.size(), keys.at(0));
@@ -849,13 +987,15 @@ TEST_F(CanonicalHostIOTest, AllReadsUseGpuIovsWithOrWithoutGdr) {
 }
 
 TEST_F(CanonicalHostIOTest, ExplicitHostTimeoutRetainsStorePinsAfterShutdown) {
-    initialize();
+    initialize(/*gdr=*/false, /*retain_client=*/true);
     client_->save_status = kv_cache_manager::ClientErrorCode::ER_SDK_TIMEOUT;
     RemoteOperationResponsePB response;
     EXPECT_FALSE(backend_->execute(request(/*host_write=*/true), response));
     EXPECT_EQ(response.transfer_status(), REMOTE_TRANSFER_STATUS_TIMEOUT);
     backend_->shutdown();
     EXPECT_EQ(host_pool_->referencedBlocksNum(BlockTreeRefType::STORE), 1u);
+    EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(client_.get()));
+    ::testing::Mock::AllowLeak(client_.get());
 }
 
 TEST_F(CanonicalHostIOTest, SingleRankHostBufferRejectionNeverPublishes) {

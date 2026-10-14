@@ -820,6 +820,7 @@ enum RemoteOpType {
     REMOTE_OPERATION_REMOVE_CACHE = 5;
     REMOTE_OPERATION_GET_LOCATIONS_BY_BACKEND = 6;
     REMOTE_OPERATION_GET_HOST_CACHE_STATE = 7;
+    REMOTE_OPERATION_HOST_EVICTION_SETTLEMENT = 9;
 }
 
 message RemoteBoolMasksTypePB { repeated bool values = 1; }
@@ -836,6 +837,24 @@ message FunctionRequestPB {
         RemoteOperationRequestPB remote_request = 2;
         P2PConnectorBroadcastTpRequestPB p2p_request = 3;
     }
+}
+
+message RemoteHostWriteSourcePathPB {
+    // Rank-local BlockTree path used to resolve and pin this HOST IOV source.
+    repeated int64 local_cache_keys = 1;
+    uint32 coordinate = 2;
+    // Stable source lease derived from the local key and GroupSet identity.
+    uint64 host_eviction_lease_id = 3;
+    // GroupSet tags sharing the source block; used for post-FinishWrite settlement.
+    repeated string group_tags = 4;
+}
+
+enum RemoteHostWriteSettlementPB {
+    REMOTE_HOST_WRITE_SETTLEMENT_UNSPECIFIED = 0;
+    REMOTE_HOST_WRITE_SETTLEMENT_COMMIT = 1;
+    REMOTE_HOST_WRITE_SETTLEMENT_ROLLBACK = 2;
+    REMOTE_HOST_WRITE_SETTLEMENT_UNKNOWN = 3;
+    REMOTE_HOST_WRITE_SETTLEMENT_RESERVE = 4;
 }
 
 message RemoteOperationRequestPB {
@@ -862,6 +881,9 @@ message RemoteOperationRequestPB {
     // canonical_v1: one logical head/state shard per tag/block/URI entry.
     repeated int32 logical_shards = 12;
     string storage_layout = 13;
+    // Optional per-IOV source paths for batched eviction keys with different tree parents.
+    repeated RemoteHostWriteSourcePathPB host_write_source_paths = 14;
+    RemoteHostWriteSettlementPB host_write_settlement = 15;
 }
 
 message RemoteMetadataRequestPB {

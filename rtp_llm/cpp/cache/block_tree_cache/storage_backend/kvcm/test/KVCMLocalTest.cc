@@ -65,6 +65,7 @@ protected:
         ASSERT_EQ(host_pool_->treeRefCount(local_block_), 1u);
 
         client_ = std::make_shared<MockClientWrapper>();
+        shutdown_calls_ = std::make_shared<std::atomic<size_t>>(0);
         EXPECT_CALL(*client_, initForPools(_, kv_cache_manager::RoleType::WORKER, _, _)).WillOnce(Return(true));
         auto parallelism    = singleRankConfig();
         parallelism.tp_size = 2;
@@ -88,13 +89,18 @@ protected:
                 return group->convertHostIndexToBuffer(layer, tag, block);
             },
             [this](const CacheKeysType& keys, const std::vector<std::string>& tags,
-                   const std::vector<uint32_t>& coordinates, int timeout_ms) {
-                return cache_->resolveHostWrite(keys, tags, coordinates, timeout_ms);
+                   const std::vector<uint32_t>& coordinates,
+                   int timeout_ms,
+                   bool keys_are_local,
+                   uint64_t lease_id) {
+                (void)keys_are_local;
+                return cache_->resolveHostWrite(keys, tags, coordinates, timeout_ms, lease_id);
             }));
         // Bind the worker resolver without starting a metadata write during fixture setup.
         cache_->storage_backend_ = backend_;
         fence_->observe({{"default", local_block_, 100}, {"default", local_block_, 500, true}});
-        EXPECT_CALL(*client_, shutdown()).WillOnce(Invoke([this] {
+        EXPECT_CALL(*client_, shutdown()).Times(::testing::AnyNumber()).WillRepeatedly(Invoke([this] {
+            shutdown_calls_->fetch_add(1, std::memory_order_relaxed);
             if (host_pool_->hasUncertainRemoteIo()) {
                 EXPECT_EQ(host_pool_->referencedBlocksNum(BlockTreeRefType::STORE), 1u);
             }
@@ -109,9 +115,14 @@ protected:
         if (host_pool_) {
             EXPECT_EQ(host_pool_->referencedBlocksNum(BlockTreeRefType::STORE),
                       host_pool_->hasUncertainRemoteIo() ? 1u : 0u);
+            EXPECT_EQ(shutdown_calls_->load(std::memory_order_relaxed),
+                      host_pool_->hasUncertainRemoteIo() ? 0u : 1u);
         }
         if (client_) {
             EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(client_.get()));
+            if (host_pool_ && host_pool_->hasUncertainRemoteIo()) {
+                ::testing::Mock::AllowLeak(client_.get());
+            }
         }
         if (host_pool_ && !isNullBlockIdx(wire_block_)) {
             host_pool_->decTreeRef(wire_block_, BlockTreeRefType::LOAD);
@@ -193,6 +204,7 @@ protected:
     std::unique_ptr<BackendEnvironment> environment_;
     std::shared_ptr<HostBlockPool>      host_pool_;
     std::shared_ptr<MockClientWrapper>  client_;
+    std::shared_ptr<std::atomic<size_t>> shutdown_calls_;
     std::shared_ptr<WorkerCacheIOFence> fence_;
     std::shared_ptr<KVCMStorageBackend> backend_;
     std::unique_ptr<BlockTreeCache>     cache_;
@@ -231,6 +243,70 @@ TEST_F(KVCMHostWriteTest, UsesLocalKeyAndLeavesBothGenerationNamespacesUnchanged
     EXPECT_EQ(producer_waits, 2);
 }
 
+TEST_F(KVCMHostWriteTest, DemotingHostSourceRequiresTheMatchingEvictionLease) {
+    auto path = cache_->tree()->findNode({101});
+    ASSERT_EQ(path.size(), 1u);
+    auto& resource = path.front()->group_set_resources.front();
+    constexpr uint64_t lease_id = 101;
+    resource.transfer_state = GroupSetTransferState::DEMOTING;
+    resource.host_eviction_lease_id = lease_id;
+
+    auto ordinary = cache_->resolveHostWrite({101}, {"default"}, {0}, 0);
+    EXPECT_FALSE(static_cast<bool>(ordinary.pins));
+    auto stale_lease = cache_->resolveHostWrite({101}, {"default"}, {0}, 0, lease_id + 1);
+    EXPECT_FALSE(static_cast<bool>(stale_lease.pins));
+
+    auto leased = cache_->resolveHostWrite({101}, {"default"}, {0}, 0, lease_id);
+    ASSERT_TRUE(static_cast<bool>(leased.pins));
+    EXPECT_EQ(leased.local_blocks, (std::vector<BlockIdxType>{local_block_}));
+    EXPECT_EQ(host_pool_->referencedBlocksNum(BlockTreeRefType::STORE), 1u);
+    leased.pins = StorageWriteTask{};
+    EXPECT_EQ(host_pool_->referencedBlocksNum(BlockTreeRefType::STORE), 0u);
+
+    resource.transfer_state = GroupSetTransferState::IDLE;
+    resource.host_eviction_lease_id = 0;
+}
+
+TEST_F(KVCMHostWriteTest, RemoteSettlementRequiresTheCurrentEvictionLease) {
+    auto path = cache_->tree()->findNode({101});
+    ASSERT_EQ(path.size(), 1u);
+    auto& resource = path.front()->group_set_resources.front();
+    constexpr uint64_t lease_id = 201;
+    constexpr uint64_t stale_lease_id = 200;
+    EXPECT_TRUE(cache_->settleRemoteHostWriteSource(
+        {101}, {"default"}, 0, stale_lease_id, HostWriteSettlementOutcome::COMMIT));
+    EXPECT_EQ(host_pool_->referencedBlocksNum(BlockTreeRefType::CACHE), 1u);
+    EXPECT_TRUE(host_pool_->isAllocated(local_block_));
+
+    auto source = cache_->resolveHostWrite({101}, {"default"}, {0}, 0, lease_id);
+    ASSERT_TRUE(static_cast<bool>(source.pins));
+    EXPECT_EQ(resource.transfer_state, GroupSetTransferState::DEMOTING);
+    source.pins = StorageWriteTask{};
+    ASSERT_TRUE(cache_->settleRemoteHostWriteSource(
+        {101}, {"default"}, 0, lease_id, HostWriteSettlementOutcome::ROLLBACK));
+    EXPECT_EQ(resource.transfer_state, GroupSetTransferState::IDLE);
+    EXPECT_EQ(resource.host_eviction_lease_id, 0u);
+    EXPECT_TRUE(host_pool_->isAllocated(local_block_));
+
+    constexpr uint64_t next_lease_id = 202;
+    auto next_source = cache_->resolveHostWrite({101}, {"default"}, {0}, 0, next_lease_id);
+    ASSERT_TRUE(static_cast<bool>(next_source.pins));
+    next_source.pins = StorageWriteTask{};
+    ASSERT_TRUE(cache_->settleRemoteHostWriteSource(
+        {101}, {"default"}, 0, lease_id, HostWriteSettlementOutcome::COMMIT));
+    EXPECT_EQ(resource.transfer_state, GroupSetTransferState::DEMOTING);
+    EXPECT_EQ(resource.host_eviction_lease_id, next_lease_id);
+    EXPECT_TRUE(cache_->settleRemoteHostWriteSource(
+        {101}, {"default"}, 0, lease_id, HostWriteSettlementOutcome::ROLLBACK));
+    EXPECT_EQ(resource.transfer_state, GroupSetTransferState::DEMOTING);
+
+    ASSERT_TRUE(cache_->settleRemoteHostWriteSource(
+        {101}, {"default"}, 0, next_lease_id, HostWriteSettlementOutcome::COMMIT));
+    EXPECT_TRUE(cache_->tree()->findNode({101}).empty());
+    EXPECT_FALSE(host_pool_->isAllocated(local_block_));
+    EXPECT_EQ(host_pool_->referencedBlocksNum(BlockTreeRefType::CACHE), 0u);
+}
+
 TEST_F(KVCMHostWriteTest, ReadsRejectHostSourcesAndStaleDeviceGenerations) {
     EXPECT_CALL(*client_, loadKvCachesForTag(_, _, _, _)).Times(0);
     EXPECT_CALL(*client_, saveKvCachesForTag(_, _, _, _)).Times(0);
@@ -258,6 +334,7 @@ TEST_F(KVCMHostWriteTest, InFlightWriteKeepsStorePinAndIoLockUntilCompletion) {
 
 TEST_F(KVCMHostWriteTest, TimedOutSubmittedWriteRetainsStorePinAfterShutdown) {
     checkIoPins(false);
+    EXPECT_EQ(shutdown_calls_->load(std::memory_order_relaxed), 0u);
 }
 
 TEST_F(KVCMHostWriteTest, FailedSubmittedWriteReleasesStorePin) {
@@ -639,7 +716,7 @@ TEST(KVCMLocalTest, PayloadReadTimeoutQuarantinesDestinationBlock) {
         std::make_shared<kmonitor::MetricsReporter>("", "", kmonitor::MetricsTags{});
 
     EXPECT_CALL(*client_wrapper, initForPools(_, _, _, _)).WillOnce(Return(true));
-    EXPECT_CALL(*client_wrapper, shutdown()).Times(1);
+    EXPECT_CALL(*client_wrapper, shutdown()).Times(0);
     auto backend = makeBackend(environment, singleRankConfig(), client_wrapper, nullptr, metrics_reporter);
     ASSERT_TRUE(initSingleRank(*backend.backend, environment));
     auto* quarantine_metrics = metrics_reporter->getMetricsGroup<RtpLLMRemoteCacheQuarantineMetrics>();
@@ -678,13 +755,15 @@ TEST(KVCMLocalTest, PayloadReadTimeoutQuarantinesDestinationBlock) {
     EXPECT_EQ(environment.device_pool->refCount(environment.block_id), ref_count_before + 1);
     EXPECT_DOUBLE_EQ(snapshotGauge(quarantine_metrics->quarantined_lease_count_metric), 0);
     EXPECT_DOUBLE_EQ(snapshotGauge(quarantine_metrics->quarantined_block_count_metric), 0);
+    EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(client_wrapper.get()));
+    ::testing::Mock::AllowLeak(client_wrapper.get());
 }
 
 TEST(KVCMLocalTest, PayloadWriteTimeoutAbortsSessionAndRetainsSourceAfterShutdown) {
     auto environment = makeBackendEnvironment("kvcm_storage_backend_write_timeout");
     auto client = std::make_shared<MockClientWrapper>();
     EXPECT_CALL(*client, initForPools(_, _, _, _)).WillOnce(Return(true));
-    EXPECT_CALL(*client, shutdown()).Times(1);
+    EXPECT_CALL(*client, shutdown()).Times(0);
     auto backend = makeBackend(environment, singleRankConfig(), client);
     ASSERT_TRUE(initSingleRank(*backend.backend, environment));
     kv_cache_manager::WriteLocation location;
@@ -709,6 +788,8 @@ TEST(KVCMLocalTest, PayloadWriteTimeoutAbortsSessionAndRetainsSourceAfterShutdow
     EXPECT_TRUE(backend->quarantineActive());
     backend->shutdown();
     EXPECT_EQ(environment.device_pool->refCount(environment.block_id), refs + 1);
+    EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(client.get()));
+    ::testing::Mock::AllowLeak(client.get());
 }
 
 }  // namespace

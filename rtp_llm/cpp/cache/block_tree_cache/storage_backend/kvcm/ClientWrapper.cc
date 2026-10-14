@@ -136,7 +136,7 @@ bool ClientWrapper::initImpl(const ConfigMap&                     config_map,
         }
         const auto config_json = autil::legacy::ToJsonString(config_map_.begin()->second);
         // PACE publishes external regions during its first initialization.
-        // The first transfer client owns all GPU registrations.
+        // Aggregate every pool before this wrapper creates its first client.
         for (size_t index = 1; index < pool_registrations_.size(); ++index) {
             auto& memory = pool_registrations_[index].memory_registrations;
             if (!memory) {
@@ -146,6 +146,12 @@ bool ClientWrapper::initImpl(const ConfigMap&                     config_map,
             if (!first_memory) {
                 first_memory.emplace();
             }
+            if (memory->host.fd >= 0 || memory->host.base != nullptr || memory->host.size != 0) {
+                first_memory->host_regions.push_back(memory->host);
+            }
+            first_memory->host_regions.insert(first_memory->host_regions.end(),
+                                              memory->host_regions.begin(),
+                                              memory->host_regions.end());
             first_memory->gpu.insert(first_memory->gpu.end(), memory->gpu.begin(), memory->gpu.end());
             memory.reset();
         }

@@ -449,6 +449,77 @@ TEST(KVCMInternalTest, FullAndLinearWriteSelectionPreservesLegacyIntervals) {
     EXPECT_EQ(selected, (std::vector<std::string>{"FfullLlinear", "Ffull", "Ffull", "FfullLlinear"}));
 }
 
+TEST(KVCMInternalTest, HostEvictionSelectsTheAvailableOtherGroupOnly) {
+    for (const auto other_type : {CacheGroupType::LINEAR, CacheGroupType::SWA}) {
+        SCOPED_TRACE(static_cast<int>(other_type));
+        auto topology = CacheTopology::create(
+            {makeGroup("full", 0, CacheGroupType::FULL), makeGroup("other", 1, other_type)},
+            {{0, {"full"}}, {1, {"other"}}});
+        FullLinearLayerGroupPolicy policy(
+            *topology, unusedResolver(), /*full_group_tags=*/{"full"}, /*other_group_tags=*/{"other"}, 1);
+        ASSERT_TRUE(policy.init());
+        GroupPolicy::LocationSpecGroups groups;
+        ASSERT_TRUE(policy.buildLocationSpecGroups(/*tp_size=*/2, groups));
+
+        auto request = makeStorageRequest({{{"other", 20}}});
+        request.source_tier = Tier::HOST;
+        request.host_write_source_paths = {{{1}, /*coordinate=*/0, /*lease=*/7}};
+        std::vector<std::string> selected;
+        ASSERT_TRUE(policy.getNeedWriteGroups(request, request.handles.size(), selected));
+        ASSERT_EQ(selected.size(), 1u);
+        EXPECT_EQ(selected.front(), policy.groups().at(1).group_name);
+        EXPECT_EQ(groups.count(selected.front()), 1u);
+
+        kv_cache_manager::Location other_location;
+        for (const auto& spec_name : groups.at(selected.front())) {
+            other_location.push_back({spec_name, "other_uri"});
+        }
+        LocationsView filtered;
+        EXPECT_TRUE(policy.filterNeedLoadLocations({other_location}, filtered));
+        ASSERT_EQ(filtered.size(), 1u);
+        EXPECT_EQ(filtered.front().size(), other_location.size());
+    }
+}
+
+TEST(KVCMInternalTest, FullLinearLoadPreservesMultipleOtherOnlyLocations) {
+    auto topology = CacheTopology::create(
+        {makeGroup("full", 0, CacheGroupType::FULL),
+         makeGroup("linear0", 1, CacheGroupType::LINEAR),
+         makeGroup("linear1", 2, CacheGroupType::LINEAR)},
+        {{0, {"full"}}, {1, {"linear0"}}, {2, {"linear1"}}});
+    FullLinearLayerGroupPolicy policy(*topology,
+                                      unusedResolver(),
+                                      /*full_group_tags=*/{"full"},
+                                      /*other_group_tags=*/{"linear0", "linear1"},
+                                      /*write_interval=*/1);
+    ASSERT_TRUE(policy.init());
+    GroupPolicy::LocationSpecGroups groups;
+    ASSERT_TRUE(policy.buildLocationSpecGroups(/*tp_size=*/2, groups));
+
+    const auto singleton_location = [&](const std::string& group_name) {
+        kv_cache_manager::Location location;
+        for (const auto& spec_name : groups.at(group_name)) {
+            location.push_back({spec_name, "uri_" + spec_name});
+        }
+        return location;
+    };
+    const std::string& full_group    = policy.groups().at(0).group_name;
+    const std::string& first_other   = policy.groups().at(1).group_name;
+    const std::string& second_other  = policy.groups().at(2).group_name;
+    const kv_cache_manager::Locations locations{singleton_location(full_group),
+                                                singleton_location(first_other),
+                                                singleton_location(full_group),
+                                                singleton_location(second_other)};
+
+    LocationsView filtered;
+    ASSERT_TRUE(policy.filterNeedLoadLocations(locations, filtered));
+    ASSERT_EQ(filtered.size(), locations.size());
+    EXPECT_EQ(filtered[0].size(), groups.at(full_group).size());
+    EXPECT_EQ(filtered[1].size(), groups.at(first_other).size());
+    EXPECT_EQ(filtered[2].size(), groups.at(full_group).size());
+    EXPECT_EQ(filtered[3].size(), groups.at(second_other).size());
+}
+
 TEST(KVCMInternalTest, FullAndLinearWriteIntervalOnePreservesLegacyDefaultAndPartialSelection) {
     auto topology = CacheTopology::create(
         {makeGroup("full", 0, CacheGroupType::FULL), makeGroup("linear", 1, CacheGroupType::LINEAR)},

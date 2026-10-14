@@ -4,6 +4,7 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCacheFactory.h"
 #include "rtp_llm/cpp/testing/TestBase.h"
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
 #include <cuda_runtime.h>
@@ -158,6 +159,161 @@ protected:
         RemoteOperationResponsePB response;
         EXPECT_TRUE(backend->execute(cleanup, response));
     }
+    void hostEvictionRoundTrip(const CacheConfig& config, bool dual_write) {
+        const auto address = autil::EnvUtil::getEnv("KVCM_P2_SERVER_ADDRESS", std::string{});
+        const auto instance_group = autil::EnvUtil::getEnv("KVCM_P2_INSTANCE_GROUP", std::string{});
+        ASSERT_FALSE(address.empty());
+        ASSERT_FALSE(instance_group.empty());
+        const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count() / 1000;
+        KVCacheConfig options;
+        options.enable_device_cache = false;
+        options.enable_memory_cache = true;
+        options.memory_cache_size_mb = 1;
+        options.enable_remote_cache = true;
+        options.block_tree_memory_evict_low_watermark_ratio = 0.0000001;
+        options.block_tree_memory_evict_high_watermark_ratio = 0.000001;
+        options.kvcm_server_address = address;
+        options.kvcm_instance_group = instance_group;
+        options.kvcm_read_backend_type = 3;
+        options.kvcm_min_replica_count = 1;
+        options.kvcm_instance_id_salt = "host_eviction_" + std::to_string(nonce);
+        options.kvcm_model_sdk_config = R"([{"type":"pace","sdk_log_level":"WARN"}])";
+        RuntimeConfig runtime;
+        runtime.model_name = "host_eviction_byte_roundtrip";
+        auto allocator = std::make_shared<CoordinatorCacheManager>(config);
+        ASSERT_TRUE(allocator->init());
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        auto backend = std::make_shared<KVCMStorageBackend>(config, options, runtime, singleRankConfig(),
+                                                            SpeculativeExecutionConfig{}, nullptr, false);
+        auto cache = createBlockTreeCache(config, options, allocator, singleRankConfig(), backend);
+        ASSERT_NE(cache, nullptr);
+        const auto pools = allocator->groupBlockPools();
+        std::vector<std::unique_ptr<ScopedReferencedBlocks>> sources;
+        for (const auto& pool : pools) {
+            sources.push_back(std::make_unique<ScopedReferencedBlocks>(pool, 2));
+        }
+        const auto payload = [](size_t group, size_t key, int layer, size_t iov, size_t size) {
+            std::vector<uint8_t> bytes(size);
+            for (size_t i = 0; i < size; ++i) {
+                bytes[i] = static_cast<uint8_t>(group * 31 + key * 17 + layer * 3 + iov + i * 5 + (i >> 3));
+            }
+            return bytes;
+        };
+        const auto forEachBuffer = [&](const auto& holders, const auto& visitor) {
+            for (size_t key = 0; key < 2; ++key) {
+                for (size_t group = 0; group < pools.size(); ++group) {
+                    const auto& tag = config.groupTags()[group];
+                    for (const int layer : config.layerIdsForGroup(tag)) {
+                        const auto buffers = allocator->convertIndexToBuffer(layer, tag, holders[group]->get()[key]);
+                        for (size_t iov = 0; iov < buffers.size(); ++iov) {
+                            visitor(group, key, layer, iov, buffers[iov]);
+                        }
+                    }
+                }
+            }
+        };
+        forEachBuffer(sources, [&](size_t group, size_t key, int layer, size_t iov, const BlockInfo& buffer) {
+            const auto bytes = payload(group, key, layer, iov, buffer.size_bytes);
+            ASSERT_EQ(cudaMemcpy(buffer.addr, bytes.data(), bytes.size(), cudaMemcpyHostToDevice), cudaSuccess);
+        });
+        std::vector<std::vector<GroupSetResource>> resources(2,
+            std::vector<GroupSetResource>(cache->groupSets().size()));
+        for (const auto& group_set : cache->groupSets()) {
+            ASSERT_NE(group_set->hostPool(), nullptr);
+            ASSERT_GE(group_set->hostPool()->sharedMemoryFd(), 0);
+            for (const auto& pool : group_set->devicePools()) {
+                const auto found = std::find(pools.begin(), pools.end(), pool);
+                ASSERT_TRUE(found != pools.end());
+                const auto group = static_cast<size_t>(std::distance(pools.begin(), found));
+                for (size_t key = 0; key < 2; ++key) {
+                    resources[key][group_set->groupSetId()].device_blocks.push_back(sources[group]->get()[key]);
+                }
+            }
+        }
+        const CacheKeysType keys{nonce, nonce + 1};
+        cache->insert(keys, resources, Tier::HOST, false, dual_write);
+        const auto eviction_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        bool all_evicted = false;
+        do {
+            block_tree_cache_test::BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+            ASSERT_TRUE(waitForBackendOperationsForTest(*backend));
+            all_evicted = std::all_of(cache->groupSets().begin(), cache->groupSets().end(), [](const auto& group_set) {
+                return group_set->hostPool()->usedBlocksNum() == 0;
+            });
+            if (!all_evicted) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        } while (!all_evicted && std::chrono::steady_clock::now() < eviction_deadline);
+        ASSERT_TRUE(all_evicted) << "HOST watermark eviction must complete without a manual flush";
+        sources.clear();
+        for (const auto& group_set : cache->groupSets()) {
+            EXPECT_EQ(group_set->hostPool()->referencedBlocksNum(BlockTreeRefType::STORE), 0u);
+        }
+        std::vector<std::unique_ptr<ScopedReferencedBlocks>> destinations;
+        StorageRequest request;
+        request.keys = std::make_shared<CacheKeysType>(keys);
+        request.handles.resize(2);
+        for (size_t group = 0; group < pools.size(); ++group) {
+            EXPECT_EQ(pools[group]->usedBlocksNum(), 0u);
+            destinations.push_back(std::make_unique<ScopedReferencedBlocks>(pools[group], 2));
+            for (size_t key = 0; key < 2; ++key) {
+                request.handles[key].push_back({config.groupTags()[group], destinations[group]->get()[key]});
+            }
+        }
+        forEachBuffer(destinations, [](size_t, size_t, int, size_t, const BlockInfo& buffer) {
+            ASSERT_EQ(cudaMemset(buffer.addr, 0, buffer.size_bytes), cudaSuccess);
+        });
+        MatchObservation matched;
+        const auto match_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        do {
+            matched = match(*backend, request);
+            if (matched.success && matched.matched_blocks_num == keys.size()) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        } while (std::chrono::steady_clock::now() < match_deadline);
+        ASSERT_TRUE(matched.success);
+        ASSERT_EQ(matched.matched_blocks_num, keys.size());
+        RemoteOperationRequestPB locations;
+        locations.set_op(REMOTE_OPERATION_GET_LOCATIONS_BY_BACKEND);
+        locations.mutable_metadata()->set_backend_type(3);
+        for (const auto key : keys) {
+            locations.mutable_metadata()->add_block_keys(key);
+        }
+        RemoteOperationResponsePB located;
+        ASSERT_TRUE(backend->execute(locations, located));
+        ASSERT_EQ(located.backend_locations_size(), keys.size());
+        for (const auto& key : located.backend_locations()) {
+            ASSERT_GT(key.locations_size(), 0);
+            for (const auto& location : key.locations()) {
+                for (const auto& spec : location.specs()) {
+                    EXPECT_EQ(spec.uri().rfind("pace://", 0), 0u);
+                }
+            }
+        }
+        ASSERT_TRUE(read(*backend, request, matched.match_meta));
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        size_t checked_bytes = 0;
+        forEachBuffer(destinations, [&](size_t group, size_t key, int layer, size_t iov, const BlockInfo& buffer) {
+            const auto& declared = config.group(config.groupTags()[group]);
+            const bool loaded = 2 - key <= declared.reuseBlockCount(2);
+            const auto expected = loaded ? payload(group, key, layer, iov, buffer.size_bytes) :
+                                           std::vector<uint8_t>(buffer.size_bytes, 0);
+            std::vector<uint8_t> actual(buffer.size_bytes);
+            ASSERT_EQ(cudaMemcpy(actual.data(), buffer.addr, actual.size(), cudaMemcpyDeviceToHost), cudaSuccess);
+            EXPECT_EQ(actual, expected) << "tag=" << declared.tag << " key=" << key << " layer=" << layer;
+            checked_bytes += actual.size();
+        });
+        std::cout << "host_eviction dual_write=" << dual_write << " host_regions=" << cache->groupSets().size()
+                  << " checked_bytes=" << checked_bytes << '\n';
+        RemoteOperationRequestPB cleanup;
+        cleanup.set_op(REMOTE_OPERATION_REMOVE_CACHE);
+        for (const auto key : keys) {
+            cleanup.mutable_metadata()->add_block_keys(key);
+        }
+        RemoteOperationResponsePB response;
+        EXPECT_TRUE(backend->execute(cleanup, response));
+    }
 };
 
 TEST_F(KVCMMultiPoolPaceTest, RequestFinishUsesDeviceSourceAlongsideLocalHostCopy) {
@@ -251,6 +407,22 @@ TEST_F(KVCMMultiPoolPaceTest, MambaMatchesHeterogeneousFullPrefixAndOnlyTheFinal
 
 TEST_F(KVCMMultiPoolPaceTest, SingleGroupPrefixRegressionThroughRealKVCMAndPace) {
     roundTrip(test::makeSimpleMhaCacheConfig(1, 16, 8, DataType::TYPE_FP16, 1, 2), false);
+}
+
+TEST_F(KVCMMultiPoolPaceTest, SingleGroupHostWatermarkEvictionWithoutDeviceDualWrite) {
+    hostEvictionRoundTrip(test::makeSimpleMhaCacheConfig(1, 16, 8, DataType::TYPE_FP16, 1, 2), false);
+}
+
+TEST_F(KVCMMultiPoolPaceTest, SingleGroupHostWatermarkEvictionWithDeviceDualWrite) {
+    hostEvictionRoundTrip(test::makeSimpleMhaCacheConfig(1, 16, 8, DataType::TYPE_FP16, 1, 2), true);
+}
+
+TEST_F(KVCMMultiPoolPaceTest, HeterogeneousHostWatermarkEvictionWithoutDeviceDualWrite) {
+    hostEvictionRoundTrip(test::makeHeterogeneousRemoteCacheConfig(), false);
+}
+
+TEST_F(KVCMMultiPoolPaceTest, HeterogeneousHostWatermarkEvictionWithDeviceDualWrite) {
+    hostEvictionRoundTrip(test::makeHeterogeneousRemoteCacheConfig(), true);
 }
 
 }  // namespace

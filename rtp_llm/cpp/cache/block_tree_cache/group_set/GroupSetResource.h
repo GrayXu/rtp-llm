@@ -41,6 +41,8 @@ struct GroupSetResource {
 
     // Async migration state and the single sorting-metadata copy (current serving tier).
     GroupSetTransferState transfer_state{GroupSetTransferState::IDLE};
+    // Identifies the current HOST eviction source on every rank. Zero for other transfers.
+    uint64_t host_eviction_lease_id{0};
     // The source remains owned by the in-flight operation, but its target must no longer be installed.
     bool          transfer_detached{false};
     CandidateMeta candidate_meta;
@@ -64,13 +66,13 @@ struct GroupSetResource {
                + static_cast<size_t>(hasTier(Tier::DISK));
     }
     bool isValidSteadyState() const {
-        return transfer_state == GroupSetTransferState::IDLE && servingTierCount() <= 1;
+        return transfer_state == GroupSetTransferState::IDLE && host_eviction_lease_id == 0 && servingTierCount() <= 1;
     }
     bool is_empty() const {
         return !hasTier(Tier::DEVICE) && !hasTier(Tier::HOST) && !hasTier(Tier::DISK);
     }
     bool is_removable() const {
-        return transfer_state == GroupSetTransferState::IDLE && is_empty();
+        return transfer_state == GroupSetTransferState::IDLE && host_eviction_lease_id == 0 && is_empty();
     }
     bool isMatchUsable() const {
         return transfer_state == GroupSetTransferState::IDLE || transfer_state == GroupSetTransferState::LOADING;

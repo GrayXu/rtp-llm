@@ -140,6 +140,7 @@ protected:
 
     bool initialize(bool fail_second = false, int rank = 0, bool reorder_binding = false) {
         auto factory = std::make_unique<kvcm::MockClientFactory>();
+        factory_     = factory.get();
         auto meta    = std::make_unique<kv_cache_manager::MockMetaClient>();
         meta_        = meta.get();
         EXPECT_CALL(*factory, createSubscriber(false)).WillOnce(Invoke([](bool) {
@@ -268,6 +269,7 @@ protected:
     std::shared_ptr<PoolTransferState>                   state_;
     std::shared_ptr<kvcm::ClientWrapper>                 wrapper_;
     kv_cache_manager::MockMetaClient*                    meta_{nullptr};
+    kvcm::MockClientFactory*                             factory_{nullptr};
     std::shared_ptr<KVCMStorageBackend>                  backend_;
     BlockTreeCachePtr                                    cache_;
 };
@@ -478,6 +480,7 @@ TEST_F(KVCMIndependentPoolTest, TimeoutRetainsUpperRequestPinsAfterShutdown) {
         {{"tp0_Ffull0", "full0"}, {"tp0_Ffull1", "full1"}, {"tp0_Llinear0", "linear"}}};
     EXPECT_CALL(*meta_, MatchLocation(_, _, _, _, _, _, _))
         .WillOnce(Return(std::make_pair(kv_cache_manager::ClientErrorCode::ER_OK, locations)));
+    state_->stored["full0"].resize(config_.blockSizeBytesForGroup("full0"));
 
     std::vector<uint32_t> ref_counts;
     for (size_t group = 0; group < pools_.size(); ++group) {
@@ -486,7 +489,11 @@ TEST_F(KVCMIndependentPoolTest, TimeoutRetainsUpperRequestPinsAfterShutdown) {
     state_->timeout_pool = 1;
     auto matched         = match(*backend_, request());
     ASSERT_EQ(matched.matched_blocks_num, 1u);
-    EXPECT_FALSE(read(*backend_, request(), matched.match_meta));
+    const auto error = readResult(*backend_, request(), matched.match_meta);
+    EXPECT_EQ(error.code(), ErrorCode::DEADLINE_EXCEEDED);
+    EXPECT_TRUE(error.completionUnknown());
+    EXPECT_TRUE(backend_->quarantineActive());
+    EXPECT_EQ(state_->reads, (std::vector<size_t>{1, 0, 0}));
     for (size_t group = 0; group < pools_.size(); ++group) {
         EXPECT_EQ(pools_[group]->refCount(blocks_[group]), ref_counts[group] + 1);
     }
@@ -495,6 +502,11 @@ TEST_F(KVCMIndependentPoolTest, TimeoutRetainsUpperRequestPinsAfterShutdown) {
     for (size_t group = 0; group < pools_.size(); ++group) {
         EXPECT_EQ(pools_[group]->refCount(blocks_[group]), ref_counts[group] + 1);
     }
+    // Quarantine retains the clients through process exit; verify their calls now.
+    EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(meta_));
+    EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(factory_));
+    ::testing::Mock::AllowLeak(meta_);
+    ::testing::Mock::AllowLeak(factory_);
 }
 
 TEST_F(KVCMIndependentPoolTest, WorkerReportsTimeoutWithoutCreatingLocalPins) {
@@ -532,6 +544,10 @@ TEST_F(KVCMIndependentPoolTest, WorkerReportsTimeoutWithoutCreatingLocalPins) {
     for (const auto& pool : pools_) {
         borrowed.push_back(pool);
     }
+    EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(meta_));
+    EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(factory_));
+    ::testing::Mock::AllowLeak(meta_);
+    ::testing::Mock::AllowLeak(factory_);
     backend_.reset();
     wrapper_.reset();
     refs_.clear();

@@ -105,7 +105,8 @@ bool StorageBackend::init(std::shared_ptr<const CacheTopology> topology,
                           BufferResolver                       buffer_resolver,
                           HostPoolsByTag                       host_pools_by_tag,
                           BufferResolver                       host_buffer_resolver,
-                          HostWriteResolver                    host_write_resolver) {
+                          HostWriteResolver                    host_write_resolver,
+                          HostWriteSettlementResolver           host_write_settlement_resolver) {
     if (init_attempted_) {
         RTP_LLM_LOG_ERROR("StorageBackend initialization has already been attempted");
         return false;
@@ -139,6 +140,7 @@ bool StorageBackend::init(std::shared_ptr<const CacheTopology> topology,
     host_pools_by_tag_ = std::move(host_pools_by_tag);
     host_buffer_resolver_ = std::move(host_buffer_resolver);
     host_write_resolver_ = std::move(host_write_resolver);
+    host_write_settlement_resolver_ = std::move(host_write_settlement_resolver);
     const auto fail_init = [this] {
         shutdownImpl();
         buffer_resolver_ = {};
@@ -146,6 +148,7 @@ bool StorageBackend::init(std::shared_ptr<const CacheTopology> topology,
         host_buffer_resolver_ = {};
         host_pools_by_tag_.clear();
         host_write_resolver_ = {};
+        host_write_settlement_resolver_ = {};
         topology_.reset();
         return false;
     };
@@ -429,6 +432,16 @@ void StorageBackend::validateRequest(const StorageRequest& request, bool allow_n
                             "storage request key/handle count mismatch: keys=%zu handles=%zu",
                             request.keys->size(),
                             request.handles.size());
+    RTP_LLM_CHECK_WITH_INFO(request.host_write_source_paths.empty()
+                                || (request.source_tier == Tier::HOST
+                                    && request.host_write_source_paths.size() == request.keys->size()),
+                            "HOST source-path count must match HOST remote key count");
+    for (const HostWriteSourcePath& source_path : request.host_write_source_paths) {
+        RTP_LLM_CHECK_WITH_INFO(!source_path.local_cache_keys.empty()
+                                    && source_path.coordinate < source_path.local_cache_keys.size()
+                                    && source_path.host_eviction_lease_id != 0,
+                                "HOST source path has an invalid local coordinate or eviction lease");
+    }
     for (size_t key_index = 0; key_index < request.handles.size(); ++key_index) {
         std::unordered_set<std::string> seen_tags;
         for (const auto& handle : request.handles[key_index]) {
@@ -461,11 +474,17 @@ const DeviceBlockPoolPtr& StorageBackend::devicePool(const std::string& tag) con
 }
 
 const std::shared_ptr<HostBlockPool>& StorageBackend::hostPool(const std::string& tag) const {
-    return host_pools_by_tag_.at(tag);
+    static const std::shared_ptr<HostBlockPool> empty_pool;
+    const auto                                 found = host_pools_by_tag_.find(tag);
+    return found == host_pools_by_tag_.end() ? empty_pool : found->second;
 }
 
 const StorageBackend::HostWriteResolver& StorageBackend::hostWriteResolver() const {
     return host_write_resolver_;
+}
+
+const StorageBackend::HostWriteSettlementResolver& StorageBackend::hostWriteSettlementResolver() const {
+    return host_write_settlement_resolver_;
 }
 
 std::vector<BlockInfo>
@@ -568,21 +587,37 @@ StorageWriteTask StorageBackend::prepareWrite(StorageRequest request) {
     return StorageWriteTask(prepare(std::move(request), /*allow_host=*/true));
 }
 
-bool StorageBackend::write(StorageWriteTask task) {
+bool StorageBackend::write(StorageWriteTask task, Done done) {
     RTP_LLM_CHECK(initialized_);
     RTP_LLM_CHECK(task.state_ != nullptr);
     auto state = std::move(task.state_);
-    return dispatch([this, state](Lifecycle outcome) {
+    return dispatch([this, state, done = std::move(done)](Lifecycle outcome) mutable {
+        ErrorInfo error = outcome == Lifecycle::ACCEPTING ?
+                              ErrorInfo::OkStatus() :
+                              ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, "storage backend is not accepting writes");
         bool quarantine = false;
         bool sdk_can_drain = true;
-        const bool transfer_started = outcome == Lifecycle::ACCEPTING && tryBeginTransfer();
-        if (transfer_started) {
+        const bool transfer_started = error.ok() && tryBeginTransfer();
+        if (error.ok() && !transfer_started) {
+            error = ErrorInfo(ErrorCode::EXECUTION_EXCEPTION,
+                              "storage backend is quarantined after unknown transfer completion");
+        }
+        if (error.ok()) {
             try {
                 writeImpl(state->request);
-            } catch (const StorageOperationCompletionUnknown& error) {
+            } catch (const StorageOperationTimeout& exception) {
+                error = ErrorInfo(ErrorCode::DEADLINE_EXCEEDED, exception.what(), /*completion_unknown=*/true);
                 quarantine = true;
-                sdk_can_drain = error.sdkCanDrain();
-            } catch (...) {}
+                sdk_can_drain = exception.sdkCanDrain();
+            } catch (const StorageOperationCompletionUnknown& exception) {
+                error = ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, exception.what(), /*completion_unknown=*/true);
+                quarantine = true;
+                sdk_can_drain = exception.sdkCanDrain();
+            } catch (const std::exception& exception) {
+                error = ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, exception.what());
+            } catch (...) {
+                error = ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, "unknown storage write failure");
+            }
         }
         if (quarantine) {
             quarantineTask(state, sdk_can_drain);
@@ -592,6 +627,9 @@ bool StorageBackend::write(StorageWriteTask task) {
         }
         if (!quarantine) {
             state->finish();
+        }
+        if (done) {
+            done(std::move(error));
         }
     });
 }

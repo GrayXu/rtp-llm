@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <exception>
 #include <mutex>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <sstream>
@@ -13,6 +15,7 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <unistd.h>
@@ -55,6 +58,13 @@ const StorageBlockHandle* findHandle(const std::vector<StorageBlockHandle>& hand
     return it == handles.end() ? nullptr : &*it;
 }
 
+void retainClientWrapperUntilProcessExit(std::shared_ptr<kvcm::ClientWrapper> client_wrapper) noexcept {
+    static auto* retained_mutex = new std::mutex;
+    static auto* retained_clients = new std::vector<std::shared_ptr<kvcm::ClientWrapper>>;
+    std::lock_guard<std::mutex> lock(*retained_mutex);
+    retained_clients->push_back(std::move(client_wrapper));
+}
+
 }  // namespace
 
 class KVCMStorageBackend::Impl {
@@ -94,7 +104,8 @@ public:
     bool init(const CacheTopology&                                                            topology,
               kvcm::GroupPolicy::SourceResolver                                               buffer_resolver,
               const std::function<const DeviceBlockPoolPtr&(const std::string&)>&             pool_resolver,
-              const std::function<const std::shared_ptr<HostBlockPool>&(const std::string&)>& host_pool_resolver) {
+              const std::function<const std::shared_ptr<HostBlockPool>&(const std::string&)>& host_pool_resolver,
+              StorageBackend::HostWriteSettlementResolver host_write_settlement_resolver) {
         RTP_LLM_LOG_INFO("start init BlockTree KVCM storage backend");
         if (topology.groups().empty() || parallelism_config_.tp_size <= 0 || parallelism_config_.tp_rank < 0
             || parallelism_config_.tp_rank >= parallelism_config_.tp_size) {
@@ -104,6 +115,7 @@ public:
         buffer_resolver_    = std::move(buffer_resolver);
         pool_resolver_      = pool_resolver;
         host_pool_resolver_ = host_pool_resolver;
+        host_write_settlement_resolver_ = std::move(host_write_settlement_resolver);
         if (kv_cache_config_.kvcm_remote_layout == "canonical_v1") {
             try {
                 canonical_layout_ = std::make_unique<kvcm::CanonicalCacheLayout>(cache_config_, parallelism_config_);
@@ -375,6 +387,56 @@ public:
 
     void write(const StorageRequest& local_request) {
         const auto request = expandRequest(local_request);
+        if (request.source_tier != Tier::HOST || request.host_write_source_paths.empty()) {
+            writeExpandedRequest(request);
+            return;
+        }
+
+        // Reserve every worker source even when replicas or an existing remote
+        // copy leave that worker with no payload RPC. No physical I/O has begun.
+        if (!settleHostEvictionSources(request, REMOTE_HOST_WRITE_SETTLEMENT_RESERVE)) {
+            settleHostEvictionSources(request, REMOTE_HOST_WRITE_SETTLEMENT_ROLLBACK);
+            throw std::runtime_error("KVCM HOST source reservation was not confirmed");
+        }
+
+        std::vector<std::string> source_tags;
+        for (const auto& key_handles : request.handles) {
+            for (const StorageBlockHandle& handle : key_handles) {
+                if (std::find(source_tags.begin(), source_tags.end(), handle.tag) == source_tags.end()) {
+                    source_tags.push_back(handle.tag);
+                }
+            }
+        }
+        const bool needs_single_tag_writes = !source_tags.empty()
+                                             && topology_->group(source_tags.front()).policy.group_type !=
+                                                    CacheGroupType::FULL;
+        try {
+            if (source_tags.size() <= 1 || !needs_single_tag_writes) {
+                writeExpandedRequest(request);
+            } else {
+                for (const std::string& source_tag : source_tags) {
+                    StorageRequest tag_request = request;
+                    for (auto& key_handles : tag_request.handles) {
+                        key_handles.erase(std::remove_if(key_handles.begin(),
+                                                         key_handles.end(),
+                                                         [&](const StorageBlockHandle& handle) {
+                                                             return handle.tag != source_tag;
+                                                         }),
+                                          key_handles.end());
+                    }
+                    writeExpandedRequest(tag_request);
+                }
+            }
+        } catch (const StorageOperationCompletionUnknown&) {
+            throw;
+        } catch (...) {
+            settleHostEvictionSources(request, REMOTE_HOST_WRITE_SETTLEMENT_ROLLBACK);
+            throw;
+        }
+        settleHostEvictionSources(request, REMOTE_HOST_WRITE_SETTLEMENT_COMMIT);
+    }
+
+    void writeExpandedRequest(const StorageRequest& request) {
         RTP_LLM_CHECK_WITH_INFO(parallelism_config_.tp_rank == 0,
                                 "KVCM metadata write must run on tp rank 0, got %ld",
                                 parallelism_config_.tp_rank);
@@ -383,6 +445,10 @@ public:
         if (valid_keys_size == 0) {
             return;
         }
+        RTP_LLM_CHECK_WITH_INFO(request.host_write_source_paths.empty()
+                                    || (request.source_tier == Tier::HOST
+                                        && request.host_write_source_paths.size() == valid_keys_size),
+                                "HOST source path count does not match remote key count");
         CacheKeysType            keys(request.keys->begin(), request.keys->begin() + valid_keys_size);
         std::vector<std::string> location_spec_group_names;
         RTP_LLM_CHECK_WITH_INFO(group_policy_->getNeedWriteGroups(request, valid_keys_size, location_spec_group_names),
@@ -473,6 +539,15 @@ public:
                     remote->set_host_source(host_source);
                     appendTransfer(*remote, info->second, handle->block, location_spec.uri);
                     remote->add_coordinate_ids(static_cast<uint32_t>(key_idx));
+                    if (host_source && !request.host_write_source_paths.empty()) {
+                        const auto& source_path = request.host_write_source_paths.at(key_idx);
+                        auto*       remote_path = remote->add_host_write_source_paths();
+                        for (const CacheKeyType key : source_path.local_cache_keys) {
+                            remote_path->add_local_cache_keys(key);
+                        }
+                        remote_path->set_coordinate(source_path.coordinate);
+                        remote_path->set_host_eviction_lease_id(source_path.host_eviction_lease_id);
+                    }
                     actual_uri_gather[rank].push_back(&location_spec);
                 }
             }
@@ -510,6 +585,7 @@ public:
                                              actual_locations),
                 "KVCM FinishWrite failed");
         } catch (...) {
+            const std::exception_ptr failure = std::current_exception();
             if (!finish_attempted) {
                 try {
                     if (!client_wrapper_->finishWrite("",
@@ -525,8 +601,136 @@ public:
                                         write_location.write_session_id.c_str());
                 }
             }
-            throw;
+            std::rethrow_exception(failure);
         }
+    }
+
+    bool settleHostEvictionSources(const StorageRequest& request, RemoteHostWriteSettlementPB settlement) {
+        if (request.host_write_source_paths.empty() || parallelism_config_.tp_size <= 1) {
+            return true;
+        }
+        struct SourceSettlement {
+            HostWriteSourcePath source_path;
+            std::vector<std::string> group_tags;
+        };
+        std::vector<SourceSettlement> sources;
+        for (size_t key_index = 0; key_index < request.host_write_source_paths.size(); ++key_index) {
+            const auto& source_path = request.host_write_source_paths[key_index];
+            for (const StorageBlockHandle& handle : request.handles.at(key_index)) {
+                auto found = std::find_if(sources.begin(), sources.end(), [&](const SourceSettlement& source) {
+                    return source.source_path.local_cache_keys == source_path.local_cache_keys
+                           && source.source_path.coordinate == source_path.coordinate
+                           && source.source_path.host_eviction_lease_id == source_path.host_eviction_lease_id;
+                });
+                if (found == sources.end()) {
+                    sources.push_back({source_path, {}});
+                    found = std::prev(sources.end());
+                }
+                if (std::find(found->group_tags.begin(), found->group_tags.end(), handle.tag)
+                    == found->group_tags.end()) {
+                    found->group_tags.push_back(handle.tag);
+                }
+            }
+        }
+        if (sources.empty()) {
+            return true;
+        }
+
+        std::vector<FunctionRequestPB> requests(static_cast<size_t>(parallelism_config_.tp_size));
+        initializeRequests(requests,
+                           REMOTE_OPERATION_HOST_EVICTION_SETTLEMENT,
+                           nextTraceId("host_settlement", finish_write_trace_sequence_));
+        for (size_t rank = 0; rank < requests.size(); ++rank) {
+            auto& function_request = requests[rank];
+            auto* remote = function_request.mutable_remote_request();
+            if (rank == 0) {
+                // TP0's BlockTreeEvictor owns the transaction and settles its
+                // source when the StorageBackend completion callback returns.
+                continue;
+            }
+            remote->set_host_write_settlement(settlement);
+            for (const SourceSettlement& source : sources) {
+                auto* remote_path = remote->add_host_write_source_paths();
+                for (const CacheKeyType key : source.source_path.local_cache_keys) {
+                    remote_path->add_local_cache_keys(key);
+                }
+                remote_path->set_coordinate(source.source_path.coordinate);
+                remote_path->set_host_eviction_lease_id(source.source_path.host_eviction_lease_id);
+                for (const std::string& tag : source.group_tags) {
+                    remote_path->add_group_tags(tag);
+                }
+            }
+        }
+        // Reusing the same transaction lease makes commit and rollback
+        // settlements idempotent when a broadcast response is lost.
+        constexpr size_t max_attempts = 2;
+        for (size_t attempt = 0; attempt < max_attempts; ++attempt) {
+            try {
+                (void)dispatchRequests(requests, kv_cache_config_.kvcm_put_broadcast_timeout);
+                return true;
+            } catch (const std::exception& error) {
+                if (attempt + 1 == max_attempts) {
+                    RTP_LLM_LOG_WARNING("KVCM HOST source settlement was not confirmed after %zu attempts: %s",
+                                        max_attempts,
+                                        error.what());
+                }
+            } catch (...) {
+                if (attempt + 1 == max_attempts) {
+                    RTP_LLM_LOG_WARNING(
+                        "KVCM HOST source settlement was not confirmed after %zu attempts due to an unknown error",
+                        max_attempts);
+                }
+            }
+        }
+        return false;
+    }
+
+    bool settleHostEvictionSources(const RemoteOperationRequestPB& request) {
+        if (request.op() != REMOTE_OPERATION_HOST_EVICTION_SETTLEMENT) {
+            return false;
+        }
+        if (request.host_write_source_paths().empty()
+            && request.host_write_settlement() == REMOTE_HOST_WRITE_SETTLEMENT_UNSPECIFIED) {
+            return true;
+        }
+        if (request.host_write_settlement() == REMOTE_HOST_WRITE_SETTLEMENT_UNSPECIFIED
+            || !host_write_settlement_resolver_) {
+            return false;
+        }
+        HostWriteSettlementOutcome outcome;
+        switch (request.host_write_settlement()) {
+            case REMOTE_HOST_WRITE_SETTLEMENT_COMMIT:
+                outcome = HostWriteSettlementOutcome::COMMIT;
+                break;
+            case REMOTE_HOST_WRITE_SETTLEMENT_ROLLBACK:
+                outcome = HostWriteSettlementOutcome::ROLLBACK;
+                break;
+            case REMOTE_HOST_WRITE_SETTLEMENT_UNKNOWN:
+                outcome = HostWriteSettlementOutcome::UNKNOWN;
+                break;
+            case REMOTE_HOST_WRITE_SETTLEMENT_RESERVE:
+                outcome = HostWriteSettlementOutcome::RESERVE;
+                break;
+            default:
+                return false;
+        }
+        for (const auto& source_path : request.host_write_source_paths()) {
+            if (source_path.local_cache_keys().empty() || source_path.group_tags().empty()
+                || source_path.coordinate() >= static_cast<uint32_t>(source_path.local_cache_keys_size())
+                || source_path.host_eviction_lease_id() == 0) {
+                return false;
+            }
+            const CacheKeysType keys(source_path.local_cache_keys().begin(), source_path.local_cache_keys().end());
+            const std::vector<std::string> tags(source_path.group_tags().begin(), source_path.group_tags().end());
+            if (!host_write_settlement_resolver_(keys,
+                                                 tags,
+                                                 source_path.coordinate(),
+                                                 source_path.host_eviction_lease_id(),
+                                                 outcome)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     bool execute(const RemoteOperationRequestPB& request,
@@ -609,12 +813,18 @@ public:
     }
 
     void shutdown() noexcept {
-        if (client_wrapper_) {
+        if (client_wrapper_ && quarantine_active_.load(std::memory_order_acquire)) {
+            // An SDK destructor does not prove that an unconfirmed PACE transfer
+            // stopped using its registered memory. Keep the registering client
+            // and its PACE MRs alive with the quarantined HOST backing.
+            retainClientWrapperUntilProcessExit(client_wrapper_);
+        } else if (client_wrapper_) {
             client_wrapper_->shutdown();
         }
     }
 
     void reportQuarantineState(uint64_t generation, size_t task_count, size_t block_count) noexcept {
+        quarantine_active_.store(task_count != 0, std::memory_order_release);
         reportQuarantineMetrics(generation, task_count, block_count);
     }
 
@@ -983,6 +1193,7 @@ private:
         });
         registration_tags_.clear();
         std::vector<kvcm::ClientWrapper::PoolRegistration> registrations;
+        std::unordered_set<const HostBlockPool*> registered_host_pools;
         std::vector<std::string>                             registration_tags;
         registrations.reserve(ordered_groups.size());
         registration_tags.reserve(ordered_groups.size());
@@ -1010,6 +1221,8 @@ private:
                 gdr_enabled_ ? pool->getAllocationSizeBytes() : pool->getTotalSizeBytes();
             kvcm::ClientWrapper::PoolRegistration registration{
                 {pool->getBaseAddress(), registration_size}, registration_spec};
+            kv_cache_manager::ClientMemoryRegistrations memory_registrations;
+            bool memory_registration_present = false;
             if (gdr_enabled_) {
 #if USING_CUDA
                 if (pool->where() != MemoryType::MEMORY_GPU || !pool->usesDedicatedDeviceAllocation()
@@ -1030,14 +1243,28 @@ private:
                                       page_size);
                     return {};
                 }
-                kv_cache_manager::ClientMemoryRegistrations memory_registrations;
                 memory_registrations.gpu.push_back(
                     {pool->getBaseAddress(), pool->getAllocationSizeBytes(), pool->deviceIndex()});
-                registration.memory_registrations = std::move(memory_registrations);
+                memory_registration_present = true;
 #else
                 RTP_LLM_LOG_ERROR("RemoteCache GDR requires a CUDA build");
                 return {};
 #endif
+            }
+            const auto& host_pool = host_pool_resolver_(tag);
+            if (host_pool && host_pool->sharedMemoryFd() >= 0 && registered_host_pools.emplace(host_pool.get()).second) {
+                const auto base = host_pool->sharedMemoryBase();
+                const auto size = host_pool->sharedMemorySize();
+                if (base == nullptr || size == 0) {
+                    RTP_LLM_LOG_ERROR("RemoteCache HOST registration has an invalid shared span for tag=%s", tag.c_str());
+                    return {};
+                }
+                memory_registrations.host_regions.push_back(
+                    {base, size, host_pool->sharedMemoryFd()});
+                memory_registration_present = true;
+            }
+            if (memory_registration_present) {
+                registration.memory_registrations = std::move(memory_registrations);
             }
             registration_tags.push_back(tag);
             registrations.push_back(std::move(registration));
@@ -1299,8 +1526,10 @@ private:
     kvcm::GroupPolicy::SourceResolver buffer_resolver_;
     kvcm::GroupPolicy::LocationSpecGroups location_spec_groups_;
     std::shared_ptr<WorkerCacheIOFence> worker_fence_;
+    std::atomic<bool> quarantine_active_{false};
     std::function<const DeviceBlockPoolPtr&(const std::string&)> pool_resolver_;
     std::function<const std::shared_ptr<HostBlockPool>&(const std::string&)> host_pool_resolver_;
+    StorageBackend::HostWriteSettlementResolver host_write_settlement_resolver_;
     // Preserve KVCM's operation-local, one-based request
     // order. Abort and finish share a sequence because both call FinishWrite.
     std::atomic<uint64_t> match_trace_sequence_{1};
@@ -1349,7 +1578,8 @@ bool KVCMStorageBackend::initImpl() {
             return resolver(layer_id, tag, block_id);
         },
         [this](const std::string& tag) -> const DeviceBlockPoolPtr& { return devicePool(tag); },
-        [this](const std::string& tag) -> const std::shared_ptr<HostBlockPool>& { return hostPool(tag); });
+        [this](const std::string& tag) -> const std::shared_ptr<HostBlockPool>& { return hostPool(tag); },
+        hostWriteSettlementResolver());
 }
 
 StorageMatchResult KVCMStorageBackend::matchImpl(const StorageRequest& request) {
@@ -1375,13 +1605,23 @@ void KVCMStorageBackend::onQuarantineChanged(uint64_t generation, size_t task_co
 
 bool KVCMStorageBackend::execute(const RemoteOperationRequestPB& request, RemoteOperationResponsePB& response) {
     response.Clear();
+    if (request.op() == REMOTE_OPERATION_HOST_EVICTION_SETTLEMENT) {
+        response.set_transfer_status(REMOTE_TRANSFER_STATUS_FAILED);
+        StorageRequest settlement_request;
+        settlement_request.keys = std::make_shared<CacheKeysType>();
+        return runTransfer(std::move(settlement_request), impl_->allocationOwner(), [&](StorageWriteTask) {
+            const bool success = impl_->settleHostEvictionSources(request);
+            response.set_transfer_status(success ? REMOTE_TRANSFER_STATUS_SUCCESS : REMOTE_TRANSFER_STATUS_FAILED);
+            return success;
+        });
+    }
     const bool payload = request.op() == REMOTE_OPERATION_READ || request.op() == REMOTE_OPERATION_WRITE;
     if (payload) {
         response.set_transfer_status(REMOTE_TRANSFER_STATUS_FAILED);
     }
     try {
         RemoteOperationRequestPB local_request = request;
-        StorageWriteTask host_pins;
+        std::vector<StorageWriteTask> host_pins;
         StorageRequest transfer;
         const bool host_write = request.op() == REMOTE_OPERATION_WRITE && request.host_source();
         if (host_write) {
@@ -1394,17 +1634,53 @@ bool KVCMStorageBackend::execute(const RemoteOperationRequestPB& request, Remote
                 if (!hostWriteResolver() || request.cache_keys_size() == 0) {
                     return false;
                 }
-                const CacheKeysType keys(request.cache_keys().begin(), request.cache_keys().end());
-                const std::vector<std::string> tags(request.group_tags().begin(), request.group_tags().end());
-                const std::vector<uint32_t> coordinates(request.coordinate_ids().begin(), request.coordinate_ids().end());
-                auto resolved = hostWriteResolver()(keys, tags, coordinates, /*timeout_ms=*/1000);
-                if (!resolved.pins || resolved.local_blocks.size() != tags.size()) {
+                const bool has_source_paths = request.host_write_source_paths_size() != 0;
+                if (has_source_paths && request.host_write_source_paths_size() != request.group_tags_size()) {
                     return false;
                 }
-                host_pins = std::move(resolved.pins);
                 local_request.clear_block_ids();
-                for (const auto block : resolved.local_blocks) {
-                    local_request.add_block_ids(block);
+                if (has_source_paths) {
+                    for (int i = 0; i < request.group_tags_size(); ++i) {
+                        const auto& source_path = request.host_write_source_paths(i);
+                        if (source_path.local_cache_keys().empty()
+                            || source_path.coordinate() >= static_cast<uint32_t>(source_path.local_cache_keys_size())
+                            || source_path.host_eviction_lease_id() == 0) {
+                            return false;
+                        }
+                        const CacheKeysType local_keys(source_path.local_cache_keys().begin(),
+                                                       source_path.local_cache_keys().end());
+                        const std::vector<std::string> tags{request.group_tags(i)};
+                        const std::vector<uint32_t> coordinates{source_path.coordinate()};
+                        auto resolved = hostWriteResolver()(local_keys,
+                                                            tags,
+                                                            coordinates,
+                                                            /*timeout_ms=*/1000,
+                                                            /*keys_are_local=*/true,
+                                                            source_path.host_eviction_lease_id());
+                        if (!resolved.pins || resolved.local_blocks.size() != 1) {
+                            return false;
+                        }
+                        host_pins.push_back(std::move(resolved.pins));
+                        local_request.add_block_ids(resolved.local_blocks.front());
+                    }
+                } else {
+                    const CacheKeysType keys(request.cache_keys().begin(), request.cache_keys().end());
+                    const std::vector<std::string> tags(request.group_tags().begin(), request.group_tags().end());
+                    const std::vector<uint32_t> coordinates(request.coordinate_ids().begin(),
+                                                            request.coordinate_ids().end());
+                    auto resolved = hostWriteResolver()(keys,
+                                                        tags,
+                                                        coordinates,
+                                                        /*timeout_ms=*/1000,
+                                                        /*keys_are_local=*/false,
+                                                        /*host_eviction_lease_id=*/0);
+                    if (!resolved.pins || resolved.local_blocks.size() != tags.size()) {
+                        return false;
+                    }
+                    host_pins.push_back(std::move(resolved.pins));
+                    for (const auto block : resolved.local_blocks) {
+                        local_request.add_block_ids(block);
+                    }
                 }
             }
             transfer.keys = std::make_shared<CacheKeysType>();
@@ -1423,11 +1699,15 @@ bool KVCMStorageBackend::execute(const RemoteOperationRequestPB& request, Remote
         const auto invoke = [&](StorageWriteTask) {
             const bool success = impl_->execute(local_request, response);
             if (response.transfer_status() == REMOTE_TRANSFER_STATUS_TIMEOUT) {
-                host_pins.quarantine(/*sdk_can_drain=*/false);
+                for (auto& pins : host_pins) {
+                    pins.quarantine(/*sdk_can_drain=*/false);
+                }
                 throw StorageOperationTimeout("KVCM worker transfer timed out", false);
             }
             if (response.transfer_status() == REMOTE_TRANSFER_STATUS_COMPLETION_UNKNOWN) {
-                host_pins.quarantine(/*sdk_can_drain=*/false);
+                for (auto& pins : host_pins) {
+                    pins.quarantine(/*sdk_can_drain=*/false);
+                }
                 throw StorageOperationCompletionUnknown("KVCM worker transfer completion is unknown", false);
             }
             return success;

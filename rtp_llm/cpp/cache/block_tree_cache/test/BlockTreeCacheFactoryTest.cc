@@ -2097,6 +2097,7 @@ TEST_F(BlockTreeCacheFactoryTest, FullPrefixScanConfigPropagatesAndValidates) {
         auto cache     = createBlockTreeCache(config, scan_enabled, allocator, owner);
         ASSERT_NE(cache, nullptr);
         EXPECT_EQ(cache->config().full_prefix_scan_interval_ms, 5000);
+        EXPECT_TRUE(cache->config().remote_host_eviction_owner);
     }
     // TP follower: the tree is a replica, so the scanner stays off.
     {
@@ -2110,6 +2111,7 @@ TEST_F(BlockTreeCacheFactoryTest, FullPrefixScanConfigPropagatesAndValidates) {
         auto cache     = createBlockTreeCache(config, scan_enabled, allocator, follower);
         ASSERT_NE(cache, nullptr);
         EXPECT_EQ(cache->config().full_prefix_scan_interval_ms, 0);
+        EXPECT_FALSE(cache->config().remote_host_eviction_owner);
     }
     // FFN service: it does not schedule normal requests, so it owns no mutable tree.
     {
@@ -2122,6 +2124,7 @@ TEST_F(BlockTreeCacheFactoryTest, FullPrefixScanConfigPropagatesAndValidates) {
         auto cache     = createBlockTreeCache(config, scan_enabled, allocator, ffn);
         ASSERT_NE(cache, nullptr);
         EXPECT_EQ(cache->config().full_prefix_scan_interval_ms, 0);
+        EXPECT_FALSE(cache->config().remote_host_eviction_owner);
     }
 
     for (const int64_t invalid_interval : {int64_t{-1}, int64_t{999}, std::numeric_limits<int64_t>::max()}) {

@@ -39,6 +39,8 @@ struct BlockTreeCacheConfig {
     bool enable_host_cache{false};
     bool enable_disk_cache{false};
     bool enable_remote_cache{false};
+    // Rank 0 owns KVCM remote eviction; worker ranks resolve its source paths.
+    bool remote_host_eviction_owner{true};
 
     // ---- Per-tier watermark ----
     using TierWatermark = rtp_llm::TierWatermark;
@@ -128,14 +130,16 @@ public:
     void                 insert(const CacheKeysType&                              cache_keys,
                                 const std::vector<std::vector<GroupSetResource>>& resources,
                                 Tier                                              target_tier,
-                                std::shared_ptr<const StorageRequest>             remote_write = nullptr);
+                                std::shared_ptr<const StorageRequest>             remote_write = nullptr,
+                                const std::vector<CacheKeysType>&                 remote_key_groups = {});
     // Returns the resident key-prefix count, including nodes that were already resident.
     size_t insert(const CacheKeysType&                              cache_keys,
                   const std::vector<std::vector<GroupSetResource>>& resources,
                   Tier                                              target_tier,
                   bool                                              is_resident,
                   bool                                              write_remote_from_device = false,
-                  std::shared_ptr<const StorageRequest>             remote_write             = nullptr);
+                  std::shared_ptr<const StorageRequest>             remote_write             = nullptr,
+                  const std::vector<CacheKeysType>&                 remote_key_groups         = {});
     // Directly reclaim up to num_blocks device blocks belonging to one group set
     // (target_tier = NONE, content dropped). Returns the number actually freed.
     int evictForGroup(std::string_view group_tag, size_t num_blocks);
@@ -155,7 +159,13 @@ public:
     StorageBackend::HostWriteResolution resolveHostWrite(const CacheKeysType&            keys,
                                                          const std::vector<std::string>& tags,
                                                          const std::vector<uint32_t>&    coordinates,
-                                                         int                             timeout_ms);
+                                                         int                             timeout_ms,
+                                                         uint64_t                        host_eviction_lease_id = 0);
+    bool settleRemoteHostWriteSource(const CacheKeysType&             local_cache_keys,
+                                     const std::vector<std::string>& group_tags,
+                                     uint32_t                        coordinate,
+                                     uint64_t                        host_eviction_lease_id,
+                                     HostWriteSettlementOutcome     outcome);
 
     // Accessors
     BlockTree* tree() const {

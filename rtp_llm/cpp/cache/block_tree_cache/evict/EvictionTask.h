@@ -2,12 +2,15 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "rtp_llm/cpp/cache/block_tree_cache/transfer/TransferTypes.h"
 #include "rtp_llm/cpp/utils/TimeUtil.h"
 
 namespace rtp_llm {
+
+class StorageWriteTask;
 
 struct EvictionTimingSnapshot {
     EvictionTimingSnapshot() = default;
@@ -27,6 +30,12 @@ struct EvictionTransferTask {
     explicit EvictionTransferTask(TransferTask task): transfer_task(std::move(task)) {}
     EvictionTransferTask(TransferTask task, std::vector<EvictionTimingSnapshot> timing_snapshots):
         transfer_task(std::move(task)), timings(std::move(timing_snapshots)) {}
+    EvictionTransferTask(TransferTask task,
+                         std::vector<EvictionTimingSnapshot> timing_snapshots,
+                         std::shared_ptr<StorageWriteTask> host_remote_write):
+        transfer_task(std::move(task)),
+        timings(std::move(timing_snapshots)),
+        host_remote_write(std::move(host_remote_write)) {}
 
     const std::vector<TransferDescriptor>& descriptors() const {
         return transfer_task.descriptors();
@@ -38,6 +47,7 @@ struct EvictionTransferTask {
 
     TransferTask                        transfer_task;
     std::vector<EvictionTimingSnapshot> timings;
+    std::shared_ptr<StorageWriteTask>    host_remote_write;
 };
 
 struct EvictionDropTask {

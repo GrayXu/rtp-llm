@@ -543,6 +543,9 @@ bool FullOtherGroupPolicy::init() {
 bool FullOtherGroupPolicy::getNeedWriteGroups(const StorageRequest&     request,
                                               size_t                    valid_keys_size,
                                               std::vector<std::string>& location_spec_group_names) const {
+    if (request.source_tier == Tier::HOST && !request.host_write_source_paths.empty()) {
+        return DefaultLayerGroupPolicy::getNeedWriteGroups(request, valid_keys_size, location_spec_group_names);
+    }
     if (std::any_of(other_group_tags_.begin(), other_group_tags_.end(), [&](const auto& tag) {
             return topology_.group(tag).policy.group_type == CacheGroupType::SWA;
         })) {
@@ -681,12 +684,53 @@ std::string FullOtherGroupPolicy::debugString() const {
 bool FullLinearLayerGroupPolicy::filterNeedLoadLocations(const kv_cache_manager::Locations& locations,
                                                          LocationsView&                     locations_view,
                                                          kv_cache_manager::BlockMaskOffset  block_mask) const {
+    std::vector<SpecNames> other_only_specs;
+    for (const auto& [group_id, group] : groups_) {
+        if (group.is_full) {
+            continue;
+        }
+        SpecNames expected;
+        for (const auto& [spec_name, info] : spec_name_to_info_) {
+            if (info.group_id == group_id) {
+                expected.push_back(spec_name);
+            }
+        }
+        if (!expected.empty()) {
+            std::sort(expected.begin(), expected.end());
+            other_only_specs.push_back(std::move(expected));
+        }
+    }
+
     LocationsView filtered_locations;
-    bool          exist_linear_location = false;
+    bool          exist_other_location = false;
     for (size_t i = locations.size(); i-- > block_mask;) {
         const auto& location = locations[i];
+        bool        matched_other_only = false;
+        for (const SpecNames& expected : other_only_specs) {
+            if (location.size() != expected.size()) {
+                continue;
+            }
+            const bool all_other = std::all_of(location.begin(), location.end(), [&](const auto& spec) {
+                return std::find(expected.begin(), expected.end(), spec.spec_name) != expected.end();
+            });
+            if (!all_other) {
+                continue;
+            }
+            if (filtered_locations.size() < i + 1) {
+                filtered_locations.resize(i + 1);
+            }
+            if (!setLocationView(location, expected, expected, "other-only", filtered_locations[i])) {
+                return false;
+            }
+            exist_other_location = true;
+            matched_other_only   = true;
+            break;
+        }
+        if (matched_other_only) {
+            continue;
+        }
         if (location.size() == full_spec_names_.size()) {
-            if (exist_linear_location) {
+            if (exist_other_location) {
                 if (!setLocationView(location, full_spec_names_, full_spec_names_, "full", filtered_locations[i])) {
                     return false;
                 }
@@ -696,7 +740,7 @@ bool FullLinearLayerGroupPolicy::filterNeedLoadLocations(const kv_cache_manager:
                 }
             }
         } else if (location.size() == full_other_spec_names_.size()) {
-            if (!exist_linear_location) {
+            if (!exist_other_location) {
                 filtered_locations.resize(i + 1);
                 if (!setLocationView(location,
                                      full_other_spec_names_,
@@ -705,7 +749,7 @@ bool FullLinearLayerGroupPolicy::filterNeedLoadLocations(const kv_cache_manager:
                                      filtered_locations[i])) {
                     return false;
                 }
-                exist_linear_location = true;
+                exist_other_location = true;
             } else {
                 if (!setLocationView(
                         location, full_other_spec_names_, full_spec_names_, "full+linear", filtered_locations[i])) {

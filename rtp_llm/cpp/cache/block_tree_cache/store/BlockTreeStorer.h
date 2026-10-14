@@ -41,7 +41,8 @@ public:
                                  bool                                              is_resident,
                                  size_t&                                           resident_prefix_length,
                                  bool                                              write_remote_from_device,
-                                 std::shared_ptr<const StorageRequest>             remote_write = nullptr);
+                                 std::shared_ptr<const StorageRequest>             remote_write = nullptr,
+                                 const std::vector<CacheKeysType>&                 remote_key_groups = {});
     void             stopAdmissionLocked();
 
 private:
@@ -51,13 +52,15 @@ private:
     void             publishDeviceLocked(const CacheKeysType&                              cache_keys,
                                          const std::vector<std::vector<GroupSetResource>>& resources,
                                          bool                                              is_resident,
-                                         size_t&                                           resident_prefix_length);
+                                         size_t&                                           resident_prefix_length,
+                                         const std::vector<CacheKeysType>&                 remote_key_groups);
     StorageRequest   makeStorageRequest(const CacheKeysType&                              cache_keys,
                                         const std::vector<std::vector<GroupSetResource>>& resources,
                                         Tier source_tier = Tier::DEVICE) const;
     void             submitLowerTierLocked(const CacheKeysType&                              cache_keys,
                                            const std::vector<std::vector<GroupSetResource>>& resources,
-                                           Tier                                              target_tier);
+                                           Tier                                              target_tier,
+                                           const std::vector<CacheKeysType>&                 remote_key_groups);
     void             runStoreTask(const StoreTaskPtr& task);
     void             scheduleStoreSettlement(const StoreTaskPtr& task, ErrorInfo error);
     void             settleTask(StoreTask& task, bool copy_success);

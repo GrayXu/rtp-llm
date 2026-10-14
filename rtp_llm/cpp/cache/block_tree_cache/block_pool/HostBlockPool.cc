@@ -101,7 +101,7 @@ bool HostBlockPool::init() {
 
     // block 0's slot is allocated as backing but is never handed out by malloc().
     const size_t total_bytes = cfg.physical_block_count * cfg.stride_bytes;
-    backing_.emplace(total_bytes, cfg.alignment, cfg.pool_name);
+    backing_.emplace(total_bytes, cfg.alignment, cfg.pool_name, cfg.shared_memory_for_remote);
     markHostBlockPoolDontDump(cfg.pool_name.c_str(), backing_->data(), total_bytes);
     static constexpr double kBytesPerMB = 1024.0 * 1024.0;
     RTP_LLM_LOG_INFO("backing selected: pool_name=%s payload_bytes=%zu stride_bytes=%zu "
@@ -136,6 +136,18 @@ size_t HostBlockPool::strideBytes() const {
 
 size_t HostBlockPool::blockSizeBytes() const {
     return payloadBytes();
+}
+
+int HostBlockPool::sharedMemoryFd() const {
+    return backing_ ? backing_->fd() : -1;
+}
+
+void* HostBlockPool::sharedMemoryBase() const {
+    return sharedMemoryFd() >= 0 ? backing_->data() : nullptr;
+}
+
+size_t HostBlockPool::sharedMemorySize() const {
+    return sharedMemoryFd() >= 0 ? backing_->size() : 0;
 }
 
 void HostBlockPool::markUncertainRemoteIo() {

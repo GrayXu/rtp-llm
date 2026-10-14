@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include <sys/stat.h>
+
 #include "gtest/gtest.h"
 
 namespace rtp_llm {
@@ -158,6 +160,37 @@ TEST(HostBlockPoolTest, HostBufferMemoryIsUsableAndDistinct) {
         ASSERT_EQ(bytes_b[i], kPatternB) << "mismatch at byte " << i << " of block B";
     }
 }
+
+#if USING_CUDA && defined(__linux__)
+TEST(HostBlockPoolTest, RemotePoolsUseIndependentSharedBackingRegions) {
+    auto first_config = makeConfig(/*physical_block_count=*/4,
+                                   /*payload_bytes=*/1024,
+                                   /*stride_bytes=*/4096);
+    first_config->shared_memory_for_remote = true;
+    auto second_config = makeConfig(/*physical_block_count=*/4,
+                                    /*payload_bytes=*/1024,
+                                    /*stride_bytes=*/4096);
+    second_config->pool_name = "host_second";
+    second_config->shared_memory_for_remote = true;
+    HostBlockPool first(first_config);
+    HostBlockPool second(second_config);
+
+    ASSERT_TRUE(first.init());
+    ASSERT_TRUE(second.init());
+    ASSERT_GE(first.sharedMemoryFd(), 0);
+    ASSERT_GE(second.sharedMemoryFd(), 0);
+    EXPECT_NE(first.sharedMemoryFd(), second.sharedMemoryFd());
+    EXPECT_EQ(static_cast<uint8_t*>(first.sharedMemoryBase()) + first.strideBytes(), first.blockBuffer(1).addr);
+    EXPECT_EQ(static_cast<uint8_t*>(second.sharedMemoryBase()) + second.strideBytes(), second.blockBuffer(1).addr);
+    EXPECT_EQ(first.sharedMemorySize(), 4u * 4096u);
+    EXPECT_EQ(second.sharedMemorySize(), 4u * 4096u);
+
+    struct stat first_stat {}, second_stat {};
+    ASSERT_EQ(fstat(first.sharedMemoryFd(), &first_stat), 0);
+    ASSERT_EQ(fstat(second.sharedMemoryFd(), &second_stat), 0);
+    EXPECT_NE(first_stat.st_ino, second_stat.st_ino);
+}
+#endif
 
 TEST(HostBlockPoolTest, LastTreeRefReleasesBlock) {
     auto          config = makeConfig();

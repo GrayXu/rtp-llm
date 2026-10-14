@@ -6,16 +6,19 @@
 #include <condition_variable>
 #include <functional>
 #include <future>
+#include <iterator>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCache.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/group_set/FullGroupSet.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/group_set/LinearGroupSet.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/test/BlockTreeCacheTestUtils.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/transfer/test/PerRankBlockTransferEngineTestUtils.h"
 
@@ -31,6 +34,82 @@ public:
 namespace rtp_llm {
 namespace {
 using namespace block_tree_cache_test;
+
+class InlineStorageBackendExecutor final: public StorageBackendExecutor {
+public:
+    bool start() override {
+        return true;
+    }
+    bool submit(Task task) override {
+        task();
+        return true;
+    }
+    void shutdown() noexcept override {}
+};
+
+class CapturingRemoteStorageBackend final: public StorageBackend {
+public:
+    enum class Outcome {
+        SUCCESS,
+        FAILURE,
+        COMPLETION_UNKNOWN,
+    };
+
+    explicit CapturingRemoteStorageBackend(Outcome outcome = Outcome::SUCCESS):
+        StorageBackend(std::make_shared<InlineStorageBackendExecutor>()), outcome_(outcome) {}
+    ~CapturingRemoteStorageBackend() override {
+        shutdown();
+    }
+
+    std::vector<StorageRequest> requests() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return requests_;
+    }
+
+    std::vector<size_t> hostStoreReferencesAtWrite() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return host_store_references_at_write_;
+    }
+
+protected:
+    bool initImpl() override {
+        return true;
+    }
+    StorageMatchResult matchImpl(const StorageRequest& request) override {
+        return {request.handles.size(), nullptr};
+    }
+    void readImpl(const StorageRequest&, const std::shared_ptr<StorageBackendMatchMeta>&) override {}
+    void writeImpl(const StorageRequest& request) override {
+        std::vector<size_t> host_store_references;
+        if (request.source_tier == Tier::HOST) {
+            for (const auto& key_handles : request.handles) {
+                for (const auto& handle : key_handles) {
+                    host_store_references.push_back(
+                        hostPool(handle.tag)->referencedBlocksNum(BlockTreeRefType::STORE));
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            requests_.push_back(request);
+            host_store_references_at_write_.push_back(
+                host_store_references.empty() ? 0 : *std::min_element(host_store_references.begin(),
+                                                                       host_store_references.end()));
+        }
+        if (outcome_ == Outcome::FAILURE) {
+            throw std::runtime_error("remote write failed");
+        }
+        if (outcome_ == Outcome::COMPLETION_UNKNOWN) {
+            throw StorageOperationCompletionUnknown("remote write completion unknown", false);
+        }
+    }
+
+private:
+    const Outcome                    outcome_;
+    mutable std::mutex               mutex_;
+    std::vector<StorageRequest>      requests_;
+    std::vector<size_t>              host_store_references_at_write_;
+};
 
 std::shared_ptr<LoadAsyncContext> getLoadContext(const BlockTreeMatchResult& result) {
     return std::dynamic_pointer_cast<LoadAsyncContext>(result.async_context);
@@ -747,6 +826,397 @@ TEST_F(BlockTreeCacheIntegrationTest, HostDiskOnlyLifecycle) {
     cache.reset();
     EXPECT_EQ(host_pool->freeBlocksNum(), 8u);
     EXPECT_EQ(disk_pool->freeBlocksNum(), 8u);
+}
+
+TEST_F(BlockTreeCacheIntegrationTest, HostRemoteCommitFallsBackToRemoteOnlyWhenDiskCopyFails) {
+    constexpr size_t payload_bytes = 16;
+    auto device_pool = makeDevicePool({{payload_bytes, 0}}, 1, "host_remote_disk_failure");
+    auto host_pool   = makeHostPool(payload_bytes, 1);
+    auto disk_pool   = makeDiskPool(payload_bytes, 2, std::make_unique<MemoryDiskBlockIO>());
+    ASSERT_NE(device_pool, nullptr);
+    ASSERT_NE(host_pool, nullptr);
+    ASSERT_NE(disk_pool, nullptr);
+    auto group = std::make_shared<FullGroupSet>(std::vector<DeviceBlockPoolPtr>{device_pool}, host_pool, disk_pool);
+
+    BlockTreeCacheConfig config;
+    config.enable_device_cache = false;
+    config.enable_host_cache = true;
+    config.enable_disk_cache = true;
+    config.enable_remote_cache = true;
+    config.task_pool_size = 1;
+    auto backend = std::make_shared<CapturingRemoteStorageBackend>();
+    auto cache = makeBlockTreeCacheForTest({group}, config, backend);
+    ASSERT_NE(cache, nullptr);
+    auto scripted_copy = std::make_shared<ScriptedPerRankBlockTransferEngine>(
+        cache->groupSets(), /*perform_successful_transfers=*/true, cache->isDiskCacheEnabled());
+    BlockTreeCacheTestPeer::setPerRankBlockTransferEngineForTest(*cache, scripted_copy);
+
+    const BlockIdxType host_block = group->allocateSingleBlock(Tier::HOST, BlockTreeRefType::CACHE);
+    ASSERT_FALSE(isNullBlockIdx(host_block));
+    std::vector<std::vector<GroupSetResource>> resources(1, std::vector<GroupSetResource>(1));
+    resources[0][0].host_block = host_block;
+    ASSERT_TRUE(insertGroupSetResources(*cache, {100}, resources));
+
+    scripted_copy->enqueue(/*success=*/false);
+    BlockTreeCacheTestPeer::setTierWatermarkForTest(*cache, Tier::HOST, 0.01);
+    BlockTreeCacheTestPeer::runMaintenanceForTest(*cache);
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+
+    const auto requests = backend->requests();
+    const auto eviction_write = std::find_if(requests.begin(), requests.end(), [](const StorageRequest& request) {
+        return request.source_tier == Tier::HOST && !request.host_write_source_paths.empty();
+    });
+    ASSERT_NE(eviction_write, requests.end());
+    ASSERT_FALSE(scripted_copy->descriptors().empty());
+    EXPECT_EQ(scripted_copy->descriptors().front().target_tier, Tier::DISK);
+    EXPECT_EQ(host_pool->usedBlocksNum(), 0u);
+    EXPECT_EQ(host_pool->referencedBlocksNum(BlockTreeRefType::CACHE), 0u);
+    EXPECT_EQ(disk_pool->usedBlocksNum(), 0u);
+    EXPECT_EQ(disk_pool->freeBlocksNum(), 2u);
+}
+
+TEST_F(BlockTreeCacheIntegrationTest, HostWatermarkEvictionCoexistsWithDeviceDualWrite) {
+    constexpr size_t payload_bytes = 16;
+    for (bool dual_write : {false, true}) {
+        auto device_pool = makeDevicePool({{payload_bytes, 0}}, 2, "host_remote_dual_write");
+        auto host_pool   = makeHostPool(payload_bytes, 2);
+        ASSERT_NE(device_pool, nullptr);
+        ASSERT_NE(host_pool, nullptr);
+        auto group = std::make_shared<FullGroupSet>(std::vector<DeviceBlockPoolPtr>{device_pool}, host_pool, nullptr);
+
+        BlockTreeCacheConfig config;
+        config.enable_device_cache = false;
+        config.enable_host_cache = true;
+        config.enable_remote_cache = true;
+        config.watermark_host = {/*low_ratio=*/0.01, /*high_ratio=*/0.5};
+        config.task_pool_size = 1;
+        config.max_descriptors_per_transfer_batch = 2;
+        auto backend = std::make_shared<CapturingRemoteStorageBackend>();
+        auto cache = makeBlockTreeCacheForTest({group}, config, backend);
+        ASSERT_NE(cache, nullptr);
+        auto scripted_copy = std::make_shared<ScriptedPerRankBlockTransferEngine>(
+            cache->groupSets(), /*perform_successful_transfers=*/true, cache->isDiskCacheEnabled());
+        BlockTreeCacheTestPeer::setPerRankBlockTransferEngineForTest(*cache, scripted_copy);
+
+        const MultiNodeBlocks device_blocks = allocateDeviceBlocksForTest(*group, 1, BlockTreeRefType::CACHE);
+        ASSERT_EQ(device_blocks.size(), 1u);
+        std::vector<std::vector<GroupSetResource>> resources(1, std::vector<GroupSetResource>(1));
+        resources[0][0].device_blocks = device_blocks.front();
+        cache->insert({100}, resources, Tier::HOST, /*is_resident=*/false, dual_write);
+        unreferenceDeviceBlocksForTest(*group, device_blocks, BlockTreeRefType::CACHE);
+        BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+
+        const auto requests = backend->requests();
+        EXPECT_EQ(requests.size(), dual_write ? 2u : 1u);
+        const auto host_write = std::find_if(requests.begin(), requests.end(), [](const StorageRequest& request) {
+            return request.source_tier == Tier::HOST && !request.host_write_source_paths.empty();
+        });
+        ASSERT_NE(host_write, requests.end());
+        EXPECT_EQ(*host_write->keys, (CacheKeysType{100}));
+        ASSERT_EQ(host_write->host_write_source_paths.size(), 1u);
+        EXPECT_EQ(host_write->host_write_source_paths.front().local_cache_keys, (CacheKeysType{100}));
+        EXPECT_EQ(host_write->host_write_source_paths.front().coordinate, 0u);
+        EXPECT_NE(host_write->host_write_source_paths.front().host_eviction_lease_id, 0u);
+        const auto host_write_index = static_cast<size_t>(std::distance(requests.begin(), host_write));
+        EXPECT_EQ(backend->hostStoreReferencesAtWrite().at(host_write_index), 1u);
+        EXPECT_EQ(host_pool->usedBlocksNum(), 0u);
+        EXPECT_EQ(cache->getStats().device_heap_total_size, 0u);
+    }
+}
+
+TEST_F(BlockTreeCacheIntegrationTest, HostOnlyWatermarkUploadsUnrelatedTreeBranches) {
+    constexpr size_t payload_bytes = 16;
+    auto device_pool = makeDevicePool({{payload_bytes, 0}}, 2, "host_remote_unrelated_branches");
+    auto host_pool   = makeHostPool(payload_bytes, 2);
+    ASSERT_NE(device_pool, nullptr);
+    ASSERT_NE(host_pool, nullptr);
+    auto group = std::make_shared<FullGroupSet>(std::vector<DeviceBlockPoolPtr>{device_pool}, host_pool, nullptr);
+
+    BlockTreeCacheConfig config;
+    config.enable_device_cache = false;
+    config.enable_host_cache = true;
+    config.enable_remote_cache = true;
+    config.watermark_host = {/*low_ratio=*/0.01, /*high_ratio=*/1.0};
+    config.task_pool_size = 1;
+    config.max_descriptors_per_transfer_batch = 4;
+    auto backend = std::make_shared<CapturingRemoteStorageBackend>();
+    auto cache = makeBlockTreeCacheForTest({group}, config, backend);
+    ASSERT_NE(cache, nullptr);
+
+    const auto allocateHostResource = [&](BlockIdxType key) {
+        const BlockIdxType block = group->allocateSingleBlock(Tier::HOST, BlockTreeRefType::CACHE);
+        EXPECT_FALSE(isNullBlockIdx(block));
+        std::vector<std::vector<GroupSetResource>> resources(1, std::vector<GroupSetResource>(1));
+        resources[0][0].host_block = block;
+        cache->insert({key}, resources, Tier::HOST);
+        group->releaseSingleBlock(Tier::HOST, block, BlockTreeRefType::CACHE);
+    };
+    allocateHostResource(100);
+    EXPECT_EQ(backend->requests().size(), 1u);  // Explicit HOST publication.
+    allocateHostResource(200);                  // Reaching the HOST watermark schedules eviction uploads.
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+
+    const auto requests = backend->requests();
+    const auto eviction_write = std::find_if(requests.begin(), requests.end(), [](const StorageRequest& request) {
+        return request.source_tier == Tier::HOST && !request.host_write_source_paths.empty();
+    });
+    ASSERT_NE(eviction_write, requests.end());
+    EXPECT_EQ(cache->getStats().device_heap_total_size, 0u);
+    EXPECT_EQ(cache->getStats().host_heap_total_size, 0u);
+    EXPECT_EQ(host_pool->usedBlocksNum(), 0u);
+    ASSERT_EQ(eviction_write->keys->size(), 2u);
+    ASSERT_EQ(eviction_write->host_write_source_paths.size(), 2u);
+    std::unordered_map<CacheKeyType, CacheKeyType> source_path_roots;
+    for (const auto& source_path : eviction_write->host_write_source_paths) {
+        ASSERT_EQ(source_path.local_cache_keys.size(), 1u);
+        EXPECT_EQ(source_path.coordinate, 0u);
+        source_path_roots.emplace(source_path.local_cache_keys.front(), source_path.local_cache_keys.front());
+    }
+    EXPECT_EQ(source_path_roots.size(), 2u);
+    EXPECT_EQ(source_path_roots.count(100), 1u);
+    EXPECT_EQ(source_path_roots.count(200), 1u);
+
+    std::unordered_map<CacheKeyType, uint64_t> first_leases;
+    for (const auto& source_path : eviction_write->host_write_source_paths) {
+        ASSERT_EQ(source_path.local_cache_keys.size(), 1u);
+        first_leases.emplace(source_path.local_cache_keys.front(), source_path.host_eviction_lease_id);
+    }
+    allocateHostResource(100);
+    allocateHostResource(200);
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+    const auto repeated_requests = backend->requests();
+    const auto first_eviction_index = static_cast<size_t>(std::distance(requests.begin(), eviction_write));
+    const auto repeated_eviction_write = std::find_if(
+        repeated_requests.begin() + first_eviction_index + 1, repeated_requests.end(), [](const StorageRequest& request) {
+            return request.source_tier == Tier::HOST && !request.host_write_source_paths.empty();
+        });
+    ASSERT_NE(repeated_eviction_write, repeated_requests.end());
+    ASSERT_EQ(repeated_eviction_write->host_write_source_paths.size(), 2u);
+    for (const auto& source_path : repeated_eviction_write->host_write_source_paths) {
+        ASSERT_EQ(source_path.local_cache_keys.size(), 1u);
+        const auto previous = first_leases.find(source_path.local_cache_keys.front());
+        ASSERT_NE(previous, first_leases.end());
+        EXPECT_NE(source_path.host_eviction_lease_id, previous->second);
+    }
+}
+
+TEST_F(BlockTreeCacheIntegrationTest, NonOwnerHostWatermarkLeavesEvictionToRemoteOwner) {
+    constexpr size_t payload_bytes = 16;
+    auto device_pool = makeDevicePool({{payload_bytes, 0}}, 1, "host_remote_non_owner");
+    auto host_pool   = makeHostPool(payload_bytes, 1);
+    ASSERT_NE(device_pool, nullptr);
+    ASSERT_NE(host_pool, nullptr);
+    auto group = std::make_shared<FullGroupSet>(std::vector<DeviceBlockPoolPtr>{device_pool}, host_pool, nullptr);
+
+    BlockTreeCacheConfig config;
+    config.enable_device_cache = false;
+    config.enable_host_cache = true;
+    config.enable_remote_cache = true;
+    config.remote_host_eviction_owner = false;
+    config.watermark_host = {/*low_ratio=*/0.01, /*high_ratio=*/1.0};
+    config.task_pool_size = 1;
+    auto backend = std::make_shared<CapturingRemoteStorageBackend>();
+    auto cache = makeBlockTreeCacheForTest({group}, config, backend);
+    ASSERT_NE(cache, nullptr);
+
+    std::vector<std::vector<GroupSetResource>> resources(1, std::vector<GroupSetResource>(1));
+    resources[0][0].host_block = group->allocateSingleBlock(Tier::HOST, BlockTreeRefType::CACHE);
+    ASSERT_FALSE(isNullBlockIdx(resources[0][0].host_block));
+    ASSERT_TRUE(insertGroupSetResources(*cache, {100}, resources));
+    BlockTreeCacheTestPeer::runMaintenanceForTest(*cache);
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+
+    EXPECT_TRUE(backend->requests().empty());
+    EXPECT_EQ(host_pool->usedBlocksNum(), 1u);
+    EXPECT_EQ(host_pool->referencedBlocksNum(BlockTreeRefType::STORE), 0u);
+    const auto path = cache->tree()->findNode({100});
+    ASSERT_EQ(path.size(), 1u);
+    EXPECT_EQ(path.front()->group_set_resources[0].transfer_state, GroupSetTransferState::IDLE);
+}
+
+TEST_F(BlockTreeCacheIntegrationTest, LinearHostEvictionWritesOnlyTheCanonicalRoundEndpoint) {
+    constexpr size_t payload_bytes = 16;
+    auto device_pool = makeDevicePool({{payload_bytes, 0}}, 1, "linear_host_remote_endpoint");
+    auto host_pool   = makeHostPool(payload_bytes, 1);
+    ASSERT_NE(device_pool, nullptr);
+    ASSERT_NE(host_pool, nullptr);
+    auto linear = std::make_shared<LinearGroupSet>(std::vector<DeviceBlockPoolPtr>{device_pool}, host_pool, nullptr);
+    auto topology = block_transfer_engine_test::makeTestTopology(
+        {block_transfer_engine_test::makeTestGroupBase(defaultCacheGroupPolicy(CacheGroupType::LINEAR), {0}, 256)});
+    linear->initialize(0, topology, topology->groupTags());
+
+    BlockTreeCacheConfig config;
+    config.enable_device_cache = false;
+    config.enable_host_cache = true;
+    config.enable_remote_cache = true;
+    config.watermark_host = {/*low_ratio=*/0.01, /*high_ratio=*/1.0};
+    config.task_pool_size = 1;
+    auto backend = std::make_shared<CapturingRemoteStorageBackend>();
+    auto cache = makeBlockTreeCacheForTest({linear}, config, backend);
+    ASSERT_NE(cache, nullptr);
+
+    std::vector<std::vector<GroupSetResource>> resources(1, std::vector<GroupSetResource>(1));
+    resources[0][0].host_block = linear->allocateSingleBlock(Tier::HOST, BlockTreeRefType::CACHE);
+    ASSERT_FALSE(isNullBlockIdx(resources[0][0].host_block));
+    const std::vector<CacheKeysType> remote_key_groups{{101, 102, 103, 104}};
+    cache->insert(CacheKeysType{104},
+                  resources,
+                  Tier::HOST,
+                  std::shared_ptr<const StorageRequest>{},
+                  remote_key_groups);
+    linear->releaseSingleBlock(Tier::HOST, resources[0][0].host_block, BlockTreeRefType::CACHE);
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+
+    const auto requests = backend->requests();
+    const auto eviction_write = std::find_if(requests.begin(), requests.end(), [](const StorageRequest& request) {
+        return request.source_tier == Tier::HOST && !request.host_write_source_paths.empty();
+    });
+    ASSERT_NE(eviction_write, requests.end());
+    EXPECT_EQ(*eviction_write->keys, (CacheKeysType{104}));
+    ASSERT_EQ(eviction_write->handles.size(), 1u);
+    ASSERT_EQ(eviction_write->handles.front().size(), 1u);
+    EXPECT_EQ(eviction_write->handles.front().front().tag, topology->groupTags().front());
+    ASSERT_EQ(eviction_write->host_write_source_paths.size(), 1u);
+    EXPECT_EQ(eviction_write->host_write_source_paths.front().local_cache_keys, (CacheKeysType{104}));
+    EXPECT_EQ(host_pool->usedBlocksNum(), 0u);
+}
+
+TEST_F(BlockTreeCacheIntegrationTest, HostPoolCapacityFailureSchedulesRemoteReclamation) {
+    constexpr size_t payload_bytes = 16;
+    auto device_pool = makeDevicePool({{payload_bytes, 0}}, 2, "host_remote_capacity");
+    auto host_pool   = makeHostPool(payload_bytes, 1);
+    auto disk_pool   = makeDiskPool(payload_bytes, 2, std::make_unique<MemoryDiskBlockIO>());
+    ASSERT_NE(device_pool, nullptr);
+    ASSERT_NE(host_pool, nullptr);
+    ASSERT_NE(disk_pool, nullptr);
+    auto group = std::make_shared<FullGroupSet>(
+        std::vector<DeviceBlockPoolPtr>{device_pool}, host_pool, disk_pool);
+
+    BlockTreeCacheConfig config;
+    config.enable_host_cache = true;
+    config.enable_disk_cache = true;
+    config.enable_remote_cache = true;
+    config.task_pool_size = 1;
+    auto backend = std::make_shared<CapturingRemoteStorageBackend>();
+    auto cache = makeBlockTreeCacheForTest({group}, config, backend);
+    ASSERT_NE(cache, nullptr);
+
+    std::vector<std::vector<GroupSetResource>> host_resources(1, std::vector<GroupSetResource>(1));
+    host_resources[0][0].host_block = group->allocateSingleBlock(Tier::HOST, BlockTreeRefType::CACHE);
+    ASSERT_FALSE(isNullBlockIdx(host_resources[0][0].host_block));
+    ASSERT_TRUE(insertGroupSetResources(*cache, {100}, host_resources));
+    EXPECT_EQ(host_pool->freeBlocksNum(), 0u);
+
+    const MultiNodeBlocks device_blocks = allocateDeviceBlocksForTest(*group, 1, BlockTreeRefType::CACHE);
+    ASSERT_EQ(device_blocks.size(), 1u);
+    std::vector<std::vector<GroupSetResource>> pending_resources(1, std::vector<GroupSetResource>(1));
+    pending_resources[0][0].device_blocks = device_blocks.front();
+    cache->insert({200}, pending_resources, Tier::HOST);
+    unreferenceDeviceBlocksForTest(*group, device_blocks, BlockTreeRefType::CACHE);
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+
+    const auto requests = backend->requests();
+    ASSERT_EQ(requests.size(), 1u);
+    EXPECT_EQ(requests.front().source_tier, Tier::HOST);
+    EXPECT_EQ(*requests.front().keys, (CacheKeysType{100}));
+    EXPECT_EQ(host_pool->usedBlocksNum(), 0u);
+    EXPECT_EQ(disk_pool->usedBlocksNum(), 0u);
+    EXPECT_TRUE(cache->tree()->findNode({100}).empty());
+}
+
+TEST_F(BlockTreeCacheIntegrationTest, UnknownHostEvictionKeepsBackingAndStopsAdmissionAfterShutdown) {
+    constexpr size_t payload_bytes = 16;
+    auto device_pool = makeDevicePool({{payload_bytes, 0}}, 2, "host_remote_unknown");
+    auto host_pool   = makeHostPool(payload_bytes, 1);
+    ASSERT_NE(device_pool, nullptr);
+    ASSERT_NE(host_pool, nullptr);
+    auto group = std::make_shared<FullGroupSet>(std::vector<DeviceBlockPoolPtr>{device_pool}, host_pool, nullptr);
+
+    BlockTreeCacheConfig config;
+    config.enable_device_cache = false;
+    config.enable_host_cache = true;
+    config.enable_remote_cache = true;
+    config.watermark_host = {/*low_ratio=*/0.01, /*high_ratio=*/1.0};
+    config.task_pool_size = 1;
+    auto backend = std::make_shared<CapturingRemoteStorageBackend>(
+        CapturingRemoteStorageBackend::Outcome::COMPLETION_UNKNOWN);
+    auto cache = makeBlockTreeCacheForTest({group}, config, backend);
+    ASSERT_NE(cache, nullptr);
+
+    const BlockIdxType block = group->allocateSingleBlock(Tier::HOST, BlockTreeRefType::CACHE);
+    ASSERT_FALSE(isNullBlockIdx(block));
+    std::vector<std::vector<GroupSetResource>> resources(1, std::vector<GroupSetResource>(1));
+    resources[0][0].host_block = block;
+    ASSERT_TRUE(insertGroupSetResources(*cache, {100}, resources));
+    BlockTreeCacheTestPeer::runMaintenanceForTest(*cache);
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+
+    ASSERT_EQ(backend->requests().size(), 1u);
+    auto path = cache->tree()->findNode({100});
+    ASSERT_EQ(path.size(), 1u);
+    EXPECT_EQ(path.front()->group_set_resources[0].transfer_state, GroupSetTransferState::DEMOTING);
+    EXPECT_NE(path.front()->group_set_resources[0].host_eviction_lease_id, 0u);
+    EXPECT_TRUE(host_pool->hasUncertainRemoteIo());
+    EXPECT_TRUE(host_pool->isAllocated(block));
+    EXPECT_EQ(host_pool->referencedBlocksNum(BlockTreeRefType::STORE), 1u);
+
+    BlockTreeCacheTestPeer::runMaintenanceForTest(*cache);
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+    EXPECT_EQ(backend->requests().size(), 1u);
+
+    std::weak_ptr<HostBlockPool> retained_pool = host_pool;
+    cache.reset();
+    group.reset();
+    host_pool.reset();
+    backend.reset();
+    ASSERT_FALSE(retained_pool.expired());
+    auto retained = retained_pool.lock();
+    ASSERT_NE(retained, nullptr);
+    EXPECT_TRUE(retained->isAllocated(block));
+    EXPECT_EQ(retained->referencedBlocksNum(BlockTreeRefType::CACHE), 0u);
+    EXPECT_EQ(retained->referencedBlocksNum(BlockTreeRefType::STORE), 1u);
+}
+
+TEST_F(BlockTreeCacheIntegrationTest, HostRemoteEvictionQueueRejectionRestoresSourceAndPins) {
+    constexpr size_t payload_bytes = 16;
+    auto device_pool = makeDevicePool({{payload_bytes, 0}}, 1, "host_remote_queue_rejection");
+    auto host_pool   = makeHostPool(payload_bytes, 1);
+    ASSERT_NE(device_pool, nullptr);
+    ASSERT_NE(host_pool, nullptr);
+    auto group = std::make_shared<FullGroupSet>(std::vector<DeviceBlockPoolPtr>{device_pool}, host_pool, nullptr);
+
+    BlockTreeCacheConfig config;
+    config.enable_device_cache = false;
+    config.enable_host_cache = true;
+    config.enable_remote_cache = true;
+    config.watermark_host = {/*low_ratio=*/0.01, /*high_ratio=*/1.0};
+    config.task_pool_size = 1;
+    auto backend = std::make_shared<CapturingRemoteStorageBackend>();
+    auto cache = makeBlockTreeCacheForTest({group}, config, backend);
+    ASSERT_NE(cache, nullptr);
+
+    std::vector<std::vector<GroupSetResource>> resources(1, std::vector<GroupSetResource>(1));
+    resources[0][0].host_block = group->allocateSingleBlock(Tier::HOST, BlockTreeRefType::CACHE);
+    ASSERT_FALSE(isNullBlockIdx(resources[0][0].host_block));
+    ASSERT_TRUE(insertGroupSetResources(*cache, {100}, resources));
+
+    BlockTreeCacheTestPeer::ScopedQueueRejectionGuard rejection_guard(*cache);
+    ASSERT_TRUE(rejection_guard.armed());
+    BlockTreeCacheTestPeer::runMaintenanceForTest(*cache);
+    EXPECT_EQ(backend->requests().size(), 0u);
+    EXPECT_EQ(host_pool->referencedBlocksNum(BlockTreeRefType::STORE), 0u);
+    EXPECT_EQ(host_pool->usedBlocksNum(), 1u);
+    auto path = cache->tree()->findNode({100});
+    ASSERT_EQ(path.size(), 1u);
+    EXPECT_EQ(path.front()->group_set_resources[0].transfer_state, GroupSetTransferState::IDLE);
+    EXPECT_EQ(path.front()->group_set_resources[0].host_eviction_lease_id, 0u);
+    ASSERT_TRUE(rejection_guard.restore());
+
+    BlockTreeCacheTestPeer::runMaintenanceForTest(*cache);
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
+    ASSERT_EQ(backend->requests().size(), 1u);
+    EXPECT_EQ(host_pool->usedBlocksNum(), 0u);
+    EXPECT_EQ(host_pool->referencedBlocksNum(BlockTreeRefType::STORE), 0u);
 }
 
 TEST_F(BlockTreeCacheIntegrationTest, OneShotPrimaryFailureDoesNotBlockIndependentGroupAndRetriesOnce) {

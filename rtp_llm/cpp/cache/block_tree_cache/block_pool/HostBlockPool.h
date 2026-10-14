@@ -15,6 +15,7 @@ struct HostBlockPoolConfig: public BlockPoolConfigBase {
     size_t payload_bytes{0};
     size_t stride_bytes{0};
     size_t alignment{4096};
+    bool   shared_memory_for_remote{false};
 };
 
 struct HostBlockBuffer {
@@ -24,10 +25,10 @@ struct HostBlockBuffer {
     size_t       stride_bytes;
 };
 
-// HostBlockPool backs every block with a fixed-stride slice of a single contiguous
-// pinned CPU memory tensor. All lifecycle behavior (malloc/free/incRef/decRef/metrics) is inherited unchanged from
-// IBlockPool; this class only owns the host backing tensor and exposes blockBuffer()
-// to map a valid physical block index to its backing address.
+// HostBlockPool backs every block with a fixed-stride slice of contiguous pinned CPU memory.
+// Remote-enabled pools use an independent memfd mapping; other pools use a pinned tensor.
+// Allocation lifecycle remains inherited from IBlockPool, while this class owns the backing
+// and exposes blockBuffer() to map physical block indices.
 class HostBlockPool: public IBlockPool {
 public:
     explicit HostBlockPool(std::shared_ptr<const HostBlockPoolConfig> config);
@@ -44,6 +45,9 @@ public:
     size_t payloadBytes() const;
     size_t strideBytes() const;
     size_t blockSizeBytes() const override;
+    int    sharedMemoryFd() const;
+    void*  sharedMemoryBase() const;
+    size_t sharedMemorySize() const;
     void markUncertainRemoteIo();
     bool hasUncertainRemoteIo() const;
 

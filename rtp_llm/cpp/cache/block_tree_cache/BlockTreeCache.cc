@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <utility>
 
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeTaskPool.h"
@@ -43,7 +44,9 @@ BlockTreeCache::BlockTreeCache(std::unique_ptr<BlockTree>                     tr
         [this](Tier tier) { return config_.isTierEnabled(tier); },
         [this](bool tree_data_mutated, bool check_watermark) {
             onWorkflowSettledLocked(tree_data_mutated, check_watermark);
-        }),
+        },
+        storage_backend_.get(),
+        config_.remote_host_eviction_owner),
     loader_(tree_.get(),
             evictor_,
             transfer_dispatcher_.get(),
@@ -148,15 +151,25 @@ bool BlockTreeCache::executeTransfer(TransferTask task) {
 StorageBackend::HostWriteResolution BlockTreeCache::resolveHostWrite(const CacheKeysType&            keys,
                                                                      const std::vector<std::string>& tags,
                                                                      const std::vector<uint32_t>&    coordinates,
-                                                                     int                             timeout_ms) {
+                                                                     int                             timeout_ms,
+                                                                     uint64_t                        host_eviction_lease_id) {
     if (!storage_backend_ || keys.empty() || tags.empty() || tags.size() != coordinates.size()) {
         return {};
     }
     std::unique_lock<std::mutex> lock(mutex_);
+    bool wait_for_publication = false;
+    std::vector<uint64_t> source_generations;
     auto resolve = [&]() -> std::vector<BlockIdxType> {
+        wait_for_publication = false;
+        source_generations.clear();
         const auto path = tree_->findNode(keys);
+        if (path.size() < keys.size()) {
+            wait_for_publication = host_eviction_lease_id == 0;
+            return {};
+        }
         std::vector<BlockIdxType> blocks;
         blocks.reserve(tags.size());
+        source_generations.reserve(tags.size());
         for (size_t i = 0; i < tags.size(); ++i) {
             if (coordinates[i] >= path.size()) {
                 return {};
@@ -170,20 +183,89 @@ StorageBackend::HostWriteResolution BlockTreeCache::resolveHostWrite(const Cache
                 return {};
             }
             const auto& resource = path[coordinates[i]]->group_set_resources[location->group_set_id];
-            if (resource.transfer_state != GroupSetTransferState::IDLE || isNullBlockIdx(resource.host_block)) {
+            const bool idle_source = resource.transfer_state == GroupSetTransferState::IDLE;
+            const bool leased_source = host_eviction_lease_id != 0
+                                       && resource.transfer_state == GroupSetTransferState::DEMOTING
+                                       && resource.host_eviction_lease_id == host_eviction_lease_id
+                                       && resource.hasTier(Tier::HOST);
+            const bool idle_eviction_source = host_eviction_lease_id != 0 && idle_source
+                                              && resource.hasTier(Tier::HOST);
+            if (host_eviction_lease_id != 0 && !leased_source && !idle_eviction_source) {
+                return {};
+            }
+            if (idle_source && !resource.hasTier(Tier::HOST)) {
+                if (host_eviction_lease_id != 0) {
+                    return {};
+                }
+                wait_for_publication = true;
+                return {};
+            }
+            if ((!idle_source && !leased_source) || isNullBlockIdx(resource.host_block)
+                || !host_pool->validBlock(resource.host_block)) {
                 return {};
             }
             blocks.push_back(resource.host_block);
+            source_generations.push_back(host_pool->blockAllocationGeneration(resource.host_block));
         }
         return blocks;
     };
     auto blocks = resolve();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(0, timeout_ms));
-    while (blocks.empty() && host_publication_cv_.wait_until(lock, deadline) != std::cv_status::timeout) {
+    while (blocks.empty() && wait_for_publication
+           && host_publication_cv_.wait_until(lock, deadline) != std::cv_status::timeout) {
         blocks = resolve();
     }
     if (blocks.empty()) {
         return {};
+    }
+    std::vector<std::pair<TreeNode*, size_t>> newly_reserved_sources;
+    const auto rollback_newly_reserved = [&]() {
+        bool restored = false;
+        for (const auto& [node, group_set_id] : newly_reserved_sources) {
+            (void)evictor_.settleRemoteHostWriteLocked(node,
+                                                       group_set_id,
+                                                       host_eviction_lease_id,
+                                                       HostWriteSettlementOutcome::ROLLBACK,
+                                                       restored);
+        }
+        if (restored) {
+            onWorkflowSettledLocked(true, true);
+        }
+    };
+    if (host_eviction_lease_id != 0) {
+        const auto path = tree_->findNode(keys);
+        for (size_t i = 0; i < tags.size(); ++i) {
+            const ReusableGroupLocation* location = tree_->reusableGroupLocation(tags[i]);
+            if (location == nullptr) {
+                rollback_newly_reserved();
+                return {};
+            }
+            TreeNode* const source_node = path[coordinates[i]];
+            const auto existing = std::find_if(newly_reserved_sources.begin(),
+                                               newly_reserved_sources.end(),
+                                               [&](const auto& entry) {
+                                                   return entry.first == source_node
+                                                          && entry.second == location->group_set_id;
+                                               });
+            if (existing != newly_reserved_sources.end()) {
+                continue;
+            }
+            bool newly_reserved = false;
+            if (!evictor_.reserveRemoteHostWriteLocked(
+                    source_node,
+                    location->group_set_id,
+                    host_eviction_lease_id,
+                    newly_reserved)) {
+                rollback_newly_reserved();
+                return {};
+            }
+            if (newly_reserved) {
+                newly_reserved_sources.emplace_back(source_node, location->group_set_id);
+            }
+        }
+        if (!newly_reserved_sources.empty()) {
+            onWorkflowSettledLocked(true, false);
+        }
     }
     auto key_copy = std::make_shared<CacheKeysType>();
     StorageRequest request{key_copy, {}};
@@ -194,7 +276,77 @@ StorageBackend::HostWriteResolution BlockTreeCache::resolveHostWrite(const Cache
         key_copy->push_back(keys[coordinates[i]]);
         request.handles.push_back({StorageBlockHandle{tags[i], blocks[i]}});
     }
-    return {storage_backend_->prepareWrite(std::move(request)), std::move(blocks)};
+    try {
+        auto pins = storage_backend_->prepareWrite(std::move(request));
+        if (pins) {
+            for (size_t i = 0; i < tags.size(); ++i) {
+                const ReusableGroupLocation* location = tree_->reusableGroupLocation(tags[i]);
+                if (location == nullptr) {
+                    pins = StorageWriteTask{};
+                    rollback_newly_reserved();
+                    return {};
+                }
+                const auto& host_pool = tree_->groupSets()[location->group_set_id]->hostPool();
+                if (!host_pool || !host_pool->validBlock(blocks[i])
+                    || host_pool->blockAllocationGeneration(blocks[i]) != source_generations[i]) {
+                    pins = StorageWriteTask{};
+                    rollback_newly_reserved();
+                    return {};
+                }
+            }
+        }
+        if (!pins && !newly_reserved_sources.empty()) {
+            rollback_newly_reserved();
+        }
+        return {std::move(pins), std::move(blocks)};
+    } catch (...) {
+        rollback_newly_reserved();
+        throw;
+    }
+}
+
+bool BlockTreeCache::settleRemoteHostWriteSource(const CacheKeysType&             local_cache_keys,
+                                                 const std::vector<std::string>& group_tags,
+                                                 uint32_t                        coordinate,
+                                                 uint64_t                        host_eviction_lease_id,
+                                                 HostWriteSettlementOutcome     outcome) {
+    if (local_cache_keys.empty() || group_tags.empty() || host_eviction_lease_id == 0) {
+        return false;
+    }
+    if (outcome == HostWriteSettlementOutcome::RESERVE) {
+        auto source = resolveHostWrite(local_cache_keys,
+                                       group_tags,
+                                       std::vector<uint32_t>(group_tags.size(), coordinate),
+                                       /*timeout_ms=*/0,
+                                       host_eviction_lease_id);
+        return static_cast<bool>(source.pins);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto                  path = tree_->findNode(local_cache_keys);
+    if (path.size() < local_cache_keys.size() || coordinate >= path.size()) {
+        return true;
+    }
+    std::optional<size_t> group_set_id;
+    for (const std::string& tag : group_tags) {
+        const ReusableGroupLocation* location = tree_->reusableGroupLocation(tag);
+        if (!location || (group_set_id && *group_set_id != location->group_set_id)) {
+            return false;
+        }
+        group_set_id = location->group_set_id;
+    }
+    bool tree_data_mutated = false;
+    if (!evictor_.settleRemoteHostWriteLocked(
+            path[coordinate],
+            *group_set_id,
+            host_eviction_lease_id,
+            outcome,
+            tree_data_mutated)) {
+        return false;
+    }
+    if (tree_data_mutated) {
+        onWorkflowSettledLocked(true, outcome != HostWriteSettlementOutcome::UNKNOWN);
+    }
+    return true;
 }
 
 BlockTreeMatchResult BlockTreeCache::match(const CacheKeysType&                 cache_keys,
@@ -211,8 +363,15 @@ BlockTreeMatchResult BlockTreeCache::match(const CacheKeysType&                 
 void BlockTreeCache::insert(const CacheKeysType&                              cache_keys,
                             const std::vector<std::vector<GroupSetResource>>& resources,
                             Tier                                              target_tier,
-                            std::shared_ptr<const StorageRequest>             remote_write) {
-    (void)insert(cache_keys, resources, target_tier, false, false, std::move(remote_write));
+                            std::shared_ptr<const StorageRequest>             remote_write,
+                            const std::vector<CacheKeysType>&                 remote_key_groups) {
+    (void)insert(cache_keys,
+                 resources,
+                 target_tier,
+                 false,
+                 false,
+                 std::move(remote_write),
+                 remote_key_groups);
 }
 
 size_t BlockTreeCache::insert(const CacheKeysType&                              cache_keys,
@@ -220,7 +379,8 @@ size_t BlockTreeCache::insert(const CacheKeysType&                              
                               Tier                                              target_tier,
                               bool                                              is_resident,
                               bool                                              write_remote_from_device,
-                              std::shared_ptr<const StorageRequest>             remote_write) {
+                              std::shared_ptr<const StorageRequest>             remote_write,
+                              const std::vector<CacheKeysType>&                 remote_key_groups) {
     size_t           resident_prefix_length = 0;
     StorageWriteTask storage_write;
     {
@@ -231,7 +391,8 @@ size_t BlockTreeCache::insert(const CacheKeysType&                              
                                             is_resident,
                                             resident_prefix_length,
                                             write_remote_from_device,
-                                            std::move(remote_write));
+                                            std::move(remote_write),
+                                            remote_key_groups);
     }
     if (storage_write) {
         storage_backend_->write(std::move(storage_write));

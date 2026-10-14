@@ -23,6 +23,10 @@ class BlockTransferDispatcher;
 class BlockTreeCacheMetricsReporter;
 class BlockTreeTaskPool;
 class EvictionTaskRunner;
+class ErrorInfo;
+class StorageBackend;
+class StorageWriteTask;
+enum class HostWriteSettlementOutcome : uint8_t;
 
 struct TierWatermark {
     double low_ratio{0.0};
@@ -60,7 +64,9 @@ public:
                      int                            disk_timeout_ms,
                      size_t                         max_descriptors_per_batch,
                      IsTierEnabledFn                is_tier_enabled,
-                     SettledFn                      settled);
+                     SettledFn                      settled,
+                     StorageBackend*                storage_backend = nullptr,
+                     bool                           remote_host_eviction_owner = true);
     ~BlockTreeEvictor();
 
     // ---- Semantic events (must be called while holding BlockTreeCache mutex) ----
@@ -70,11 +76,21 @@ public:
     CandidateStats         candidateStats() const;
     size_t                 candidateCount(size_t group_set_id, Tier tier) const;
     std::vector<TreeNode*> candidateNodes(size_t group_set_id, Tier tier) const;
+    bool reserveRemoteHostWriteLocked(TreeNode* node,
+                                      size_t group_set_id,
+                                      uint64_t lease_id,
+                                      bool& newly_reserved);
+    bool settleRemoteHostWriteLocked(TreeNode*                    node,
+                                     size_t                       group_set_id,
+                                     uint64_t                     lease_id,
+                                     HostWriteSettlementOutcome outcome,
+                                     bool&                        tree_data_mutated);
 
     // ---- Eviction selection & migration (caller owns synchronization) ----
     // Selection, task preparation, settlement, and abort mutate tree/group-set/pool/heap
     // state and must run under BlockTreeCache's mutex. Task execution is lock-free.
     bool   dropLocked(size_t group_set_id, Tier source_tier, bool notify_settled);
+    bool   reclaimCapacityLocked(size_t group_set_id, Tier source_tier, size_t max_victim_count);
     void   scheduleWatermarkEvictionsLocked(Tier tier, const TierWatermark& watermark);
     size_t computeWatermarkEvictCount(const GroupSet& group_set, Tier tier, const TierWatermark& watermark);
     // Discard a detached operation's source without publishing its target.
@@ -116,13 +132,24 @@ private:
     std::optional<TransferDescriptor> chooseVictim(size_t group_set_id, Tier tier, bool force_drop = false);
     EvictionDropTask                  createDropTask(TransferDescriptor eviction_desc);
     bool   batchDropLocked(size_t group_set_id, Tier source_tier, size_t max_victim_count, size_t& scheduled_count);
-    bool   submitEvictionTask(std::vector<TransferDescriptor> descriptors, std::vector<EvictionTimingSnapshot> timings);
+    bool   submitEvictionTask(std::vector<TransferDescriptor> descriptors,
+                              std::vector<EvictionTimingSnapshot> timings,
+                              std::shared_ptr<StorageWriteTask> host_remote_write = nullptr);
     void   finishWatermarkRoundLocked(size_t group_set_id, Tier source_tier);
     Tier   watermarkTargetTier(Tier source_tier) const;
     size_t watermarkLogicalBatchLimit(Tier source_tier, Tier target_tier) const;
     void   runEvictionTask(std::shared_ptr<const EvictionTransferTask> task) noexcept;
-    BatchEvictResult batchEvictLocked(size_t group_set_id, Tier source_tier, size_t max_victim_count);
-    void scheduleEvictionSettlement(std::shared_ptr<const EvictionTransferTask> task, bool success) noexcept;
+    void   runLocalEvictionTransfer(std::shared_ptr<const EvictionTransferTask> task,
+                                   bool remote_write_committed = false) noexcept;
+    BatchEvictResult batchEvictLocked(size_t group_set_id,
+                                      Tier   source_tier,
+                                      size_t max_victim_count,
+                                      bool   capacity_reclaim = false);
+    void scheduleEvictionSettlement(std::shared_ptr<const EvictionTransferTask> task,
+                                    ErrorInfo error,
+                                    bool remote_write_committed = false) noexcept;
+    std::shared_ptr<StorageWriteTask>
+    prepareHostRemoteWrite(const std::vector<TransferDescriptor>& descriptors);
     void runDropTask(TransferDescriptor eviction_desc, bool notify_settled = true);
     void rollbackTransferLocked(const std::vector<TransferDescriptor>& descs);
     void updateFullCandidate(TreeNode* node, size_t group_set_id);
@@ -132,7 +159,9 @@ private:
     void                            collectFullPrune(const TransferDescriptor&                  eviction_desc,
                                                      EvictionDropTask&                          task,
                                                      std::vector<std::pair<TreeNode*, size_t>>& detached_resources) const;
-    void                            reserveSource(const std::vector<TransferDescriptor>& eviction_descs);
+    void                            reserveSource(const std::vector<TransferDescriptor>& eviction_descs,
+                                                   uint64_t host_eviction_lease_id = 0);
+    uint64_t                        nextHostEvictionLeaseId();
     std::vector<TransferDescriptor> restoreSource(const std::vector<TransferDescriptor>& eviction_descs);
     void                            releaseTargetBlocks(const std::vector<TransferDescriptor>& descs);
     void                            completeDrop(const TransferDescriptor& desc);
@@ -147,6 +176,8 @@ private:
                                                                  bool&                high_reached) const;
 
     BlockTree*                          tree_;
+    StorageBackend*                     storage_backend_{nullptr};
+    bool                                remote_host_eviction_owner_{true};
     BlockTreeTaskPool*                  task_pool_{nullptr};
     BlockTreeCacheMetricsReporter*      metrics_reporter_{nullptr};
     std::mutex*                         mutex_{nullptr};
@@ -164,6 +195,7 @@ private:
     // Process-local logical clocks (read/written only under the cache mutex).
     uint64_t access_seq_{0};
     uint64_t admission_seq_{0};
+    uint64_t host_eviction_lease_seq_{0};
 };
 
 }  // namespace rtp_llm

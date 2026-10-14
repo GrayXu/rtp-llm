@@ -85,12 +85,18 @@ With cache reuse enabled, the local-tier rules are:
 
 Remote caching requires a backend enabled and initialized by the deployment configuration.
 A remote-only deployment supports both lookup and automatic upload after successful completion.
-Request-completion uploads always use a DEVICE source; explicit HOST inserts use CPU IOVs.
-Remote writes are asynchronous, so request completion does not guarantee remote persistence.
-A failed upload does not roll back the local cache or change the request's successful status.
+Request-completion uploads always use a DEVICE source; explicit HOST inserts and natural HOST
+eviction uploads use CPU IOVs. Remote writes are asynchronous, so request completion does not
+guarantee remote persistence. A failed request-completion upload does not roll back the local
+cache or change the request's successful status.
 
 Other DEVICE inserts also prepare an upload when the backend is available, including resident
-system prompts and duplicate keys.
+system prompts and duplicate keys. Independently, a HOST watermark or a failed HOST-pool
+allocation can select existing HOST candidates for remote upload. This path does not depend on
+DEVICE pressure and works with request-completion dual writes enabled or disabled. With DISK
+enabled, watermark eviction can write both remote and DISK; HOST-pool capacity reclamation uses
+remote as its destination to free the HOST block. A DEVICE-to-HOST copy alone does not trigger a
+remote write. Forced local drops retain their existing direct-discard behavior.
 
 The request's `enable_remote_cache` field remains accepted but does not control remote lookup
 or request-completion upload. Completion storage still requires a successful request,
@@ -119,25 +125,41 @@ v9 and can read v1–v8. See [KV cache event publisher](kv_cache_event_publisher
 
 On successful completion, the request stores KV in the configured local tier and asynchronously
 writes remote cache from a DEVICE source through the GDR path. A local HOST target still uses
-the GPU for upload, without waiting for or reusing the D2H copy. Regular local copies, migration
-and eviction do not trigger additional uploads.
+the GPU for this request-completion upload, without waiting for or reusing the D2H copy. The
+separate HOST eviction path uploads existing HOST data when its watermark or capacity requires
+reclamation; it does not upload after every local copy or migration.
 
-Explicit inserts of ready HOST content use ordinary CPU IOVs and the transfer client for the
-original business tag. Each rank resolves HOST blocks by its local cache key/coordinate and
-holds STORE references during I/O. This path requires neither HOST fd registration nor a
-dedicated HOST client.
+Explicit inserts of ready HOST content and HOST eviction uploads use ordinary CPU IOVs and the
+transfer client for the original business tag. Each rank resolves its own HOST block from a
+rank-local key path and coordinate, then holds a STORE reference during I/O. Each HOST pool
+keeps its own memfd mapping when the remote backend is enabled. RTP's KVCM `ClientWrapper`
+passes all HOST regions and GPU spans to its first transfer client before PACE INIT; later pool
+clients borrow those registrations. Standalone SDK callers can pass the complete set through
+the existing `TransferClient::Create` overload taking `ClientMemoryRegistrations` before the process's
+first PACE INIT. If PACE
+cannot register a HOST region, its CPU IOVs use the existing staging path while GPU
+registrations remain active.
 
-For sharded CP, explicit HOST inserts use the existing `remote_write` parameter. The
-`StorageRequest` supplies `source_tier=HOST`, local round endpoint keys/handles, and the original
-global fixed-block keys in `remote_keys`. It uploads complete rounds stored in the local HOST
-tree. Workers use the same `CPSlotMapper` to project global keys/coordinates into local rounds;
-the original keys cannot be recovered from endpoint hashes. A TP replica with no write shard
-completes as an empty task.
+TP rank 0 selects HOST eviction sources and assigns a unique transaction lease. A control RPC
+validates each worker's source path and local allocation generation, pins its HOST block, and
+reserves the source before payload transfer. Replica ranks and sources whose remote copy already
+exists participate in this reservation even when they send no payload. After KVCM FinishWrite,
+a settlement RPC commits the worker's local eviction. A known failure rolls worker reservations
+back; an unknown completion leaves affected sources reserved. No cross-rank RPC runs under a
+BlockTree lock. If the remote commit succeeds but TP0 cannot promote the source to DISK, all ranks
+settle to remote-only and release the HOST source.
+
+For sharded CP, the tree retains the original global key group for each local round endpoint.
+Eviction writes carry the selected remote key and its separate rank-local source path, so
+unrelated LRU victims can share a batch without treating their keys as one prefix. CPU IOV order
+and canonical TP/CP shard layout stay on the existing storage path. Non-FULL groups write their
+round-end keys; a TP replica with no write shard completes as an empty task.
 
 Remote reads always target GPU IOVs. SDK/PACE selects direct, landing or staging; RTP does not
-allocate a separate HOST read pool. The first transfer client registers all required GPU spans
-before the first PACE INIT, and subsequent clients borrow those registrations. Shutdown drains
-borrowers before closing the registration owner.
+allocate a separate HOST read pool. Shutdown drains borrowers before closing the registration
+owner. If a remote write's physical completion is unknown, the backend stops new I/O and retains
+affected HOST blocks, mappings, and the registering client until process exit. SDK shutdown and
+RPC timeout alone do not prove that DMA has stopped.
 
 In non-FFN-disaggregated mode, when `dp_size=1`, TP spans nodes, and both remote BlockTree
 cache and GDR are enabled, rank 0 bounds idle scheduler waits to 10 ms. It reuses the empty-stream

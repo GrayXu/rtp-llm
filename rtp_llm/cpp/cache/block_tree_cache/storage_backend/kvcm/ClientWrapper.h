@@ -30,7 +30,7 @@ public:
     struct PoolRegistration {
         kv_cache_manager::RegistSpan span;
         std::string                  location_spec_name;
-        // All GPU regions are owned by the first pool's transfer client.
+        // All external HOST and GPU regions are owned by the first transfer client.
         std::optional<kv_cache_manager::ClientMemoryRegistrations> memory_registrations;
     };
     virtual bool initForPools(const ConfigMap&                     config_map,

@@ -808,6 +808,17 @@ void CoordinatorCacheManager::insertIntoCache(const InsertInfo& insert_info, siz
         if (full_keys.empty()) {
             continue;
         }
+        CacheKeysType insert_keys = cp_active ? cpCanonicalCacheKeys(cp_mapper, full_keys) : full_keys;
+        std::vector<CacheKeysType> remote_key_groups;
+        if (cp_active && block_tree_cache_->isRemoteCacheEnabled()) {
+            const size_t cp_size = static_cast<size_t>(cp_mapper->cpSize());
+            remote_key_groups.reserve(insert_keys.size());
+            for (size_t local_index = 0; local_index < insert_keys.size(); ++local_index) {
+                const size_t begin = local_index * cp_size;
+                const size_t end   = std::min(full_keys.size(), begin + cp_size);
+                remote_key_groups.emplace_back(full_keys.begin() + begin, full_keys.begin() + end);
+            }
+        }
         std::shared_ptr<StorageRequest> remote_write;
         if (cp_active && block_tree_cache_->isRemoteCacheEnabled()
             && (insert_info.target_tier == Tier::DEVICE || insert_info.target_tier == Tier::REMOTE
@@ -840,7 +851,6 @@ void CoordinatorCacheManager::insertIntoCache(const InsertInfo& insert_info, siz
             remote_write->keys = std::make_shared<const CacheKeysType>(full_keys.begin(), full_keys.begin() + complete);
             remote_write->handles.resize(complete);
         }
-        CacheKeysType insert_keys = cp_active ? cpCanonicalCacheKeys(cp_mapper, full_keys) : full_keys;
         if (insert_keys.empty()) {
             if (remote_write) {
                 block_tree_cache_->insert({}, {}, insert_info.target_tier, remote_write);
@@ -926,13 +936,15 @@ void CoordinatorCacheManager::insertIntoCache(const InsertInfo& insert_info, siz
         }
         insert_keys.resize(publish_prefix);
         resources.resize(publish_prefix);
+        remote_key_groups.resize(std::min(remote_key_groups.size(), publish_prefix));
         if (insert_info.is_resident) {
             const size_t batch_resident_prefix_length = block_tree_cache_->insert(insert_keys,
                                                                                   resources,
                                                                                   insert_info.target_tier,
                                                                                   true,
                                                                                   insert_info.write_remote_from_device,
-                                                                                  remote_write);
+                                                                                  remote_write,
+                                                                                  remote_key_groups);
             resident_prefix_length += batch_resident_prefix_length;
         } else {
             block_tree_cache_->insert(insert_keys,
@@ -940,7 +952,8 @@ void CoordinatorCacheManager::insertIntoCache(const InsertInfo& insert_info, siz
                                       insert_info.target_tier,
                                       false,
                                       insert_info.write_remote_from_device,
-                                      remote_write);
+                                      remote_write,
+                                      remote_key_groups);
         }
     }
 }

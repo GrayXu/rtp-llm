@@ -28,8 +28,14 @@ public:
             FINISHED
         };
 
-        Task(Tier target, CacheKeysType keys, std::chrono::milliseconds timeout):
-            target_tier(target), cache_keys(std::move(keys)), transfer_task({}, timeout) {}
+        Task(Tier target,
+             CacheKeysType keys,
+             std::chrono::milliseconds timeout,
+             std::vector<CacheKeysType> remote_keys = {}):
+            target_tier(target),
+            cache_keys(std::move(keys)),
+            remote_key_groups(std::move(remote_keys)),
+            transfer_task({}, timeout) {}
 
         const std::vector<TransferDescriptor>& descriptors() const {
             return transfer_task.descriptors();
@@ -37,6 +43,7 @@ public:
 
         Tier          target_tier{Tier::NONE};
         CacheKeysType cache_keys;
+        std::vector<CacheKeysType> remote_key_groups;
         TransferTask  transfer_task;
         Phase         phase{Phase::CREATED};
     };

@@ -4,6 +4,7 @@
 #include <atomic>
 
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -27,6 +28,19 @@ namespace rtp_llm {
 struct StorageBlockHandle {
     std::string  tag;
     BlockIdxType block{NULL_BLOCK_IDX};
+};
+
+struct HostWriteSourcePath {
+    CacheKeysType local_cache_keys;
+    uint32_t      coordinate{0};
+    uint64_t      host_eviction_lease_id{0};
+};
+
+enum class HostWriteSettlementOutcome : uint8_t {
+    COMMIT,
+    ROLLBACK,
+    UNKNOWN,
+    RESERVE,
 };
 
 struct StorageBackendMatchMeta {
@@ -68,6 +82,9 @@ struct StorageRequest {
     size_t local_matched_blocks_num{0};
     // Write sources may be DEVICE or HOST. Match/read requests stay on DEVICE.
     Tier source_tier{Tier::DEVICE};
+    // Optional rank-local lookup path and eviction lease for each remote key.
+    // Separate from `keys`, the remote KVCM keys.
+    std::vector<HostWriteSourcePath> host_write_source_paths;
     // Complete original fixed-token-block keys at the remote CP boundary.
     // Local tree keys may each represent one full CP round.
     std::shared_ptr<const CacheKeysType> remote_keys;
@@ -125,7 +142,14 @@ public:
     using HostWriteResolver = std::function<HostWriteResolution(const CacheKeysType&,
                                                                 const std::vector<std::string>&,
                                                                 const std::vector<uint32_t>&,
-                                                                int timeout_ms)>;
+                                                                int timeout_ms,
+                                                                bool keys_are_local,
+                                                                uint64_t host_eviction_lease_id)>;
+    using HostWriteSettlementResolver = std::function<bool(const CacheKeysType&,
+                                                           const std::vector<std::string>&,
+                                                           uint32_t coordinate,
+                                                           uint64_t host_eviction_lease_id,
+                                                           HostWriteSettlementOutcome)>;
 
     // An injected executor may be observed by its owner but belongs to only
     // one backend; init rejects binding the same instance a second time.
@@ -139,13 +163,14 @@ public:
                           BufferResolver                       buffer_resolver,
                           HostPoolsByTag                       host_pools_by_tag    = {},
                           BufferResolver                       host_buffer_resolver = {},
-                          HostWriteResolver                    host_write_resolver  = {});
+                          HostWriteResolver                    host_write_resolver  = {},
+                          HostWriteSettlementResolver           host_write_settlement_resolver = {});
     void match(StorageRequest request, MatchDone done);
     void read(StorageRequest request, std::shared_ptr<StorageBackendMatchMeta> match_meta, Done done);
     StorageWriteTask prepareWrite(StorageRequest request);
     // Returns admission only, not the I/O result; never waits for completion.
     // Source pins live until execution or rejection.
-    bool write(StorageWriteTask task);
+    bool write(StorageWriteTask task, Done done = {});
     // Must not be called from backend I/O or completion callbacks.
     void shutdown();
 
@@ -155,8 +180,10 @@ protected:
     }
     const CacheTopology&      topology() const;
     const DeviceBlockPoolPtr& devicePool(const std::string& tag) const;
+    // HOST pools are optional for remote DEVICE-only configurations.
     const std::shared_ptr<HostBlockPool>& hostPool(const std::string& tag) const;
     const HostWriteResolver& hostWriteResolver() const;
+    const HostWriteSettlementResolver& hostWriteSettlementResolver() const;
     std::vector<BlockInfo>
     convertIndexToBuffer(int layer_id, const std::string& tag, int block_id, Tier source_tier = Tier::DEVICE) const;
     // Match queries contain every possible group handle. Derived matchers use
@@ -200,6 +227,7 @@ private:
     std::shared_ptr<const CacheTopology> topology_;
     PoolsByTag                           pools_by_tag_;
     HostWriteResolver                     host_write_resolver_;
+    HostWriteSettlementResolver           host_write_settlement_resolver_;
     BufferResolver                       buffer_resolver_;
     HostPoolsByTag                          host_pools_by_tag_;
     BufferResolver                          host_buffer_resolver_;

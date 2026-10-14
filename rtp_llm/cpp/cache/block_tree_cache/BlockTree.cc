@@ -83,6 +83,7 @@ void BlockTree::releaseNode(TreeNode* node) {
             resource.disk_block = NULL_BLOCK_IDX;
         }
         resource.transfer_state = GroupSetTransferState::IDLE;
+        resource.host_eviction_lease_id = 0;
     }
 }
 
@@ -133,11 +134,26 @@ bool BlockTree::isLeafAtTier(const TreeNode* node, size_t group_set_id, Tier tie
 BlockTreeInsertResult BlockTree::insertNode(const CacheKeysType&                              cache_keys,
                                             const std::vector<std::vector<GroupSetResource>>& resources,
                                             bool                                              collect_path,
-                                            bool                                              is_resident) {
+                                            bool                                              is_resident,
+                                            const std::vector<CacheKeysType>&                 remote_key_groups) {
     BlockTreeInsertResult result;
     if (resources.size() != cache_keys.size()) {
         RTP_LLM_LOG_WARNING("key/resource size mismatch, keys=%zu resources=%zu", cache_keys.size(), resources.size());
         return result;
+    }
+    if (!remote_key_groups.empty() && remote_key_groups.size() != cache_keys.size()) {
+        RTP_LLM_LOG_WARNING("remote key-group size mismatch, keys=%zu groups=%zu",
+                            cache_keys.size(),
+                            remote_key_groups.size());
+        return result;
+    }
+    for (size_t i = 0; i < remote_key_groups.size(); ++i) {
+        if (remote_key_groups[i].empty() || remote_key_groups[i].back() != cache_keys[i]) {
+            RTP_LLM_LOG_WARNING("remote key group does not end at its local canonical key, index=%zu key=%ld",
+                                i,
+                                cache_keys[i]);
+            return result;
+        }
     }
     for (size_t i = 0; i < resources.size(); ++i) {
         if (resources[i].size() != group_sets_.size()) {
@@ -160,13 +176,14 @@ BlockTreeInsertResult BlockTree::insertNode(const CacheKeysType&                
         }
     }
 
-    return insertNodeImpl(cache_keys, resources, collect_path, is_resident);
+    return insertNodeImpl(cache_keys, resources, collect_path, is_resident, remote_key_groups);
 }
 
 BlockTreeInsertResult BlockTree::insertNodeImpl(const CacheKeysType&                              cache_keys,
                                                 const std::vector<std::vector<GroupSetResource>>& resources,
                                                 bool                                              collect_path,
-                                                bool                                              is_resident) {
+                                                bool                                              is_resident,
+                                                const std::vector<CacheKeysType>&                 remote_key_groups) {
     BlockTreeInsertResult result;
     if (collect_path) {
         result.path.reserve(cache_keys.size());
@@ -185,6 +202,16 @@ BlockTreeInsertResult BlockTree::insertNodeImpl(const CacheKeysType&            
         auto         it  = current->children.find(key);
         if (it != current->children.end()) {
             TreeNode* child = it->second;
+            if (!remote_key_groups.empty()) {
+                auto& remote_key_group = child->remote_key_group;
+                if (remote_key_group.empty()) {
+                    remote_key_group = remote_key_groups[i];
+                } else {
+                    RTP_LLM_CHECK_WITH_INFO(remote_key_group == remote_key_groups[i],
+                                            "BlockTree remote key mapping changed for key=%ld",
+                                            key);
+                }
+            }
             if (is_resident
                 && std::any_of(child->group_set_resources.begin(),
                                child->group_set_resources.end(),
@@ -262,6 +289,9 @@ BlockTreeInsertResult BlockTree::insertNodeImpl(const CacheKeysType&            
             current->children[key]       = child;
             current                      = child;
             current->group_set_resources = resources[i];
+            if (!remote_key_groups.empty()) {
+                current->remote_key_group = remote_key_groups[i];
+            }
             for (size_t group_set_id = 0; group_set_id < group_sets_.size(); ++group_set_id) {
                 const GroupSetResource& resource = current->group_set_resources[group_set_id];
                 const Tier              tier     = resource.getTopTier();

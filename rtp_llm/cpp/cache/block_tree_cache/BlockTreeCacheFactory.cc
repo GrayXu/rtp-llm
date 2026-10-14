@@ -177,7 +177,8 @@ std::vector<SingleTypeCacheManagerPtr> alignCoordinatorGroups(const CacheConfig&
     return aligned;
 }
 
-std::shared_ptr<HostBlockPool> createHostPool(const std::string& name, size_t payload_bytes, size_t usable_blocks) {
+std::shared_ptr<HostBlockPool>
+createHostPool(const std::string& name, size_t payload_bytes, size_t usable_blocks, bool shared_memory_for_remote) {
     if (payload_bytes == 0 || usable_blocks == 0) {
         return nullptr;
     }
@@ -188,6 +189,11 @@ std::shared_ptr<HostBlockPool> createHostPool(const std::string& name, size_t pa
     config->payload_bytes        = payload_bytes;
     config->stride_bytes         = alignUp(payload_bytes, kPoolAlignment);
     config->alignment            = kPoolAlignment;
+#if USING_CUDA && defined(__linux__)
+    config->shared_memory_for_remote = shared_memory_for_remote;
+#else
+    (void)shared_memory_for_remote;
+#endif
     auto pool                    = std::make_shared<HostBlockPool>(config);
     return pool->init() ? pool : nullptr;
 }
@@ -415,6 +421,7 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
 
     const bool       host_enabled = kv_cache_config.enable_memory_cache;
     const bool       disk_enabled = kv_cache_config.enable_disk_cache;
+    const bool       remote_enabled = kv_cache_config.enable_remote_cache && storage_backend != nullptr;
     constexpr size_t bytes_per_mb = 1024UL * 1024UL;
     const auto       valid_budget = [](int64_t mb) {
         return mb > 0 && static_cast<uint64_t>(mb) <= std::numeric_limits<size_t>::max() / bytes_per_mb;
@@ -469,7 +476,8 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
             const GroupBase&                first   = cache_config.topology().group(members.front());
             const std::string               pool_name =
                 "block_tree_host_" + std::string(metricCacheGroupTypeName(first.policy.group_type));
-            host_pools[group_set_id] = createHostPool(pool_name, group_set_payload_bytes[group_set_id], usable);
+            host_pools[group_set_id] =
+                createHostPool(pool_name, group_set_payload_bytes[group_set_id], usable, remote_enabled);
             if (!host_pools[group_set_id]) {
                 return nullptr;
             }
@@ -543,7 +551,7 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
     config.enable_device_cache = kv_cache_config.enable_device_cache;
     config.enable_host_cache   = host_enabled;
     config.enable_disk_cache   = disk_enabled;
-    config.enable_remote_cache = kv_cache_config.enable_remote_cache && storage_backend != nullptr;
+    config.enable_remote_cache = remote_enabled;
     if (!config.enable_remote_cache) {
         storage_backend = nullptr;
     }
@@ -621,6 +629,7 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
     const bool owns_mutable_block_tree =
         parallelism_config.tp_rank == 0 && !parallelism_config.ffn_disaggregate_config.is_ffn_service();
     config.full_prefix_scan_interval_ms = owns_mutable_block_tree ? configured_scan_interval_ms : 0;
+    config.remote_host_eviction_owner = owns_mutable_block_tree;
 
     auto cache_metrics_reporter = std::make_shared<BlockTreeCacheMetricsReporter>(std::move(metrics_reporter));
     auto per_rank_engine        = std::make_shared<PerRankBlockTransferEngine>(group_sets,
@@ -690,13 +699,15 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
                  canonical = kv_cache_config.kvcm_remote_layout == "canonical_v1"](const CacheKeysType& keys,
                              const std::vector<std::string>& tags,
                              const std::vector<uint32_t>& coordinates,
-                             int timeout_ms) {
+                             int timeout_ms,
+                             bool keys_are_local,
+                             uint64_t host_eviction_lease_id) {
                     auto cache = weak_cache.lock();
                     if (!cache) {
                         return StorageBackend::HostWriteResolution{};
                     }
-                    if (!canonical || !cp_mapper || !cp_mapper->isSharded()) {
-                        return cache->resolveHostWrite(keys, tags, coordinates, timeout_ms);
+                    if (keys_are_local || !canonical || !cp_mapper || !cp_mapper->isSharded()) {
+                        return cache->resolveHostWrite(keys, tags, coordinates, timeout_ms, host_eviction_lease_id);
                     }
                     auto local_coordinates = coordinates;
                     for (auto& coordinate : local_coordinates) {
@@ -706,7 +717,24 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
                         coordinate /= cp_mapper->cpSize();
                     }
                     return cache->resolveHostWrite(
-                        cp_mapper->canonicalCacheKeys(keys), tags, local_coordinates, timeout_ms);
+                        cp_mapper->canonicalCacheKeys(keys),
+                        tags,
+                        local_coordinates,
+                        timeout_ms,
+                        host_eviction_lease_id);
+                },
+                [weak_cache](const CacheKeysType&             local_cache_keys,
+                             const std::vector<std::string>& group_tags,
+                             uint32_t                        coordinate,
+                             uint64_t                        host_eviction_lease_id,
+                             HostWriteSettlementOutcome     outcome) {
+                    auto cache = weak_cache.lock();
+                    return cache && cache->settleRemoteHostWriteSource(
+                                        local_cache_keys,
+                                        group_tags,
+                                        coordinate,
+                                        host_eviction_lease_id,
+                                        outcome);
                 }),
             "StorageBackend init failed");
     }
