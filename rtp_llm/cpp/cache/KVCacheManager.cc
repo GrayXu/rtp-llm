@@ -782,11 +782,15 @@ bool KVCacheManager::executeFunction(const FunctionRequestPB& request, FunctionR
             RTP_LLM_LOG_WARNING("KVCacheManager::executeFunction: KVCM storage backend is not initialized");
             return false;
         }
-        // A handled transfer failure is carried in remote_response so the
-        // coordinator can distinguish failure from timeout. Keep the RPC
-        // successful long enough to deliver that payload to rank 0.
-        (void)backend->execute(request.remote_request(), *response.mutable_remote_response());
-        return true;
+        const auto& remote_request = request.remote_request();
+        const bool  success        = backend->execute(remote_request, *response.mutable_remote_response());
+        if (remote_request.op() == REMOTE_OPERATION_READ || remote_request.op() == REMOTE_OPERATION_WRITE) {
+            // A handled transfer failure is carried in remote_response so the
+            // coordinator can distinguish failure from timeout. Keep the RPC
+            // successful long enough to deliver that payload to rank 0.
+            return true;
+        }
+        return success;
 #else
         RTP_LLM_LOG_WARNING("KVCacheManager::executeFunction: KVCM support is not compiled in");
         return false;
@@ -862,10 +866,11 @@ void KVCacheManager::initCacheEventPublisher() {
             return;
         }
 
-        // KVCM currently represents one complete prefix chain per key.  A
-        // tail-sparse reuse group is still required by local reuse, but cannot
-        // be represented in that contract; publishing only the FULL groups
-        // would advertise keys that the local cache cannot actually reuse.
+        // ReportEvent can represent individual FULL/LINEAR components, but
+        // this publisher emits one aggregate HBM spec from complete DEVICE
+        // prefix chains. Tail-state residency is not part of that snapshot.
+        // Keep the guard until the emitter tracks those components; a FULL
+        // chain alone cannot advertise a reusable hybrid boundary.
         if (hasTailSparseReuseGroup()) {
             RTP_LLM_LOG_WARNING("KV cache event publisher disabled because tail-sparse reuse groups are unsupported");
             return;
@@ -906,12 +911,13 @@ void KVCacheManager::initCacheEventPublisher() {
         publisher_context.model_name        = runtime_config_.model_name;
         publisher_context.dtype             = getDataTypeStr(config_.dtype);
         publisher_context.spec_name         = "rtp_llm_hbm_" + std::to_string(config_.seq_size_per_block);
-        publisher_context.location_uri      = "rtp-llm://" + publisher_context.host_ip_port + "/hbm";
         publisher_context.block_size_tokens = static_cast<int32_t>(config_.seq_size_per_block);
         // Pipeline parallelism is rejected above because a unique PP owner is
         // not represented in ParallelismConfig yet.
         publisher_context.spec_size_bytes =
             aggregateKVCacheEventSpecSizeBytes(group_block_size_bytes, parallelism_config_.tp_size);
+        publisher_context.location_uri = "event_report://" + publisher_context.host_ip_port + "/hbm?size="
+                                          + std::to_string(publisher_context.spec_size_bytes);
         publisher_context.tp_size = static_cast<int32_t>(parallelism_config_.tp_size);
         publisher_context.dp_size = static_cast<int32_t>(parallelism_config_.dp_size);
         publisher_context.pp_size = static_cast<int32_t>(parallelism_config_.pp_size);

@@ -8,6 +8,8 @@
 #include "kmonitor/client/MetricsReporter.h"
 #include "kmonitor/client/core/MetricsData.h"
 #include "rtp_llm/cpp/cache/DeviceBlockPoolConfigHelper.h"
+#include "rtp_llm/cpp/cache/KVCacheManager.h"
+#include "rtp_llm/cpp/cache/test/BlockPoolTestHelper.h"
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
 
 namespace rtp_llm {
@@ -103,7 +105,7 @@ TEST(KVCMLocalTest, DirectClientRoutesMetadataAndPayload) {
 
     kv_cache_manager::WriteLocation write_location;
     write_location.write_session_id = "session";
-    EXPECT_CALL(*meta_ptr, StartWrite("start", keys, std::vector<int64_t>{}, std::vector<std::string>{"Ffull"}, 9, _))
+    EXPECT_CALL(*meta_ptr, StartWrite("start", keys, std::vector<int64_t>{}, std::vector<std::string>{"Ffull"}, 9, 0))
         .WillOnce(Return(std::make_pair(kv_cache_manager::ClientErrorCode::ER_OK, write_location)));
     const auto [start_ok, actual_write_location] =
         wrapper.getWriteLocation("", "start", keys, {}, {"Ffull"}, /*write_timeout_seconds=*/9);
@@ -285,6 +287,51 @@ TEST(KVCMLocalTest, LegacyEmptyRemoteResponsePreservesOneofPresence) {
     ASSERT_TRUE(parsed.ParseFromString(serialized));
     ASSERT_TRUE(parsed.has_remote_response());
     EXPECT_EQ(parsed.remote_response().transfer_status(), REMOTE_TRANSFER_STATUS_UNSPECIFIED);
+}
+
+TEST(KVCMLocalTest, ExecuteFunctionPropagatesMetadataErrorsAndPreservesTransferStatus) {
+    rtp_llm::initLogger();
+    createDevice();
+    auto environment    = makeBackendEnvironment("kvcm_rpc_result");
+    auto client_wrapper = std::make_shared<MockClientWrapper>();
+    EXPECT_CALL(*client_wrapper, initForPools(_, _, _, _)).WillOnce(Return(true));
+    EXPECT_CALL(*client_wrapper, shutdown()).Times(1);
+    auto backend = makeBackend(environment, singleRankConfig(), client_wrapper);
+    ASSERT_TRUE(initSingleRank(*backend.backend, environment));
+
+    KVCacheManager manager(environment.cache_config);
+    ASSERT_TRUE(manager.init());
+    manager.blockTreeCache()->storage_backend_ = std::move(backend.backend);
+
+    for (const auto operation : {REMOTE_OPERATION_REMOVE_CACHE,
+                                 REMOTE_OPERATION_GET_LOCATIONS_BY_BACKEND,
+                                 REMOTE_OPERATION_GET_HOST_CACHE_STATE}) {
+        FunctionRequestPB request;
+        request.mutable_remote_request()->set_op(operation);
+        request.mutable_remote_request()->mutable_metadata()->set_query_type(999);
+        FunctionResponsePB response;
+        EXPECT_FALSE(manager.executeFunction(request, response));
+    }
+
+    for (const auto ec :
+         {kv_cache_manager::ClientErrorCode::ER_CLIENT_NOT_EXISTS, kv_cache_manager::ClientErrorCode::ER_SDK_TIMEOUT}) {
+        client_wrapper->load_status = ec;
+        client_wrapper->save_status = ec;
+        for (const auto operation : {REMOTE_OPERATION_READ, REMOTE_OPERATION_WRITE}) {
+            FunctionRequestPB request;
+            auto*             remote = request.mutable_remote_request();
+            remote->set_op(operation);
+            remote->add_group_tags("default");
+            remote->add_block_ids(environment.block_id);
+            remote->add_uris("transfer_uri");
+            FunctionResponsePB response;
+            EXPECT_TRUE(manager.executeFunction(request, response));
+            ASSERT_TRUE(response.has_remote_response());
+            EXPECT_EQ(response.remote_response().transfer_status(),
+                      ec == kv_cache_manager::ClientErrorCode::ER_SDK_TIMEOUT ? REMOTE_TRANSFER_STATUS_TIMEOUT :
+                                                                                REMOTE_TRANSFER_STATUS_FAILED);
+        }
+    }
 }
 
 TEST(KVCMLocalTest, MatchAndReadUseReturnedLocation) {
@@ -524,7 +571,7 @@ TEST(KVCMLocalTest, PayloadReadTimeoutQuarantinesOnlyDestinationBlock) {
     EXPECT_TRUE(read(*backend.backend, healthy_request, std::move(healthy_observation.match_meta)));
 
     kv_cache_manager::WriteLocation empty_write_location;
-    EXPECT_CALL(*client_wrapper, getWriteLocation(_, _, _, _, _, _))
+    EXPECT_CALL(*client_wrapper, getWriteLocation(_, _, _, _, _, _, 0))
         .WillOnce(Return(std::make_pair(true, empty_write_location)));
     auto write_task = backend.backend->prepareWrite(healthy_request);
     ASSERT_TRUE(write_task);
