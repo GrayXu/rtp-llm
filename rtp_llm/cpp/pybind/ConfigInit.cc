@@ -528,6 +528,8 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("kvcm_vipserver_domain", &KVCacheConfig::kvcm_vipserver_domain)
         .def_readwrite("kvcm_server_address", &KVCacheConfig::kvcm_server_address)
         .def_readwrite("kvcm_instance_group", &KVCacheConfig::kvcm_instance_group)
+        .def_readwrite("kvcm_read_backend_type", &KVCacheConfig::kvcm_read_backend_type)
+        .def_readwrite("kvcm_min_replica_count", &KVCacheConfig::kvcm_min_replica_count)
         .def_readwrite("kvcm_meta_channel_retry_time", &KVCacheConfig::kvcm_meta_channel_retry_time)
         .def_readwrite("kvcm_meta_channel_connection_timeout", &KVCacheConfig::kvcm_meta_channel_connection_timeout)
         .def_readwrite("kvcm_meta_channel_call_timeout", &KVCacheConfig::kvcm_meta_channel_call_timeout)
@@ -577,7 +579,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def(py::pickle(
             [](const KVCacheConfig& self) {
                 return py::make_tuple(std::string("KVCacheConfig"),
-                                      8,
+                                      9,
                                       self.reuse_cache,
                                       self.multi_task_prompt,
                                       self.multi_task_prompt_str,
@@ -646,12 +648,21 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                                       self.kv_cache_event_instance_id,
                                       self.kv_cache_event_host_ip_port,
                                       self.memory_cache_swa_block_ratio,
-                                      self.dsv41_decoder_swa_pool_blocks);
+                                      self.dsv41_decoder_swa_pool_blocks,
+                                      self.kvcm_read_backend_type,
+                                      self.kvcm_min_replica_count);
             },
             [](py::tuple t) {
-                const py::tuple pool_state = t;
-                const bool has_pool_fields = t.size() == 71 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 8;
-                if (has_pool_fields) {
+                const py::tuple extended_state = t;
+                const bool has_combined_fields = t.size() == 73 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 9;
+                const bool has_version8_fields = t.size() == 71 && py::isinstance<py::int_>(t[1]) && t[1].cast<int>() == 8;
+                // Upstream v8 appended double/uint pool settings; GDR v8 appended
+                // two int KVCM settings. Preserve both native serializer layouts.
+                const bool has_pool_fields = has_combined_fields
+                    || (has_version8_fields && py::isinstance<py::float_>(t[69]));
+                const bool has_kvcm_fields = has_combined_fields
+                    || (has_version8_fields && py::isinstance<py::int_>(t[69]));
+                if (has_pool_fields || has_kvcm_fields) {
                     t    = t[py::slice(0, 69, 1)].cast<py::tuple>();
                     t[1] = py::int_(7);
                 }
@@ -765,8 +776,13 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                     c.kv_cache_event_host_ip_port     = event_state[68].cast<std::string>();
                 }
                 if (has_pool_fields) {
-                    c.memory_cache_swa_block_ratio  = pool_state[69].cast<double>();
-                    c.dsv41_decoder_swa_pool_blocks = pool_state[70].cast<uint32_t>();
+                    c.memory_cache_swa_block_ratio  = extended_state[69].cast<double>();
+                    c.dsv41_decoder_swa_pool_blocks = extended_state[70].cast<uint32_t>();
+                }
+                if (has_kvcm_fields) {
+                    const size_t offset = has_combined_fields ? 71 : 69;
+                    c.kvcm_read_backend_type = extended_state[offset].cast<int32_t>();
+                    c.kvcm_min_replica_count = extended_state[offset + 1].cast<int32_t>();
                 }
                 return c;
             }));
