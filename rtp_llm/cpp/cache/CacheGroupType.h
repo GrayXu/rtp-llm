@@ -156,10 +156,10 @@ inline CacheGroupPolicy defaultCacheGroupPolicy(CacheGroupType group_type) {
     return policy;
 }
 
-// Reusable FULL/SWA groups report their own resident components. LINEAR groups
-// are excluded; memory placement is validated before attaching to the cache tree.
+// Reusable groups report their own resident components. Tag exclusions and
+// memory placement are validated before attaching to the cache tree.
 inline bool cacheGroupPublishesEvents(const CacheGroupPolicy& policy) {
-    return policy.enable_prefix_reuse && policy.group_type != CacheGroupType::LINEAR;
+    return policy.enable_prefix_reuse;
 }
 
 }  // namespace rtp_llm

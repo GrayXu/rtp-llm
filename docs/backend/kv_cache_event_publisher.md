@@ -5,8 +5,9 @@ queue, worker, or connection; `kvcm` enables publishing.
 
 ## Semantics
 
-Events describe logical cache keys, not physical block indices. Reusable FULL/SWA components are reported independently;
-LINEAR and reuse-disabled groups are excluded. Each component requires a complete, IDLE, non-detached DEVICE GroupSet.
+Events describe logical cache keys, not physical block indices. Reusable components are reported independently;
+`csa_state`, `swa_kv`, and reuse-disabled groups are excluded, without filtering by cache group type.
+Each component requires a complete, IDLE, non-detached DEVICE GroupSet.
 Deleting a component preserves the others. Duplicate puts and LRU touches do not produce events.
 
 Cache mutations only attempt a bounded non-blocking enqueue; network I/O runs on the publisher worker. Queue overflow,
@@ -19,7 +20,7 @@ Only `tp_rank=0` publishes when `pp_size=1`. CP-sharded Prefill reports canonica
 host state. When the value is empty, RTP-LLM derives a per-rank endpoint as
 `server_ip:(start_port + rank_id * worker_info_port_num)`.
 
-Publishing supports DEVICE FULL/SWA caches, including sparse tails. HOST/HOST_PINNED groups are skipped.
+Publishing supports reusable DEVICE caches, including sparse tails. HOST/HOST_PINNED groups are skipped.
 
 ## KVCM lifecycle
 
