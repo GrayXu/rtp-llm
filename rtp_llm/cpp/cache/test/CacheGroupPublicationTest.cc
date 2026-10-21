@@ -16,7 +16,7 @@ CacheGroupPolicy policyOf(CacheGroupType type, bool reuse = true) {
 TEST(CacheGroupPublicationTest, PublishesReusableFullAndSwaGroups) {
     EXPECT_TRUE(cacheGroupPublishesEvents(policyOf(CacheGroupType::FULL)));
     EXPECT_FALSE(cacheGroupPublishesEvents(policyOf(CacheGroupType::FULL, false)));
-    EXPECT_FALSE(cacheGroupPublishesEvents(policyOf(CacheGroupType::LINEAR)));
+    EXPECT_TRUE(cacheGroupPublishesEvents(policyOf(CacheGroupType::LINEAR)));
     EXPECT_TRUE(cacheGroupPublishesEvents(policyOf(CacheGroupType::SWA)));
     EXPECT_FALSE(cacheGroupPublishesEvents(policyOf(CacheGroupType::LINEAR, false)));
     EXPECT_FALSE(cacheGroupPublishesEvents(policyOf(CacheGroupType::SWA, false)));
@@ -36,7 +36,7 @@ TEST(CacheGroupPublicationTest, SelectsEveryEligibleGroupInOrder) {
             selected.push_back(gid);
         }
     }
-    EXPECT_EQ((std::vector<size_t>{0, 1, 3}), selected);
+    EXPECT_EQ((std::vector<size_t>{0, 1, 3, 4}), selected);
 }
 
 }  // namespace rtp_llm::test
