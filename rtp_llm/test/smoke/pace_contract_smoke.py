@@ -36,8 +36,10 @@ def main():
             subprocess.run([args.sdk, str(config_path), str(server.pace_fixture.storage_type)],
                            env=env, check=True, timeout=120)
         finally:
-            server.stop_server()
-            server.copy_logs()
+            try:
+                server.close()
+            finally:
+                server.copy_logs()
 
 
 if __name__ == "__main__":

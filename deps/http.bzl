@@ -156,6 +156,26 @@ def http_deps():
         sha256 = "94c10e4aa3916600b6e2fcb531f137a53ecc38bf7e19662ce09b6bec16ee7462",
     )
 
+    # Local PACE smoke services (Linux x86_64); --distdir can supply the same
+    # release RPMs for offline builds.
+    http_file(
+        name = "pace_test_meta_rpm",
+        urls = [
+            "https://rtp-maga.oss-cn-zhangjiakou.aliyuncs.com/pace/server/tair_mempool_metaservice-3.1.21_2026_10_14_03_08-1.al8.x86_64.rpm",
+            "https://rtp-maga.cn-zhangjiakou.oss.aliyuncs.com/pace/server/tair_mempool_metaservice-3.1.21_2026_10_14_03_08-1.al8.x86_64.rpm",
+        ],
+        sha256 = "e9f2c946ae6815b54635f58d479f51316e4fe8f86daca6a33b3d7ef7edfe6719",
+    )
+
+    http_file(
+        name = "pace_test_server_rpm",
+        urls = [
+            "https://rtp-maga.oss-cn-zhangjiakou.aliyuncs.com/pace/server/tair_mempool_server-3.1.21_2026_10_14_03_12-1.al8.x86_64.rpm",
+            "https://rtp-maga.cn-zhangjiakou.oss.aliyuncs.com/pace/server/tair_mempool_server-3.1.21_2026_10_14_03_12-1.al8.x86_64.rpm",
+        ],
+        sha256 = "d97b2fe2b813edea51b40316dcb27dbc982003beca22d68a358b83e53489ee43",
+    )
+
     http_file(
         name = "remote_kv_cache_manager_client_rpm",
         urls = [
@@ -210,9 +230,9 @@ exports_files(["bin/kv_cache_manager_bin"])
     http_archive(
         name = "remote_kv_cache_manager_server_cuda130",
         urls = [
-            "https://rtp-maga.oss-cn-zhangjiakou.aliyuncs.com/kv_cache_manager/server/kv_cache_manager_server_2026_08_19_20_01.tar.gz",
+            "https://rtp-maga.oss-cn-zhangjiakou.aliyuncs.com/kv_cache_manager/server/kv-cache-manager-server-79404320.x86_64.tar.gz",
         ],
-        sha256 = "facbcee3395e3fa129cf45c7034d82e576fefc5af7017fead26ed795bb6f7bf6",
+        sha256 = "23713be2ca4ac04dae156d23b0616380ec62b268458a0f56f37f77a6f4ec4236",
         build_file_content = """
 exports_files(["bin/kv_cache_manager_bin"])
         """,
