@@ -29,7 +29,9 @@ runfiles_alias(
     name = "remote_kv_cache_manager_server_bin",
     src = select({
         "@//:using_cuda13_x86": "@remote_kv_cache_manager_server_cuda130//:bin/kv_cache_manager_bin",
-        "@//:using_cuda13_arm": "@remote_kv_cache_manager_server_cuda130//:bin/kv_cache_manager_bin",
+        "@//:using_cuda13_arm": "@remote_kv_cache_manager_server_aarch64//:bin/kv_cache_manager_bin",
+        "@//:using_cuda12_arm": "@remote_kv_cache_manager_server_aarch64//:bin/kv_cache_manager_bin",
+        "@//:using_arm": "@remote_kv_cache_manager_server_aarch64//:bin/kv_cache_manager_bin",
         "//conditions:default": "@remote_kv_cache_manager_server//:bin/kv_cache_manager_bin",
     }),
     runfile_path = "3rdparty/remote_kv_cache_manager/bin/kv_cache_manager_bin",
