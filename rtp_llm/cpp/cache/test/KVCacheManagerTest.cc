@@ -396,7 +396,7 @@ static CacheConfig makeEventPublicationCacheConfig(bool reversed,
                                                    CacheMemoryPlacement swa_placement = CacheMemoryPlacement::DEVICE) {
     auto config = makeSimpleMhaCacheConfig(4, 128, 1, DataType::TYPE_FP16);
     std::vector<GroupBase> groups;
-    const std::vector<std::string> tags{"full", "swa", "linear", "disabled"};
+    const std::vector<std::string> tags{"full", "swa", "csa_state", "disabled"};
     const std::vector<CacheGroupType> types{
         CacheGroupType::FULL, CacheGroupType::SWA, CacheGroupType::LINEAR, CacheGroupType::FULL};
     for (size_t i = 0; i < tags.size(); ++i) {
@@ -414,7 +414,7 @@ static CacheConfig makeEventPublicationCacheConfig(bool reversed,
     if (reversed) {
         std::reverse(groups.begin(), groups.end());
     }
-    config.setTopology(std::move(groups), {{0, {"full"}}, {1, {"swa"}}, {2, {"linear"}}, {3, {"disabled"}}});
+    config.setTopology(std::move(groups), {{0, {"full"}}, {1, {"swa"}}, {2, {"csa_state"}}, {3, {"disabled"}}});
     return config;
 }
 
@@ -453,7 +453,7 @@ TEST_F(KVCacheManagerTest, EventPublisherWiresEligibleGroupsInTopologyOrder) {
                     std::vector<DeviceBlockPoolPtr>{block_tree_cache_test::makeStructuralDevicePool(1)}, nullptr, nullptr),
                 std::make_shared<LinearGroupSet>(
                     std::vector<DeviceBlockPoolPtr>{block_tree_cache_test::makeStructuralDevicePool(2)}, nullptr, nullptr)};
-            const std::vector<std::string> group_tags{"full", "swa", "linear"};
+            const std::vector<std::string> group_tags{"full", "swa", "csa_state"};
             for (size_t i = 0; i < groups.size(); ++i) {
                 groups[i]->initialize(i, config.topologyPtr(), {group_tags[i]});
             }
@@ -483,7 +483,7 @@ TEST_F(KVCacheManagerTest, EventPublisherWiresEligibleGroupsInTopologyOrder) {
             EXPECT_EQ(cache->logicalCacheSnapshot().block_groups, full_only);
             EXPECT_EQ(manager.cache_event_publisher_->status().accepted_count, 0u);
 
-            // A LINEAR component mutation produces neither a snapshot component nor an event.
+            // A component excluded by tag produces neither a snapshot component nor an event.
             resources[0][2].device_blocks = {47};
             cache->insert({100, 200}, resources, Tier::DEVICE);
             EXPECT_EQ(cache->logicalCacheSnapshot().block_groups, full_only);

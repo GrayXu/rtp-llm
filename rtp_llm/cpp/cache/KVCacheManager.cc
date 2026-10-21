@@ -795,7 +795,8 @@ void KVCacheManager::initCacheEventPublisher(std::shared_ptr<KVCacheEventReporte
         std::vector<std::string> reuse_group_tags;
         for (const auto& group : config_.topology().groups()) {
             if (!cacheGroupPublishesEvents(group.policy)
-                || group.policy.memory_placement != CacheMemoryPlacement::DEVICE) {
+                || group.policy.memory_placement != CacheMemoryPlacement::DEVICE
+                || group.tag == "csa_state" || group.tag == "swa_kv") {
                 continue;
             }
             reuse_group_tags.push_back(group.tag);
