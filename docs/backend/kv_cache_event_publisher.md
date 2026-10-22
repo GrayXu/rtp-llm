@@ -70,4 +70,14 @@ Invalid configuration disables publishing without disabling inference. VIPServer
 does for remote-cache storage. Direct RPC discovery requires the server's `GetClusterInfo` API and a leader endpoint;
 standalone servers without leader election can continue to use the explicit HTTP endpoint.
 
+## FlexLB worker metadata
+
+`GetWorkerStatus` reports `kv_cache_group_mode` at protobuf field 25, matching FlexLB's protocol. It uses the same
+DEVICE, prefix-reuse, and exact tag filters as HBM publishing. Eligible LINEAR groups report `WITH_MAMBA` (2);
+other eligible groups report `FULL_ATTENTION_ONLY` (1). An unavailable cache topology or no eligible groups reports
+`UNSPECIFIED` (0). DeepSeek V4.1's excluded `csa_state` and `swa_kv` do not change its FULL-only reporting mode.
+
+FlexLB maps these modes to `QT_PREFIX_MATCH_WITH_MAMBA` and `QT_PREFIX_MATCH`, respectively, without an explicit
+query-type override. Its query Instance ID and cache-key block size must still match the publisher's registration.
+
 See [KVCM remote cache configuration](reuse_kv_cache.md#kvcm-remote-cache) for the shared backend settings.
