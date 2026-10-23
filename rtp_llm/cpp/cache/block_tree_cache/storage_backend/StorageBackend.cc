@@ -349,7 +349,7 @@ void StorageBackend::read(StorageRequest request, std::shared_ptr<StorageBackend
                 readImpl(state->request, match_meta);
             } catch (const StorageOperationTimeout& exception) {
                 error      = ErrorInfo(ErrorCode::DEADLINE_EXCEEDED, exception.what());
-                quarantine = true;
+                quarantine = !exception.buffer_safe;
             } catch (const StorageOperationCompletionUnknown& exception) {
                 error      = ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, exception.what());
                 quarantine = true;
@@ -387,8 +387,8 @@ bool StorageBackend::write(StorageWriteTask task) {
             try {
                 writeImpl(state->request);
             } catch (const StorageOperationTimeout& error) {
-                quarantine = true;
-                RTP_LLM_LOG_WARNING("StorageBackend write timed out; quarantining request pins: %s", error.what());
+                quarantine = !error.buffer_safe;
+                RTP_LLM_LOG_WARNING("StorageBackend write timed out; buffer_safe=%d: %s", error.buffer_safe, error.what());
             } catch (const StorageOperationCompletionUnknown& error) {
                 quarantine = true;
                 RTP_LLM_LOG_WARNING("StorageBackend write completion is unknown; quarantining request pins: %s",

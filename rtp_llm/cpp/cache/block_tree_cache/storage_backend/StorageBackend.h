@@ -38,12 +38,13 @@ public:
     using std::runtime_error::runtime_error;
 };
 
-// The transport reported an explicit timeout. Buffer ownership is still
-// unknown, so this remains a completion-unknown failure for quarantine while
-// allowing callers to preserve the timeout error code.
+// Preserve timeout status; only an explicit buffer-safety proof permits release.
 class StorageOperationTimeout: public StorageOperationCompletionUnknown {
 public:
-    using StorageOperationCompletionUnknown::StorageOperationCompletionUnknown;
+    explicit StorageOperationTimeout(const std::string& message, bool buffer_safe = false):
+        StorageOperationCompletionUnknown(message), buffer_safe(buffer_safe) {}
+
+    const bool buffer_safe;
 };
 
 struct StorageMatchResult {

@@ -84,6 +84,8 @@ public:
         SUCCESS,
         FAILED,
         TIMEOUT,
+        FAILED_BUFFER_SAFE,
+        TIMEOUT_BUFFER_SAFE,
     };
 
     Impl(const CacheConfig&                            cache_config,
@@ -592,7 +594,7 @@ public:
         const kv_cache_manager::UriStrVec uris(request.uris().begin(), request.uris().end());
         if (tags.size() != blocks.size() || blocks.size() != uris.size()) {
             RTP_LLM_LOG_WARNING("KVCM transfer tag/block/URI count mismatch");
-            response.set_transfer_status(REMOTE_TRANSFER_STATUS_FAILED);
+            response.set_transfer_status(REMOTE_TRANSFER_STATUS_FAILED_BUFFER_SAFE);
             return false;
         }
         if (tags.empty()) {
@@ -605,20 +607,30 @@ public:
         for (const auto& tag : tags) {
             if (pools_by_tag_.find(tag) == pools_by_tag_.end()) {
                 RTP_LLM_LOG_ERROR("KVCM transfer contains unregistered tag [%s]", tag.c_str());
-                response.set_transfer_status(REMOTE_TRANSFER_STATUS_FAILED);
+                response.set_transfer_status(REMOTE_TRANSFER_STATUS_FAILED_BUFFER_SAFE);
                 return false;
             }
         }
         setCudaDevice();
         kv_cache_manager::BlockBuffers buffers;
         if (!group_policy_->genBlockBuffers(tags, blocks, buffers)) {
-            response.set_transfer_status(REMOTE_TRANSFER_STATUS_FAILED);
+            response.set_transfer_status(REMOTE_TRANSFER_STATUS_FAILED_BUFFER_SAFE);
             return false;
         }
-        const auto result = executeTagTransfers(request.op(), tags, blocks, uris, buffers, response);
-        response.set_transfer_status(result == TransferResult::SUCCESS ? REMOTE_TRANSFER_STATUS_SUCCESS :
-                                     result == TransferResult::TIMEOUT ? REMOTE_TRANSFER_STATUS_TIMEOUT :
-                                                                         REMOTE_TRANSFER_STATUS_FAILED);
+        TransferResult result = TransferResult::FAILED;
+        try {
+            result = executeTagTransfers(request.op(), tags, blocks, uris, buffers, response);
+        } catch (...) {
+            // An exception after entering the SDK carries no buffer-safety proof.
+            response.clear_actual_uris();
+            RTP_LLM_LOG_ERROR("KVCM transfer threw an exception");
+        }
+        response.set_transfer_status(
+            result == TransferResult::SUCCESS ? REMOTE_TRANSFER_STATUS_SUCCESS :
+            result == TransferResult::TIMEOUT ? REMOTE_TRANSFER_STATUS_TIMEOUT :
+            result == TransferResult::TIMEOUT_BUFFER_SAFE ? REMOTE_TRANSFER_STATUS_TIMEOUT_BUFFER_SAFE :
+            result == TransferResult::FAILED_BUFFER_SAFE ? REMOTE_TRANSFER_STATUS_FAILED_BUFFER_SAFE :
+                                                          REMOTE_TRANSFER_STATUS_FAILED);
         return result == TransferResult::SUCCESS;
     }
 
@@ -1006,6 +1018,12 @@ private:
             if (operation == REMOTE_OPERATION_READ) {
                 const auto ec =
                     client_wrapper_->loadKvCachesForTagWithStatus(tag, batch_uris, batch_buffers, trace_info);
+                if (ec == kv_cache_manager::ClientErrorCode::ER_SDK_TIMEOUT_BUFFER_SAFE) {
+                    return TransferResult::TIMEOUT_BUFFER_SAFE;
+                }
+                if (ec == kv_cache_manager::ClientErrorCode::ER_SDK_ERROR_BUFFER_SAFE) {
+                    return TransferResult::FAILED_BUFFER_SAFE;
+                }
                 if (ec == kv_cache_manager::ClientErrorCode::ER_SDK_TIMEOUT) {
                     return TransferResult::TIMEOUT;
                 }
@@ -1015,12 +1033,20 @@ private:
             } else {
                 auto [ec, result] =
                     client_wrapper_->saveKvCachesForTagWithStatus(tag, batch_uris, batch_buffers, trace_info);
+                if (ec == kv_cache_manager::ClientErrorCode::ER_SDK_TIMEOUT_BUFFER_SAFE) {
+                    return TransferResult::TIMEOUT_BUFFER_SAFE;
+                }
+                if (ec == kv_cache_manager::ClientErrorCode::ER_SDK_ERROR_BUFFER_SAFE) {
+                    return TransferResult::FAILED_BUFFER_SAFE;
+                }
                 if (ec == kv_cache_manager::ClientErrorCode::ER_SDK_TIMEOUT) {
                     return TransferResult::TIMEOUT;
                 }
-                if (ec != kv_cache_manager::ClientErrorCode::ER_OK
-                    || (!result.empty() && result.size() != batch_uris.size())) {
+                if (ec != kv_cache_manager::ClientErrorCode::ER_OK) {
                     return TransferResult::FAILED;
+                }
+                if (!result.empty() && result.size() != batch_uris.size()) {
+                    return TransferResult::FAILED_BUFFER_SAFE;
                 }
                 for (size_t index = 0; index < result.size(); ++index) {
                     actual_uris[indices[index]] = std::move(result[index]);
@@ -1127,9 +1153,12 @@ private:
         if (!broadcast_manager_) {
             RTP_LLM_CHECK_WITH_INFO(
                 requests.size() == 1, "KVCM local transfer requires exactly one request, got %zu", requests.size());
-            FunctionResponsePB response;
-            execute(requests.front().remote_request(), *response.mutable_remote_response());
-            responses.push_back(std::move(response));
+            responses.emplace_back();
+            try {
+                execute(requests.front().remote_request(), *responses.back().mutable_remote_response());
+            } catch (...) {
+                throw StorageOperationCompletionUnknown("KVCM local transfer completion is unknown");
+            }
         } else {
             auto rpc_call = [](const std::shared_ptr<RpcService::Stub>&    stub,
                                const std::shared_ptr<grpc::ClientContext>& context,
@@ -1137,10 +1166,17 @@ private:
                                grpc::CompletionQueue*                      queue) {
                 return stub->AsyncExecuteFunction(context.get(), request, queue);
             };
-            auto result =
-                broadcast_manager_->broadcast<FunctionRequestPB, FunctionResponsePB>(requests, timeout_ms, rpc_call);
-            if (result == nullptr) {
+            std::shared_ptr<BroadcastResult<FunctionRequestPB, FunctionResponsePB>> result;
+            try {
+                result = broadcast_manager_->broadcast<FunctionRequestPB, FunctionResponsePB>(
+                    requests, timeout_ms, rpc_call);
+            } catch (...) {
+                // Dispatch may already have submitted a prefix of the workers.
                 throw StorageOperationCompletionUnknown("KVCM broadcast dispatch failed");
+            }
+            if (result == nullptr) {
+                // A null result is returned only before submitting any RPC.
+                throw std::runtime_error("KVCM broadcast dispatch failed before submission");
             }
             try {
                 result->waitDone();
@@ -1156,13 +1192,19 @@ private:
             if (!result->success()) {
                 throw StorageOperationCompletionUnknown("KVCM broadcast completion is unknown");
             }
-            responses = result->responses();
+            try {
+                responses = result->responses();
+            } catch (...) {
+                throw StorageOperationCompletionUnknown("KVCM worker responses are unavailable");
+            }
         }
 
         if (responses.size() != requests.size()) {
             throw StorageOperationCompletionUnknown("KVCM worker response count mismatch");
         }
-        bool failed = false;
+        bool failed      = false;
+        bool timed_out   = false;
+        bool buffer_safe = true;
         for (const auto& response : responses) {
             if (!response.has_remote_response()) {
                 throw StorageOperationCompletionUnknown("KVCM worker returned no transfer response");
@@ -1171,16 +1213,30 @@ private:
                 case REMOTE_TRANSFER_STATUS_UNSPECIFIED:  // successful legacy worker
                 case REMOTE_TRANSFER_STATUS_SUCCESS:
                     break;
-                case REMOTE_TRANSFER_STATUS_FAILED:
+                case REMOTE_TRANSFER_STATUS_FAILED_BUFFER_SAFE:
                     failed = true;
                     break;
+                case REMOTE_TRANSFER_STATUS_TIMEOUT_BUFFER_SAFE:
+                    timed_out = true;
+                    break;
                 case REMOTE_TRANSFER_STATUS_TIMEOUT:
-                    throw StorageOperationTimeout("KVCM transfer timed out");
+                    timed_out = true;
+                    buffer_safe = false;
+                    break;
+                case REMOTE_TRANSFER_STATUS_FAILED:
                 default:
-                    throw StorageOperationCompletionUnknown("KVCM transfer completion is unknown");
+                    failed = true;
+                    buffer_safe = false;
+                    break;
             }
         }
+        if (timed_out) {
+            throw StorageOperationTimeout("KVCM transfer timed out", buffer_safe);
+        }
         if (failed) {
+            if (!buffer_safe) {
+                throw StorageOperationCompletionUnknown("KVCM transfer completion is unknown");
+            }
             throw std::runtime_error("KVCM transfer failed");
         }
         return responses;
