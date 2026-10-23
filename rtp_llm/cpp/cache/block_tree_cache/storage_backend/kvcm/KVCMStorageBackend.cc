@@ -617,14 +617,7 @@ public:
             response.set_transfer_status(REMOTE_TRANSFER_STATUS_FAILED_BUFFER_SAFE);
             return false;
         }
-        TransferResult result = TransferResult::FAILED;
-        try {
-            result = executeTagTransfers(request.op(), tags, blocks, uris, buffers, response);
-        } catch (...) {
-            // An exception after entering the SDK carries no buffer-safety proof.
-            response.clear_actual_uris();
-            RTP_LLM_LOG_ERROR("KVCM transfer threw an exception");
-        }
+        const auto result = executeTagTransfers(request.op(), tags, blocks, uris, buffers, response);
         response.set_transfer_status(
             result == TransferResult::SUCCESS ? REMOTE_TRANSFER_STATUS_SUCCESS :
             result == TransferResult::TIMEOUT ? REMOTE_TRANSFER_STATUS_TIMEOUT :
@@ -1204,6 +1197,7 @@ private:
         }
         bool failed      = false;
         bool timed_out   = false;
+        bool unknown     = false;
         bool buffer_safe = true;
         for (const auto& response : responses) {
             if (!response.has_remote_response()) {
@@ -1224,8 +1218,13 @@ private:
                     buffer_safe = false;
                     break;
                 case REMOTE_TRANSFER_STATUS_FAILED:
-                default:
+                    // Legacy FAILED alone releases pins, but cannot prove a
+                    // peer's timeout safe to release.
                     failed = true;
+                    buffer_safe = false;
+                    break;
+                default:
+                    unknown = true;
                     buffer_safe = false;
                     break;
             }
@@ -1233,10 +1232,10 @@ private:
         if (timed_out) {
             throw StorageOperationTimeout("KVCM transfer timed out", buffer_safe);
         }
+        if (unknown) {
+            throw StorageOperationCompletionUnknown("KVCM transfer completion is unknown");
+        }
         if (failed) {
-            if (!buffer_safe) {
-                throw StorageOperationCompletionUnknown("KVCM transfer completion is unknown");
-            }
             throw std::runtime_error("KVCM transfer failed");
         }
         return responses;
