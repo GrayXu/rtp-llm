@@ -32,7 +32,7 @@ The publisher registers the instance in prefix mode and registers the node, then
 independently of batched `EVENT_BLOCK_ADD`/`EVENT_BLOCK_DELETE` changes and `EVENT_HEARTBEAT` requests. It sends best-effort
 `EVENT_HOST_DOWN` during engine shutdown. Snapshots replace all medium state for that host identity;
 failed or rate-limited snapshot rounds are logged and discarded. Failed incremental batches are dropped and counted,
-with backoff confined to the incremental sender. Reporting is best effort; KVCM's same-reporter snapshot/delta write
+without an additional send delay. Reporting is best effort; KVCM's same-reporter snapshot/delta write
 barrier still applies. The endpoint must support snapshot fencing and crash-safe commit semantics.
 
 Snapshots are captured once after registration, then every 30 seconds by default, timed from capture/handoff rather

@@ -1088,15 +1088,9 @@ private:
                         RTP_LLM_LOG_WARNING("KVCMPublisher mutation report failed %zu consecutive time(s); "
                                             "dropping %zu event(s)", consecutive_mutation_failures, batch.size());
                     }
-                    // Back off only this failed incremental path, never snapshots
-                    // or heartbeats. The failed batch has already been dropped.
-                    if (registered_.load(std::memory_order_acquire)) {
-                        waitWithBackoff();
-                    }
                 } else if (registered_.load(std::memory_order_acquire)) {
                     if (!batch.empty()) {
                         consecutive_mutation_failures = 0;
-                        retry_interval = base_retry_interval;
                     }
                     state_.store(PublisherState::READY, std::memory_order_relaxed);
                 }
