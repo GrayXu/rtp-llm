@@ -60,6 +60,12 @@ Arguments have equivalent upper-case environment variables.
 | `--kv_cache_event_instance_id` | empty | stable deployment-level instance ID |
 | `--kv_cache_event_host_ip_port` | empty (auto-derived) | stable endpoint; must be unique for every DP replica when `dp_size>1` |
 
+Set `KV_CACHE_EVENT_ENABLE_SNAPSHOT=0` before starting RTP-LLM to disable all `EVENT_BLOCK_SNAPSHOT` reports, including
+startup, periodic, failure-recovery, and server-requested snapshots. This environment-only switch defaults to `1` and
+is read when the publisher is constructed. Registration, heartbeats, incremental ADD/DELETE reports, and shutdown
+HOST_DOWN reports continue. Snapshot collection and reconciliation queue discards are skipped. Without snapshots,
+existing cached keys cannot be backfilled and dropped or failed events cannot be repaired by reconciliation.
+
 When the explicit endpoint is empty, the publisher reuses `RECO_ENABLE_VIPSERVER` and `RECO_VIPSERVER_DOMAIN`, or
 `RECO_SERVER_ADDRESS` when VIPServer is disabled. The existing subscriber supplies Meta RPC bootstrap addresses;
 `GetClusterInfo` supplies the current leader's host and Meta HTTP port. Reporting still uses HTTP, with no KVCM SDK

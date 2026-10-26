@@ -56,6 +56,7 @@ cc_library(
         "//rtp_llm/cpp/utils:core_utils",
         "@curl//:curl",
         "@grpc//:grpc++",
+        "@havenask//aios/autil:env_util",
         "@rapidjson//:rapidjson",
     ],
 )

@@ -18,6 +18,7 @@
 #include <thread>
 #include <utility>
 
+#include "autil/EnvUtil.h"
 #include "rtp_llm/cpp/cache/events/KVCacheEventQueue.h"
 #include "rtp_llm/cpp/cache/events/KVCMPublisherUtils.h"
 #include "rtp_llm/cpp/cache/events/kvcm_discovery.pb.h"
@@ -619,6 +620,7 @@ public:
         context_(std::move(context)),
         snapshot_provider_(std::move(snapshot_provider)),
         reporter_(std::move(reporter)),
+        snapshot_enabled_(autil::EnvUtil::getEnv("KV_CACHE_EVENT_ENABLE_SNAPSHOT", true)),
         queue_(config_.queue_capacity) {
         if (reporter_) {
             snapshot_reporter_ = reporter_;
@@ -655,6 +657,9 @@ public:
         }
         if (started_.load(std::memory_order_relaxed)) {
             return true;
+        }
+        if (!snapshot_enabled_) {
+            RTP_LLM_LOG_INFO("KVCMPublisher snapshots disabled by KV_CACHE_EVENT_ENABLE_SNAPSHOT");
         }
         stopping_.store(false, std::memory_order_relaxed);
         registered_.store(false, std::memory_order_relaxed);
@@ -987,9 +992,10 @@ private:
     }
 
     bool needsReconciliation(uint64_t generation) const {
-        return reconciled_generation_ != generation
-               || requested_snapshot_epoch_.load(std::memory_order_relaxed)
-                      > snapshot_epoch_.load(std::memory_order_relaxed);
+        return snapshot_enabled_
+               && (reconciled_generation_ != generation
+                   || requested_snapshot_epoch_.load(std::memory_order_relaxed)
+                          > snapshot_epoch_.load(std::memory_order_relaxed));
     }
 
     void workerLoop() noexcept {
@@ -1014,7 +1020,7 @@ private:
         try {
             while (!stopping_.load(std::memory_order_relaxed)) {
                 if (!registered_.load(std::memory_order_relaxed)) {
-                    // A new registration must reconcile from a fresh snapshot.
+                    // A new registration must reconcile from a fresh snapshot when enabled.
                     pending_snapshot_report_.reset();
                     if (!registerNode()) {
                         state_.store(PublisherState::DEGRADED, std::memory_order_relaxed);
@@ -1030,10 +1036,13 @@ private:
                     registered_.store(true, std::memory_order_relaxed);
                     registered_once_.store(true, std::memory_order_relaxed);
                     dirty_generation_.fetch_add(1, std::memory_order_relaxed);
+                    if (!snapshot_enabled_) {
+                        state_.store(PublisherState::READY, std::memory_order_relaxed);
+                    }
                 }
 
                 const auto now = std::chrono::steady_clock::now();
-                if (!pending_snapshot_report_ && now >= next_snapshot) {
+                if (snapshot_enabled_ && !pending_snapshot_report_ && now >= next_snapshot) {
                     dirty_generation_.fetch_add(1, std::memory_order_relaxed);
                     next_snapshot = now + std::chrono::milliseconds(std::max(config_.snapshot_interval_ms, 1));
                 }
@@ -1119,6 +1128,7 @@ private:
     KVCacheSnapshotProvider               snapshot_provider_;
     std::shared_ptr<KVCacheEventReporter> reporter_;
     std::shared_ptr<KVCacheEventReporter> snapshot_reporter_;
+    const bool                            snapshot_enabled_;
     detail::KVCacheEventQueue             queue_;
     std::thread                           worker_;
     std::thread                           heartbeat_worker_;
