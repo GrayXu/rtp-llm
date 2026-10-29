@@ -908,6 +908,9 @@ message RemoteOperationRequestPB {
     repeated string group_tags = 6;
     // Metadata operations are served by TP rank 0 for this backend's instance.
     RemoteMetadataRequestPB metadata = 7;
+    // Empty preserves one block per URI. Otherwise each positive count gives
+    // the number of consecutive physical group_tags/block_ids for that URI.
+    repeated uint32 uri_block_counts = 8;
 }
 
 message RemoteMetadataRequestPB {
