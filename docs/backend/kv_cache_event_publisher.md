@@ -54,6 +54,11 @@ with a single PACE DRAM backend merges the three compatible FULL groups into one
 remote allocation per rank, using the original GPU buffers directly. State specs remain
 `S3_TP<n>`/`S4_TP<n>`. Custom configurations, other backends, and `DeepSeekV41DSpark` retain
 `F0_TP<n>`/`F1_TP<n>`/`F2_TP<n>`.
+For merged FULL transfers, select the existing normal batch path with
+`PACE_ENABLE_GATHERSCATTER=OFF` before SDK initialization. The current SDK caches this setting at initialization
+and exposes no per-request normal-mode selector; RTP does not override it. Normal GDR sends the original GPU
+IOVs directly to offsets in the single GA, without payload packing. This path requires no PACE or SDK source changes.
+Compact gather/scatter is outside this merge's supported transfer path.
 The automatic remote-cache Instance ID includes both specs and groups, so retaining the renamed groups can change
 that ID relative to an instance registered with `Fglobal_kv_1`/`Fglobal_kv_2` groups.
 This pool-name compatibility mapping applies to the `DeepSeekV41` and `DeepSeekV41DSpark` model names supplied by
