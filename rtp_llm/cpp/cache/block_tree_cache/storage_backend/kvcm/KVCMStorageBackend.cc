@@ -250,32 +250,6 @@ public:
         }
         kvcm::ClientWrapper::ConfigMap client_config_map;
         try {
-            if (runtime_config_.model_name == "DeepSeekV41" && kv_cache_config_.kvcm_client_config.empty()
-                && full_group_tags.size() == 3) {
-                kvcm::SdkWrapperConfig sdk;
-                sdk.parseBackendConfigs(kv_cache_config_.kvcm_model_sdk_config);
-                const auto& backends = sdk.sdk_backend_configs();
-                if (backends.size() == 1) {
-                    const auto fields =
-                        autil::legacy::AnyCast<autil::legacy::json::JsonMap>(autil::legacy::ToJson(backends.front()));
-                    const auto& first = topology.group(full_group_tags.front());
-                    std::set<std::string> names;
-                    bool compatible = true;
-                    for (const auto& [id, group] : group_policy_->groups()) {
-                        (void)id;
-                        if (!group.is_full)
-                            continue;
-                        names.insert(kvcm::genLocationSpecName(0, group.group_name, runtime_config_.model_name));
-                        const auto& member = topology.group(group.tag);
-                        compatible = compatible && member.seqSizePerBlock() == first.seqSizePerBlock()
-                                     && member.cacheKeyTokenStride() == first.cacheKeyTokenStride()
-                                     && member.policy.cp_mapping == first.policy.cp_mapping
-                                     && member.policy.cp_slice == first.policy.cp_slice;
-                    }
-                    merge_full_specs_ = autil::legacy::AnyCast<std::string>(fields.at("type")) == "pace"
-                                        && compatible && names == std::set<std::string>{"F0_TP0", "F1_TP0", "F2_TP0"};
-                }
-            }
             if (!kv_cache_config_.kvcm_client_config.empty()) {
                 auto [location_infos, location_groups] = genLocationSpecs();
                 autil::legacy::FromJsonString(client_config_map, kv_cache_config_.kvcm_client_config);
@@ -325,8 +299,7 @@ public:
                     for (int rank = 0; rank < parallelism_config_.tp_size; ++rank) {
                         const std::string legacy_name = "tp" + std::to_string(rank) + "_" + group.group_name;
                         const std::string expected_name =
-                            kvcm::genLocationSpecName(rank, group.group_name, runtime_config_.model_name,
-                                                      merge_full_specs_);
+                            kvcm::genLocationSpecName(rank, group.group_name, runtime_config_.model_name);
                         if (legacy_name != expected_name && configured_infos.count(legacy_name) != 0) {
                             RTP_LLM_LOG_ERROR("KVCM_CLIENT_CONFIG must replace location spec [%s] with [%s]",
                                               legacy_name.c_str(), expected_name.c_str());
@@ -366,7 +339,7 @@ public:
                     }
                 }
             } else {
-                client_config_map = genClientConfig();
+                client_config_map = genClientConfig(full_group_tags);
             }
         } catch (const autil::legacy::ExceptionBase& error) {
             RTP_LLM_LOG_ERROR("parse KVCM_CLIENT_CONFIG failed: %s", error.what());
@@ -1084,8 +1057,7 @@ public:
                                                             runtime_config_.model_name,
                                                             merge_full_specs_);
                 const auto info = infos.find(name);
-                if (info == infos.end() || info->second.group_ids.size() != count
-                    || (count > 1 && request.uris(uri).compare(0, 7, "pace://") != 0)) {
+                if (info == infos.end() || info->second.group_ids.size() != count) {
                     return false;
                 }
                 for (size_t member = 0; member < count; ++member) {
@@ -1522,7 +1494,7 @@ private:
         return {std::move(infos), std::move(groups)};
     }
 
-    kvcm::ClientWrapper::ConfigMap genClientConfig() {
+    kvcm::ClientWrapper::ConfigMap genClientConfig(const std::vector<std::string>& full_group_tags) {
         std::vector<std::string> addresses;
         if (!kv_cache_config_.kvcm_server_address.empty()) {
             addresses.push_back(kv_cache_config_.kvcm_server_address);
@@ -1535,6 +1507,25 @@ private:
                                                             kv_cache_config_.kvcm_put_timeout_ms,
                                                             kv_cache_config_.kvcm_get_timeout_ms);
         sdk->parseBackendConfigs(kv_cache_config_.kvcm_model_sdk_config);
+        const auto& backends = sdk->sdk_backend_configs();
+        if (runtime_config_.model_name == "DeepSeekV41" && full_group_tags.size() == 3 && backends.size() == 1
+            && std::dynamic_pointer_cast<kvcm::TairMempoolSdkConfig>(backends.front())) {
+            const auto& first = topology_->group(full_group_tags.front());
+            std::set<std::string> names;
+            bool compatible = true;
+            for (const auto& [id, group] : group_policy_->groups()) {
+                (void)id;
+                if (!group.is_full)
+                    continue;
+                names.insert(kvcm::genLocationSpecName(0, group.group_name, runtime_config_.model_name));
+                const auto& member = topology_->group(group.tag);
+                compatible = compatible && member.seqSizePerBlock() == first.seqSizePerBlock()
+                             && member.cacheKeyTokenStride() == first.cacheKeyTokenStride()
+                             && member.policy.cp_mapping == first.policy.cp_mapping
+                             && member.policy.cp_slice == first.policy.cp_slice;
+            }
+            merge_full_specs_ = compatible && names == std::set<std::string>{"F0_TP0", "F1_TP0", "F2_TP0"};
+        }
         auto [location_infos, location_groups] = genLocationSpecs();
 
         const std::string model_name = runtime_config_.model_name;
