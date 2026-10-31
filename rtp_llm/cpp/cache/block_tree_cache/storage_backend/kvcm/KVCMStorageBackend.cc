@@ -618,8 +618,12 @@ public:
             try {
                 size_t count = 0;
                 for (const auto& row : locations_view) {
-                    for (const auto& spec : row)
-                        count += spec_info.at(std::string(spec.spec_name)).group_ids.size();
+                    for (const auto& spec : row) {
+                        const auto info = spec_info.find(spec.spec_name);
+                        if (info != spec_info.end()) {
+                            count += info->second.group_ids.size();
+                        }
+                    }
                 }
                 origin_bindings.reserve(count);
             } catch (const std::bad_alloc&) {
@@ -1140,9 +1144,10 @@ public:
                 const auto& tag = tags[member];
                 buffers.emplace_back();
                 auto& iovs = buffers.back().iovs;
-                iovs.reserve(cache_config_.layerIdsForGroup(tag).size() * 2);
+                const auto layer_ids = cache_config_.layerIdsForGroup(tag);
+                iovs.reserve(layer_ids.size() * 2);
                 size_t bytes = 0;
-                for (int layer : cache_config_.layerIdsForGroup(tag)) {
+                for (int layer : layer_ids) {
                     const auto parts = mapper.sliceBlockForPeer(
                         cache_config_, tag, file_resolver_(layer, tag, blocks[member]), peer);
                     for (const auto& part : parts) {
@@ -1168,15 +1173,9 @@ public:
             const size_t count = request.uri_block_counts(uri);
             auto& buffer = buffers[begin];
             if (count > 1) {
-                size_t iov_count = 0, bytes = 0;
+                size_t iov_count = 0;
                 for (size_t member = begin; member < begin + count; ++member) {
                     iov_count += buffers[member].iovs.size();
-                    for (const auto& iov : buffers[member].iovs) {
-                        if (iov.size > std::numeric_limits<size_t>::max() - bytes) {
-                            return false;
-                        }
-                        bytes += iov.size;
-                    }
                 }
                 buffer.iovs.reserve(iov_count);
                 for (size_t member = begin + 1; member < begin + count; ++member) {

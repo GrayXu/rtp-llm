@@ -70,10 +70,7 @@ bool GroupPolicy::buildLocationSpecGroups(int                 tp_size,
         const bool compound_member = genLocationSpecName(0, group.group_name, model_name, merge_full)
                                      != genLocationSpecName(0, group.group_name, model_name);
         if (compound_member) {
-            if (!group.is_full) {
-                RTP_LLM_LOG_ERROR("compound KVCM spec requires FULL group [%s]", group.group_name.c_str());
-                return false;
-            }
+            // The caller validates the three compatible FULL groups before enabling merge_full.
             compound_group_names.push_back(group.group_name);
             compound_mask |= group.group_name_bithash;
         } else {
@@ -85,18 +82,13 @@ bool GroupPolicy::buildLocationSpecGroups(int                 tp_size,
             const auto [spec_it, spec_inserted] =
                 new_spec_name_to_info.emplace(spec_name, SpecInfo{group_id, rank, group.tag, {group_id}});
             if (!spec_inserted) {
-                if (!compound_member || spec_it->second.tp_rank != rank
-                    || !groups_.at(spec_it->second.group_id).is_full) {
+                if (!compound_member) {
                     RTP_LLM_LOG_ERROR("duplicate KVCM location spec [%s]", spec_name.c_str());
                     return false;
                 }
                 spec_it->second.group_ids.push_back(group_id);
             }
         }
-    }
-    if (!compound_group_names.empty() && compound_group_names.size() != 3) {
-        RTP_LLM_LOG_ERROR("compound KVCM spec requires three FULL members, actual=%zu", compound_group_names.size());
-        return false;
     }
     for (auto& [name, info] : new_spec_name_to_info) {
         (void)name;
